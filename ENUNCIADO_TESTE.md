@@ -1,4 +1,4 @@
-# Teste — Dia da apresentação (simulação)
+# Teste — Dia da apresentação (simulação n.º 2)
 
 Tem **20 minutos** a partir do momento em que começa.
 
@@ -7,12 +7,12 @@ As cenas estão na pasta `cenas_teste/`. Foram geradas pelo simulador, de vário
 
 | cena | caixas |
 |---|---|
-| cena_1 | 3 |
-| cena_2 | 3 |
+| cena_1 | 2 |
+| cena_2 | 1 |
 | cena_3 | 2 |
 | cena_4 | 3 |
-| cena_5 | 1 |
-| cena_6 | 2 |
+| cena_5 | 3 |
+| cena_6 | 3 |
 
 ## O que tem de fazer
 
