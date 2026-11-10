@@ -1,34 +1,36 @@
-# Teste — Dia da apresentação (simulação n.º 3: poucas câmaras)
+# Teste — Dia da apresentação (simulação n.º 4: 15 cenas de todos os tipos)
 
-Tem **20 minutos** a partir do momento em que começa.
+As cenas estão na pasta `cenas_teste/`. Foram geradas pelo simulador e **não têm** `ground_truth.json` nem `config.json`.
 
-As cenas estão na pasta `cenas_teste/`. Foram geradas pelo simulador, de vários níveis, e **não têm**
-`ground_truth.json` nem `config.json`.
+Cada cena tem **no máximo 4 imagens** (2, 3 ou 4). As câmaras estão num arco, com 45° a 75° entre câmaras vizinhas,
+e a distância e a altura de cada câmara variam. Há faces das caixas que nenhuma câmara vê.
 
-**Novidade deste teste:** cada cena tem **no máximo 4 imagens**, e o número de imagens varia de cena para cena.
-As câmaras já não dão a volta completa à mesa: estão num arco, com 45° a 75° entre câmaras vizinhas.
-Há por isso faces das caixas que nenhuma câmara vê.
-
-| cena | caixas |
-|---|---|
-| cena_1 | 2 |
-| cena_2 | 1 |
-| cena_3 | 2 |
-| cena_4 | 3 |
-| cena_5 | 3 |
-| cena_6 | 3 |
+| cena | caixas | imagens |
+|---|---|---|
+| cena_1 | 1 | 4 |
+| cena_2 | 1 | 2 |
+| cena_3 | 2 | 3 |
+| cena_4 | 3 | 4 |
+| cena_5 | 2 | 4 |
+| cena_6 | 2 | 3 |
+| cena_7 | 2 | 4 |
+| cena_8 | 2 | 4 |
+| cena_9 | 3 | 4 |
+| cena_10 | 2 | 4 |
+| cena_11 | 3 | 4 |
+| cena_12 | 3 | 3 |
+| cena_13 | 2 | 4 |
+| cena_14 | 2 | 2 |
+| cena_15 | 4 | 4 |
 
 ## O que tem de fazer
 
 1. Obter as cenas deste repositório e pô-las onde o seu programa as consegue ler;
 2. Correr o seu programa em cada cena;
-3. Fazer *commit* e *push*, para este repositório, do código e de um `result.json` por cena,
-   em `resultados_teste/<cena>/result.json` (por exemplo `resultados_teste/cena_1/result.json`);
-4. Ao fim dos 20 minutos, parar. O que for enviado depois não conta.
+3. Fazer *commit* e *push*, para este repositório, de um `result.json` por cena,
+   em `results_test/<cena>/result.json` (por exemplo `results_test/cena_1/result.json`).
 
 ## Avaliação
 
 O desempenho é o IoU 3D médio entre cada caixa estimada e a caixa verdadeira correspondente.
 Uma caixa não encontrada, ou uma cena sem `result.json`, conta com IoU = 0.
-
-Bom trabalho!
