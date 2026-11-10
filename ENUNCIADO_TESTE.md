@@ -1,9 +1,9 @@
-# Teste — Dia da apresentação (simulação n.º 5)
+# Teste — Dia da apresentação (simulação n.º 6: 30 cenas)
 
 As cenas estão na pasta `cenas_teste/`. Foram geradas pelo simulador e **não têm** `ground_truth.json` nem `config.json`.
 
-Cada cena tem entre **1 e 4 imagens**. Três cenas têm **uma só imagem**: não há registo a fazer, e há faces das
-caixas que não se veem. Nas outras, as câmaras estão num arco, com 45° a 75° entre câmaras vizinhas.
+Cada cena tem entre **1 e 4 imagens**. Nas cenas com uma só imagem não há registo a fazer, e há faces das caixas que não
+se veem. Nas outras, as câmaras estão num arco, com 45° a 75° entre câmaras vizinhas.
 
 | cena | caixas | imagens |
 |---|---|---|
@@ -22,6 +22,21 @@ caixas que não se veem. Nas outras, as câmaras estão num arco, com 45° a 75�
 | cena_13 | 2 | 4 |
 | cena_14 | 4 | 4 |
 | cena_15 | 2 | 2 |
+| cena_16 | 3 | 3 |
+| cena_17 | 2 | 1 |
+| cena_18 | 1 | 2 |
+| cena_19 | 3 | 2 |
+| cena_20 | 2 | 3 |
+| cena_21 | 5 | 4 |
+| cena_22 | 2 | 3 |
+| cena_23 | 2 | 4 |
+| cena_24 | 4 | 4 |
+| cena_25 | 2 | 2 |
+| cena_26 | 2 | 1 |
+| cena_27 | 2 | 3 |
+| cena_28 | 3 | 4 |
+| cena_29 | 3 | 3 |
+| cena_30 | 4 | 4 |
 
 ## O que tem de fazer
 
