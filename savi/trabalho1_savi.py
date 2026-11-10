@@ -1413,16 +1413,18 @@ def split_geometric(points, n, method="kmeans"):
     labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(top)).cluster_dbscan(0.012, 5))
     pieces = [top[labels == k] for k in range(labels.max() + 1) if np.sum(labels == k) >= 30]
 
-    # 2. Níveis: pedaços ordenados pela altura; um novo nível começa quando a altura salta > 1.5 cm
-    pieces.sort(key=lambda g: np.median(g[:, 2]))
-    levels = []
-    for g in pieces:
-        if levels and np.median(g[:, 2]) - np.median(levels[-1][:, 2]) < 0.015:
-            levels[-1] = np.vstack([levels[-1], g])
-        else:
-            levels.append(g)
-    levels.sort(key=len, reverse=True)
-    groups = [(g, True) for g in levels[:n]] if levels else [(top, False)]   # (pontos, nível inteiro?)
+    # 2. Só se há MAIS pedaços do que caixas: junta pedaços à mesma altura (< 1.5 cm), começando pelo
+    #    par com alturas mais parecidas. (Se há tantos pedaços como caixas, cada pedaço é uma caixa:
+    #    duas caixas iguais encostadas podem ter uma junta visível entre os topos.)
+    while len(pieces) > n:
+        h = [np.median(g[:, 2]) for g in pieces]
+        pairs = [(abs(h[i] - h[j]), i, j) for i in range(len(pieces)) for j in range(i + 1, len(pieces))]
+        diff, i, j = min(pairs)
+        if diff >= 0.015:
+            break
+        pieces[i] = np.vstack([pieces[i], pieces.pop(j)])
+    pieces.sort(key=len, reverse=True)
+    groups = [(g, True) for g in pieces[:n]] if pieces else [(top, False)]   # (pontos, não dividido?)
 
     # 3. Divisões até haver n grupos
     while len(groups) < n:
@@ -1441,13 +1443,23 @@ def split_geometric(points, n, method="kmeans"):
     boxes = []
     for i, (g, whole_level) in enumerate(groups):
         rect = rect_params(g[:, :2])
-        if whole_level and i > 0:                               # há caixas mais altas no cluster
+        # Só para um grupo sozinho na sua altura e com caixas mais altas no cluster (numa pilha);
+        # se houver outra caixa à mesma altura, as paredes dela misturavam-se com as desta.
+        alone = sum(abs(h - heights[i]) < 0.015 for h in heights) == 1
+        if whole_level and alone and heights[0] > heights[i] + 0.015:
             below = max([h for h in heights if h < heights[i] - 0.015], default=0.0)
             wall = points[(points[:, 2] > below + 0.01) & (points[:, 2] < heights[i] - 0.01)]
             for b in boxes:                                     # fora das caixas mais altas
                 wall = wall[~inside_rect(wall[:, :2], b[:5], margin=0.01)]
             candidates = np.vstack([g, wall])
-            rect = rect_params(candidates[largest_component(candidates), :2])
+            candidates = candidates[largest_component(candidates)]
+            rect = rect_params(candidates[:, :2])
+            # Uma caixa da pilha tem de suportar as que estão por cima dela: se o centro de uma caixa
+            # mais alta está sobre esta, os cantos dela também ficam dentro do retângulo (com poucas
+            # câmaras, as paredes e o topo visível desta caixa podem ser só de um lado).
+            corners = [box_corners_2d(*b[:5]) for b in boxes if inside_rect(b[None, :2], rect, margin=0.02)[0]]
+            if corners:
+                rect = rect_params(np.vstack([candidates[:, :2]] + corners))
         boxes.append(np.append(rect, heights[i]))
     return boxes
 
