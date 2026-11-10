@@ -1232,8 +1232,17 @@ def segment(cloud, table, num_boxes, use_color=True, verbose=True):
     keep = np.isin(clusters, list(counts.keys()))
     points, colors, clusters = points[keep], colors[keep], clusters[keep]
 
-    # Em cada cluster com várias caixas, tenta separar as caixas pela cor
-    color_groups = {k: color_split(colors[clusters == k], n) if (use_color and n > 1) else None
+    # Em cada cluster com várias caixas, tenta separar as caixas pela cor. Primeiro em n cores; se
+    # não der (há caixas com a mesma cor), em n-1, ..., 2 cores: por exemplo, duas caixas verdes e
+    # uma rosa por cima dão 2 grupos de cor, e o grupo verde é depois dividido pela geometria.
+    def partial_color_split(cluster_colors, n):
+        for k in range(n, 1, -1):
+            labels = color_split(cluster_colors, k)
+            if labels is not None:
+                return labels
+        return None
+
+    color_groups = {k: partial_color_split(colors[clusters == k], n) if (use_color and n > 1) else None
                     for k, n in counts.items()}
     if verbose:
         print(f"  {len(points)} pontos de objetos, {len(counts)} clusters euclidianos; "
@@ -1294,7 +1303,22 @@ def split_kmeans(group):
     return group[lab == 0], group[lab == 1]
 
 
-def split_profile(group, bin_size=0.005, min_piece=0.04, min_step=0.01):
+def split_equal(group, k):
+    """Divide um topo em k partes IGUAIS ao longo do seu lado maior.
+
+    Caixas iguais da mesma cor encostadas em fila formam um só topo, sem juntas nem degraus: não há
+    nenhuma informação sobre onde acaba cada caixa. A hipótese mais simples é que são do mesmo
+    tamanho. (Dividir ao meio duas vezes dava 1/2 + 1/4 + 1/4 em vez de 1/3 + 1/3 + 1/3.)
+    """
+    _, (a, b), angle = cv2.minAreaRect(group[:, :2].astype(np.float32))
+    angle = np.radians(angle) + (0.0 if a >= b else np.pi / 2)   # direção do lado maior
+    u = group[:, :2] @ [np.cos(angle), np.sin(angle)]
+    edges = np.linspace(u.min(), u.max(), k + 1)
+    which = np.clip(np.digitize(u, edges[1:-1]), 0, k - 1)
+    return [group[which == i] for i in range(k) if np.any(which == i)]
+
+
+def split_profile(group, bin_size=0.005, min_piece=0.04, min_step=0.025):
     """Divide um grupo de pontos do topo em dois, no 'degrau' do contorno.
 
     Caixas da mesma altura encostadas formam um topo plano único. Se tiverem larguras diferentes (ou
@@ -1303,7 +1327,9 @@ def split_profile(group, bin_size=0.005, min_piece=0.04, min_step=0.01):
       2. fatias de 5 mm ao longo de u; em cada fatia, os limites do topo em v (percentis 10 e 90);
       3. o degrau é onde estes limites mais mudam (compara a fatia 1 cm antes com a 1 cm depois);
       4. corta-se aí, desde que fiquem pelo menos 4 cm de cada lado.
-    Saída: os dois pedaços, ou None se não houver nenhum degrau claro (> 1 cm).
+    Saída: os dois pedaços, ou None se não houver nenhum degrau claro (> 2.5 cm, somando os dois lados).
+    (Com 1 cm, o ruído das paredes criava 'degraus' falsos em caixas da mesma largura, e a otimização
+    partia daí e ficava num mínimo local: teste 6, cena 13.)
     """
     xy = group[:, :2]
     center = xy.mean(axis=0)
@@ -1397,10 +1423,12 @@ def split_geometric(points, n, method="kmeans"):
     2. Junta os grupos que estão à mesma altura (menos de 1.5 cm): é o mesmo NÍVEL. Numa pilha, a
        caixa de cima tapa o meio do topo da caixa de baixo, e o que se vê dele fica partido em vários
        pedaços à volta da caixa de cima; esses pedaços são todos da mesma caixa;
-    3. Se houver menos níveis do que caixas, divide o grupo com maior área até haver n:
-         - forma de L e faltam pelo menos 2 caixas: corta pelo canto interior do L (split_corner);
-         - method="kmeans":  k-means no plano (divide a área ao meio, sem olhar ao contorno);
-         - method="profile": no degrau do contorno (split_profile); sem degrau, usa o k-means.
+    3. Se houver menos grupos do que caixas, as caixas que faltam vão para os grupos com maior área
+       por caixa, e cada grupo com c caixas é dividido em c:
+         - c = 3 e forma de L: corta pelo canto interior do L (split_corner);
+         - c = 2, method="kmeans":  k-means no plano;
+         - c = 2, method="profile": no degrau do contorno (split_profile); sem degrau, partes iguais;
+         - restantes casos: c partes iguais ao longo do lado maior (split_equal).
        A divisão é só uma aproximação: a otimização corrige a fronteira. Mas, se começar muito
        longe, pode ficar presa num mínimo local, por isso run() experimenta os dois métodos;
     4. Retângulo de cada caixa visto de cima. Para um nível que não foi dividido e que tem caixas
@@ -1426,16 +1454,24 @@ def split_geometric(points, n, method="kmeans"):
     pieces.sort(key=len, reverse=True)
     groups = [(g, True) for g in pieces[:n]] if pieces else [(top, False)]   # (pontos, não dividido?)
 
-    # 3. Divisões até haver n grupos
-    while len(groups) < n:
-        areas = [rect_params(g[:, :2])[3] * rect_params(g[:, :2])[4] for g, _ in groups]
-        g, _ = groups.pop(int(np.argmax(areas)))               # o grupo com maior área
-        split = split_corner(g) if n - len(groups) >= 3 else None
-        if split is None and method == "profile":
-            split = split_profile(g)
+    # 3. Quantas caixas há em cada grupo: uma cada; as que faltam vão, uma a uma, para o grupo com
+    #    maior área por caixa (três caixas iguais em fila são um só topo com 3 caixas)
+    areas = [rect_params(g[:, :2])[3] * rect_params(g[:, :2])[4] for g, _ in groups]
+    counts = [1] * len(groups)
+    for _ in range(n - len(groups)):
+        counts[int(np.argmax(np.array(areas) / counts))] += 1
+    divided = []
+    for (g, whole_level), c in zip(groups, counts):
+        if c == 1:
+            divided.append((g, whole_level))
+            continue
+        split = split_corner(g) if c == 3 else None             # forma de L
+        if split is None and c == 2 and method == "profile":
+            split = split_profile(g)                            # degrau do contorno
         if split is None:
-            split = split_kmeans(g)
-        groups += [(p, False) for p in split]
+            split = split_kmeans(g) if c == 2 and method == "kmeans" else split_equal(g, c)
+        divided += [(p, False) for p in split]
+    groups = divided
 
     # 4. Retângulos, do grupo mais alto para o mais baixo
     groups.sort(key=lambda item: -np.median(item[0][:, 2]))
@@ -1489,7 +1525,9 @@ def place_on_supports(boxes, min_cover=0.5, min_step=0.02):
 
 def needs_geometric_split(seg):
     """True se algum cluster tem várias caixas que a cor não separa (Nível 3 ou pilhas da mesma cor)."""
-    return any(n > 1 and seg.color_groups.get(k) is None for k, n in seg.boxes_per_cluster.items())
+    groups = seg.color_groups
+    return any(n > 1 and (groups.get(k) is None or groups[k].max() + 1 < n)
+               for k, n in seg.boxes_per_cluster.items())
 
 
 def initial_boxes(seg, split_method="kmeans"):
@@ -1515,13 +1553,23 @@ def initial_boxes(seg, split_method="kmeans"):
             colors.append(np.median(chroma_features(cols), axis=0))
             labels[idx] = first
         elif groups is not None:
-            for g in range(n):
+            # Quantas caixas há em cada grupo de cor (menos cores do que caixas: há caixas da mesma
+            # cor); a mesma regra que para os clusters (topos a alturas diferentes, depois área)
+            per_color = allocate_boxes(pts, groups, n)
+            tops = []
+            for g, c in per_color.items():
                 sel = np.nonzero(groups == g)[0]
                 sel = sel[largest_component(pts[sel])]          # retira pontos soltos com a cor errada
-                params.append(np.append(rect_params(pts[sel, :2]), np.percentile(pts[sel, 2], 98)))
-                colors.append(np.median(chroma_features(cols[sel]), axis=0))
-                labels[idx[sel]] = first + g
-            params[first:] = place_on_supports(params[first:])
+                color = np.median(chroma_features(cols[sel]), axis=0)
+                if c == 1:
+                    labels[idx[sel]] = first + len(tops)
+                    tops.append(np.append(rect_params(pts[sel, :2]), np.percentile(pts[sel, 2], 98)))
+                    colors.append(color)
+                else:                                           # várias caixas desta cor: geometria
+                    for box in split_geometric(pts[sel], c, split_method):
+                        tops.append(box)
+                        colors.append(color)
+            params += place_on_supports(tops)
         else:
             for p in place_on_supports(split_geometric(pts, n, split_method)):
                 params.append(p)
