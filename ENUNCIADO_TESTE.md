@@ -1,9 +1,13 @@
-# Teste — Dia da apresentação (simulação n.º 2)
+# Teste — Dia da apresentação (simulação n.º 3: poucas câmaras)
 
 Tem **20 minutos** a partir do momento em que começa.
 
 As cenas estão na pasta `cenas_teste/`. Foram geradas pelo simulador, de vários níveis, e **não têm**
-`ground_truth.json` nem `config.json`. O número de caixas de cada cena é:
+`ground_truth.json` nem `config.json`.
+
+**Novidade deste teste:** cada cena tem **no máximo 4 imagens**, e o número de imagens varia de cena para cena.
+As câmaras já não dão a volta completa à mesa: estão num arco, com 45° a 75° entre câmaras vizinhas.
+Há por isso faces das caixas que nenhuma câmara vê.
 
 | cena | caixas |
 |---|---|
