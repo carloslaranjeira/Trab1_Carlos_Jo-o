@@ -2,13 +2,13 @@
 """Dia da apresentação: corre o sistema em TODAS as cenas de uma pasta, uma de cada vez.
 
 Utilização:
-    python run_test.py --download <link do repositório GitHub>   # copia as cenas do GitHub para teste/ e corre
-    python run_test.py              # corre todas as cenas que já estão em teste/
+    python run_test.py --download <link do repositório GitHub>   # copia as cenas do GitHub para test/ e corre
+    python run_test.py              # corre todas as cenas que já estão em test/
     python run_test.py --git        # e faz git add + commit + push depois de cada cena
     python run_test.py --redo       # volta a correr cenas que já têm resultado
 
-Para cada cena teste/<cena>/ escreve resultados_teste/<cena>/result.json (e as figuras).
-O número de caixas de cada cena vem de teste/num_boxes.json; se faltar, é perguntado no terminal.
+Para cada cena test/<cena>/ escreve results_test/<cena>/result.json (e a figura top_view.png).
+O número de caixas de cada cena vem de test/num_boxes.json; se faltar, é perguntado no terminal.
 
 Pensado para não perder resultados:
     - um erro numa cena não pára as outras (fica registado e passa-se à seguinte);
@@ -18,18 +18,28 @@ Pensado para não perder resultados:
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import traceback
 from pathlib import Path
 
-import main
-from savi import evaluation, visualization
-from savi.scene_io import write_result
+FOLDER = Path(__file__).resolve().parent         # pasta principal do trabalho
+# O código está na pasta savi/: junta-a aos sítios onde o Python procura módulos
+sys.path.insert(0, str(FOLDER / "savi"))
+import trabalho1_savi as t1                       # noqa: E402 (tem de vir depois do sys.path)
 
-FOLDER = Path(__file__).parent
+
+def natural_key(path):
+    """Chave de ordenação 'natural': os números no nome são comparados como números.
+
+    'cena_10' -> ['cena_', 10, ''], por isso fica depois de 'cena_2' -> ['cena_', 2, ''].
+    (A ordem alfabética punha cena_10 logo a seguir a cena_1.)
+    """
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", Path(path).name)]
 
 
 def read_num_boxes(path):
@@ -50,12 +60,12 @@ def ask_num_boxes(name):
 
 
 def download_scenes(url, scenes_dir):
-    """Copia as cenas de um repositório GitHub para a pasta das cenas (teste/).
+    """Copia as cenas de um repositório GitHub para a pasta das cenas (test/).
 
     1. Faz 'git clone' do repositório para uma pasta temporária (só a última versão: --depth 1);
        aceita também o link copiado do browser (ex.: .../tree/main/cenas_teste), que é cortado;
     2. Procura todas as pastas que são cenas (têm a subpasta point_clouds/), em qualquer sítio do repositório;
-    3. Copia cada cena para teste/<cena> (as que já lá estão não são copiadas outra vez);
+    3. Copia cada cena para test/<cena> (as que já lá estão não são copiadas outra vez);
     4. Apaga a pasta temporária.
     """
     if "/tree/" in url:                 # link de uma pasta no browser -> link do repositório
@@ -67,7 +77,7 @@ def download_scenes(url, scenes_dir):
         if result.returncode != 0:
             raise SystemExit(f"Não foi possível transferir o repositório:\n{result.stderr}")
         copied = 0
-        for point_clouds in sorted(Path(tmp).rglob("point_clouds")):
+        for point_clouds in sorted(Path(tmp).rglob("point_clouds"), key=lambda p: natural_key(p.parent)):
             scene = point_clouds.parent
             target = scenes_dir / scene.name
             if target.exists():
@@ -95,8 +105,8 @@ def git_push(output, message):
 
 def main_test():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--scenes", default=str(FOLDER / "teste"), help="pasta com as cenas")
-    parser.add_argument("--output", default=str(FOLDER / "resultados_teste"), help="pasta dos resultados")
+    parser.add_argument("--scenes", default=str(FOLDER / "test"), help="pasta com as cenas")
+    parser.add_argument("--output", default=str(FOLDER / "results_test"), help="pasta dos resultados")
     parser.add_argument("--git", action="store_true", help="commit + push depois de cada cena")
     parser.add_argument("--redo", action="store_true", help="volta a correr cenas que já têm resultado")
     parser.add_argument("--download", metavar="URL", help="copia primeiro as cenas deste repositório GitHub para --scenes")
@@ -106,7 +116,8 @@ def main_test():
     if args.download:
         download_scenes(args.download, scenes_dir)
     # Uma cena é qualquer subpasta com point_clouds/
-    scenes = sorted(p for p in scenes_dir.iterdir() if (p / "point_clouds").is_dir())
+    # Ordem natural (cena_1, cena_2, ..., cena_10) e não alfabética (cena_1, cena_10, cena_2, ...)
+    scenes = sorted((p for p in scenes_dir.iterdir() if (p / "point_clouds").is_dir()), key=natural_key)
     if not scenes:
         print(f"Não há cenas em {scenes_dir} (cada cena tem de ter a subpasta point_clouds/)")
         return
@@ -127,13 +138,16 @@ def main_test():
         print(f"\n[{k}/{len(scenes)}] {scene.name} ({num_boxes[scene.name]} caixas)"
               f" - {(time.time() - start) / 60:.1f} min desde o início")
         try:
-            r = main.run(scene, num_boxes[scene.name])
-            boxes = evaluation.boxes_to_camera0(r["params_opt"], r["table"].T_camera0_table)
-            result_path.parent.mkdir(parents=True, exist_ok=True)
-            write_result(result_path, [v.name for v in r["scene"].views], r["T_cams"], boxes)
-            visualization.save_top_view(result_path.parent / "top_view.png", r["seg"].points, r["seg"].colors,
-                                        r["params_opt"], r["params_bbox"], title=scene.name)
+            r = t1.run(scene, num_boxes[scene.name])
+            boxes = t1.boxes_to_camera0(r["params_opt"], r["table"].T_camera0_table)
+            t1.write_result(result_path, [v.name for v in r["scene"].views], r["T_cams"], boxes)
             print(f"  -> {result_path}")
+            try:
+                # Figura da vista de cima (se falhar, o result.json já está escrito)
+                t1.save_top_view(result_path.parent / "top_view.png", r["seg"].points,
+                                 r["seg"].colors, r["params_opt"], r["params_bbox"], title=scene.name)
+            except Exception as error:
+                print(f"  (figura não gravada: {error})")
             done.append(scene.name)
             if args.git:
                 git_push(output, f"Resultado da cena {scene.name}")

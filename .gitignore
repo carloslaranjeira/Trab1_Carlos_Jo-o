@@ -1,6 +1,4 @@
 __pycache__/
-simulator/scenes/
-# Cenas do dia da apresentação: são grandes, só os resultados (resultados_teste/) vão para o git
-teste/*/
-# Pasta do "professor" (soluções das cenas de teste) - nunca vai para o git
+scenes_offline/
+test/*/
 .professor/
