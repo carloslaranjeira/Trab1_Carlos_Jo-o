@@ -1334,32 +1334,122 @@ def split_profile(group, bin_size=0.005, min_piece=0.04, min_step=0.01):
     return group[u < cut], group[u >= cut]
 
 
+def split_corner(group, cell=0.01, min_side=0.04, min_fraction=0.12):
+    """Divide um topo em forma de L em 3 retângulos, cortando pelo canto interior do L.
+
+    Três caixas iguais (mesma cor e altura) encostadas em L formam um topo plano único, sem nenhuma
+    junta visível. O mais natural é que as juntas passem pelo canto interior do L:
+      1. Referencial do retângulo mínimo do topo (eixos u, v); grelha de 1 cm com as células ocupadas;
+      2. Em cada um dos 4 cantos do retângulo, procura o maior retângulo VAZIO encostado a esse canto
+         (o 'buraco' do L). O seu vértice interior é o canto interior do L;
+      3. Corta pelas duas retas (u = a e v = b) que passam por esse vértice: ficam 3 pedaços.
+    Saída: os 3 pedaços, ou None se o topo não tiver forma de L (buraco com menos de 12% da área ou
+    com algum lado menor do que 4 cm).
+    """
+    (cx, cy), _, angle = cv2.minAreaRect(group[:, :2].astype(np.float32))
+    a = np.radians(angle)
+    axes = np.array([[np.cos(a), np.sin(a)], [-np.sin(a), np.cos(a)]])
+    uv = (group[:, :2] - [cx, cy]) @ axes.T                     # coordenadas no referencial do retângulo
+    lo = uv.min(axis=0)
+    ij = np.floor((uv - lo) / cell).astype(int)
+    nu, nv = ij.max(axis=0) + 1
+    occupied = np.zeros((nu, nv), int)
+    np.add.at(occupied, (ij[:, 0], ij[:, 1]), 1)
+    occupied = occupied >= 2                                    # célula com pontos (ignora pontos soltos)
+
+    best = None
+    for flip_u in (False, True):                                # os 4 cantos = 4 orientações da grelha
+        for flip_v in (False, True):
+            grid = occupied[::-1] if flip_u else occupied
+            grid = grid[:, ::-1] if flip_v else grid
+            # retângulo vazio [0, i) x [0, j) encostado ao canto (0, 0): soma acumulada da ocupação
+            cum = grid.cumsum(axis=0).cumsum(axis=1)
+            for i in range(1, nu):
+                for j in range(1, nv):
+                    if cum[i - 1, j - 1] == 0 and (best is None or i * j > best[0]):
+                        best = (i * j, i, j, flip_u, flip_v)
+    if best is None:
+        return None
+    area, i, j, flip_u, flip_v = best
+    if area < min_fraction * nu * nv or min(i, j) * cell < min_side or min(nu - i, nv - j) * cell < min_side:
+        return None
+    # Vértice interior do L, em coordenadas (u, v)
+    cut_u = lo[0] + (nu - i if flip_u else i) * cell
+    cut_v = lo[1] + (nv - j if flip_v else j) * cell
+    side_u, side_v = uv[:, 0] >= cut_u, uv[:, 1] >= cut_v
+    pieces = [group[(side_u == su) & (side_v == sv)] for su in (False, True) for sv in (False, True)]
+    pieces = [p for p in pieces if len(p) >= 30]                # o quadrante vazio desaparece
+    return pieces if len(pieces) == 3 else None
+
+
+def inside_rect(points_xy, rect, margin=0.0):
+    """True para os pontos 2D dentro do retângulo [x, y, yaw, length, width] alargado de 'margin'."""
+    c, s = np.cos(rect[2]), np.sin(rect[2])
+    d = points_xy - rect[:2]
+    u, v = d @ [c, s], d @ [-s, c]
+    return (np.abs(u) < rect[3] / 2 + margin) & (np.abs(v) < rect[4] / 2 + margin)
+
+
 def split_geometric(points, n, method="kmeans"):
     """Estimativa inicial de n caixas da MESMA COR que se tocam (um só cluster).
 
-    1. Fica só com os pontos dos topos das caixas;
-    2. Agrupa os topos com DBSCAN em 3D: caixas de alturas diferentes (ou empilhadas) têm topos a
-       alturas diferentes e ficam separadas;
-    3. Se houver menos grupos do que caixas, divide o grupo com maior área em dois, até haver n:
+    1. Fica só com os pontos dos topos das caixas e agrupa-os com DBSCAN em 3D;
+    2. Junta os grupos que estão à mesma altura (menos de 1.5 cm): é o mesmo NÍVEL. Numa pilha, a
+       caixa de cima tapa o meio do topo da caixa de baixo, e o que se vê dele fica partido em vários
+       pedaços à volta da caixa de cima; esses pedaços são todos da mesma caixa;
+    3. Se houver menos níveis do que caixas, divide o grupo com maior área até haver n:
+         - forma de L e faltam pelo menos 2 caixas: corta pelo canto interior do L (split_corner);
          - method="kmeans":  k-means no plano (divide a área ao meio, sem olhar ao contorno);
          - method="profile": no degrau do contorno (split_profile); sem degrau, usa o k-means.
        A divisão é só uma aproximação: a otimização corrige a fronteira. Mas, se começar muito
-       longe, pode ficar presa num mínimo local, por isso run() experimenta os dois métodos.
+       longe, pode ficar presa num mínimo local, por isso run() experimenta os dois métodos;
+    4. Retângulo de cada caixa visto de cima. Para um nível que não foi dividido e que tem caixas
+       mais altas no cluster, o topo visível pode ser só uma moldura ou um pedaço (o resto está
+       tapado pela caixa de cima). Juntam-se então as PAREDES dessa caixa: pontos entre o nível de
+       baixo e o seu topo, fora dos retângulos das caixas mais altas (que já estão calculados).
     Saída: lista de n caixas [x, y, yaw, length, width, topo] (ainda sem z: ver place_on_supports).
     """
     top = points[top_surface_points(points)]
     labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(top)).cluster_dbscan(0.012, 5))
-    groups = [top[labels == k] for k in range(labels.max() + 1) if np.sum(labels == k) >= 30]
-    groups.sort(key=len, reverse=True)
-    groups = groups[:n] if groups else [top]
+    pieces = [top[labels == k] for k in range(labels.max() + 1) if np.sum(labels == k) >= 30]
 
+    # 2. Níveis: pedaços ordenados pela altura; um novo nível começa quando a altura salta > 1.5 cm
+    pieces.sort(key=lambda g: np.median(g[:, 2]))
+    levels = []
+    for g in pieces:
+        if levels and np.median(g[:, 2]) - np.median(levels[-1][:, 2]) < 0.015:
+            levels[-1] = np.vstack([levels[-1], g])
+        else:
+            levels.append(g)
+    levels.sort(key=len, reverse=True)
+    groups = [(g, True) for g in levels[:n]] if levels else [(top, False)]   # (pontos, nível inteiro?)
+
+    # 3. Divisões até haver n grupos
     while len(groups) < n:
-        areas = [rect_params(g[:, :2])[3] * rect_params(g[:, :2])[4] for g in groups]
-        g = groups.pop(int(np.argmax(areas)))                  # o grupo com maior área
-        pieces = split_profile(g) if method == "profile" else None
-        groups += list(pieces if pieces is not None else split_kmeans(g))
+        areas = [rect_params(g[:, :2])[3] * rect_params(g[:, :2])[4] for g, _ in groups]
+        g, _ = groups.pop(int(np.argmax(areas)))               # o grupo com maior área
+        split = split_corner(g) if n - len(groups) >= 3 else None
+        if split is None and method == "profile":
+            split = split_profile(g)
+        if split is None:
+            split = split_kmeans(g)
+        groups += [(p, False) for p in split]
 
-    return [np.append(rect_params(g[:, :2]), np.median(g[:, 2])) for g in groups]
+    # 4. Retângulos, do grupo mais alto para o mais baixo
+    groups.sort(key=lambda item: -np.median(item[0][:, 2]))
+    heights = [np.median(g[:, 2]) for g, _ in groups]
+    boxes = []
+    for i, (g, whole_level) in enumerate(groups):
+        rect = rect_params(g[:, :2])
+        if whole_level and i > 0:                               # há caixas mais altas no cluster
+            below = max([h for h in heights if h < heights[i] - 0.015], default=0.0)
+            wall = points[(points[:, 2] > below + 0.01) & (points[:, 2] < heights[i] - 0.01)]
+            for b in boxes:                                     # fora das caixas mais altas
+                wall = wall[~inside_rect(wall[:, :2], b[:5], margin=0.01)]
+            candidates = np.vstack([g, wall])
+            rect = rect_params(candidates[largest_component(candidates), :2])
+        boxes.append(np.append(rect, heights[i]))
+    return boxes
 
 
 def place_on_supports(boxes, min_cover=0.5, min_step=0.02):

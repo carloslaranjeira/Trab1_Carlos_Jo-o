@@ -193,7 +193,16 @@ pontos do topo agrupados por altura (DBSCAN 3D) e, se faltarem grupos, divisão 
 tantas partes como caixas. Há dois métodos de divisão:
 - **k-means no plano:** divide a área ao meio, sem olhar ao contorno;
 - **degraus do contorno:** percorre o topo ao longo do seu eixo principal, em fatias de 5 mm, e corta onde os limites
-  laterais mudam de repente, que é onde acaba uma caixa e começa a outra.
+  laterais mudam de repente, que é onde acaba uma caixa e começa a outra;
+- **canto do L** (quando faltam pelo menos 3 caixas num topo): três caixas iguais encostadas em L formam um topo plano
+  sem juntas visíveis. Procura-se o maior retângulo vazio encostado a um canto do retângulo mínimo (o "buraco" do L) e
+  corta-se pelas duas retas que passam pelo canto interior → 3 retângulos.
+
+**Pilhas da mesma cor:** a cor não separa as caixas e o topo da caixa de baixo só se vê em pedaços à volta da de cima.
+Os pedaços de topo à mesma altura (< 1.5 cm) são juntos num só **nível** (uma caixa). Para uma caixa com caixas mais
+altas por cima, o retângulo usa também as suas **paredes laterais**: pontos entre o nível de baixo e o seu topo, fora
+dos retângulos das caixas mais altas. Sem isto, no teste 5 uma torre de 3 caixas da mesma cor ficava com uma caixa
+pousada na mesa em vez de empilhada (IoU 0.48).
 
 **Caixas empilhadas:** a contagem de caixas por cluster também conta os topos a alturas diferentes (uma pilha tem
 pouca área vista de cima, mas 2 topos → pelo menos 2 caixas). Contam-se as **alturas** diferentes e não os pedaços
