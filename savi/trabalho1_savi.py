@@ -1134,15 +1134,24 @@ def top_surface_points(points, cell=0.02, tolerance=0.006):
 def count_top_levels(points, min_points=30):
     """Número de topos de caixa (superfícies horizontais separadas) num cluster.
 
-    Agrupa os pontos do topo (top_surface_points) com DBSCAN em 3D: topos a alturas diferentes
-    ficam em grupos diferentes. Grupos com menos de 30 pontos (ruído) não contam.
+    1. Agrupa os pontos do topo (top_surface_points) com DBSCAN em 3D. Grupos com menos de 30 pontos
+       (ruído) não contam;
+    2. Conta as ALTURAS diferentes desses grupos, e não os grupos: numa pilha, a caixa de cima tapa
+       parte do topo da caixa de baixo, e o que se vê desse topo pode ficar partido em vários pedaços
+       (um de cada lado da caixa de cima). Pedaços a menos de 1.5 cm de altura uns dos outros são
+       o mesmo topo.
     Serve para as caixas empilhadas: uma pilha de 2 tem 2 topos, a alturas diferentes.
     """
     top = points[top_surface_points(points)]
     if len(top) < min_points:
         return 1
     labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(top)).cluster_dbscan(0.012, 5))
-    return max(1, sum(np.sum(labels == k) >= min_points for k in range(labels.max() + 1)))
+    heights = sorted(np.median(top[labels == k, 2]) for k in range(labels.max() + 1)
+                     if np.sum(labels == k) >= min_points)
+    if not heights:
+        return 1
+    # Alturas ordenadas: um novo topo começa sempre que a altura salta mais de 1.5 cm
+    return 1 + int(np.sum(np.diff(heights) > 0.015))
 
 
 def allocate_boxes(points, clusters, num_boxes):

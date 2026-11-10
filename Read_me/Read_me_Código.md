@@ -196,7 +196,9 @@ tantas partes como caixas. Há dois métodos de divisão:
   laterais mudam de repente, que é onde acaba uma caixa e começa a outra.
 
 **Caixas empilhadas:** a contagem de caixas por cluster também conta os topos a alturas diferentes (uma pilha tem
-pouca área vista de cima, mas 2 topos → pelo menos 2 caixas). Na estimativa inicial, uma caixa está por cima de outra
+pouca área vista de cima, mas 2 topos → pelo menos 2 caixas). Contam-se as **alturas** diferentes e não os pedaços
+de topo: a caixa de cima tapa parte do topo da de baixo, e o que se vê dele pode ficar partido em vários pedaços à
+mesma altura (no teste 4, uma pilha rodada deu 4 pedaços e a caixa extra foi para o cluster errado). Na estimativa inicial, uma caixa está por cima de outra
 se o topo da outra está ≥ 2 cm mais abaixo e os retângulos vistos de cima se sobrepõem em ≥ 50% da área do mais
 pequeno; a base fica no topo da caixa de baixo. (Caixas encostadas lado a lado quase não se sobrepõem vistas de cima.)
 Resultados com as poses verdadeiras das câmaras (`simulator/configs/stack_*.json`):
