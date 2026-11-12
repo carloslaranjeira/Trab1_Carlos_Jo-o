@@ -195,9 +195,10 @@ tantas partes como caixas. Há dois métodos de divisão:
 - **degraus do contorno:** percorre o topo ao longo do seu eixo principal, em fatias de 5 mm, e corta onde os limites
   laterais mudam de repente, que é onde acaba uma caixa e começa a outra. O degrau tem de ter pelo menos 2.5 cm (somando
   os dois lados): com 1 cm, o ruído das paredes criava degraus falsos em caixas da mesma largura;
-- **partes iguais:** quando um topo tem c caixas e não há degrau nem canto, divide-se em c partes iguais ao longo do lado
-  maior (3 caixas iguais em fila: 1/3 + 1/3 + 1/3, e não 1/2 + 1/4 + 1/4 dividindo ao meio duas vezes). As caixas que
-  faltam vão para o topo com maior área por caixa;
+- **partes iguais:** quando um topo tem c caixas e não há degrau nem canto, divide-se em c partes iguais numa grelha
+  r × s (r·s = c), escolhendo a grelha com as caixas menos alongadas: 3 caixas em fila → 1/3 + 1/3 + 1/3 (e não
+  1/2 + 1/4 + 1/4 dividindo ao meio duas vezes); 4 caixas em quadrado → 2 × 2 (e não 4 tiras: no teste 7 isso deu
+  IoU 0.32). As caixas que faltam vão para o topo com maior área por caixa;
 - **canto do L** (quando faltam pelo menos 3 caixas num topo): três caixas iguais encostadas em L formam um topo plano
   sem juntas visíveis. Procura-se o maior retângulo vazio encostado a um canto do retângulo mínimo (o "buraco" do L) e
   corta-se pelas duas retas que passam pelo canto interior → 3 retângulos.

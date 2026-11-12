@@ -1304,18 +1304,30 @@ def split_kmeans(group):
 
 
 def split_equal(group, k):
-    """Divide um topo em k partes IGUAIS ao longo do seu lado maior.
+    """Divide um topo em k partes IGUAIS, numa grelha de r x s células (r * s = k).
 
-    Caixas iguais da mesma cor encostadas em fila formam um só topo, sem juntas nem degraus: não há
-    nenhuma informação sobre onde acaba cada caixa. A hipótese mais simples é que são do mesmo
-    tamanho. (Dividir ao meio duas vezes dava 1/2 + 1/4 + 1/4 em vez de 1/3 + 1/3 + 1/3.)
+    Caixas iguais da mesma cor encostadas formam um só topo, sem juntas nem degraus: não há nenhuma
+    informação sobre onde acaba cada caixa. A hipótese mais simples é que são do mesmo tamanho.
+      - 3 caixas em fila: 3 x 1 -> 1/3 + 1/3 + 1/3 (dividir ao meio duas vezes dava 1/2 + 1/4 + 1/4);
+      - 4 caixas em quadrado: 2 x 2 (em fila, 4 x 1, davam 4 tiras compridas: teste 7, cena 5).
+    Escolhe-se a grelha cujas células (caixas) são MENOS alongadas: as caixas reais não costumam ser
+    tiras muito finas.
     """
     _, (a, b), angle = cv2.minAreaRect(group[:, :2].astype(np.float32))
     angle = np.radians(angle) + (0.0 if a >= b else np.pi / 2)   # direção do lado maior
-    u = group[:, :2] @ [np.cos(angle), np.sin(angle)]
-    edges = np.linspace(u.min(), u.max(), k + 1)
-    which = np.clip(np.digitize(u, edges[1:-1]), 0, k - 1)
-    return [group[which == i] for i in range(k) if np.any(which == i)]
+    long_side, short_side = max(a, b), min(a, b)
+    u = group[:, :2] @ [np.cos(angle), np.sin(angle)]             # ao longo do lado maior
+    v = group[:, :2] @ [-np.sin(angle), np.cos(angle)]            # ao longo do lado menor
+
+    grids = [(r, k // r) for r in range(1, k + 1) if k % r == 0]  # (divisões em u, divisões em v)
+    elongation = [max(long_side / r, short_side / s) / max(min(long_side / r, short_side / s), 1e-3)
+                  for r, s in grids]
+    r, s = grids[int(np.argmin(elongation))]
+
+    iu = np.clip(np.digitize(u, np.linspace(u.min(), u.max(), r + 1)[1:-1]), 0, r - 1)
+    iv = np.clip(np.digitize(v, np.linspace(v.min(), v.max(), s + 1)[1:-1]), 0, s - 1)
+    cell = iu * s + iv
+    return [group[cell == i] for i in range(k) if np.any(cell == i)]
 
 
 def split_profile(group, bin_size=0.005, min_piece=0.04, min_step=0.025):
@@ -1428,7 +1440,7 @@ def split_geometric(points, n, method="kmeans"):
          - c = 3 e forma de L: corta pelo canto interior do L (split_corner);
          - c = 2, method="kmeans":  k-means no plano;
          - c = 2, method="profile": no degrau do contorno (split_profile); sem degrau, partes iguais;
-         - restantes casos: c partes iguais ao longo do lado maior (split_equal).
+         - restantes casos: c partes iguais, numa grelha (fila ou 2x2) com as caixas menos alongadas (split_equal).
        A divisão é só uma aproximação: a otimização corrige a fronteira. Mas, se começar muito
        longe, pode ficar presa num mínimo local, por isso run() experimenta os dois métodos;
     4. Retângulo de cada caixa visto de cima. Para um nível que não foi dividido e que tem caixas
