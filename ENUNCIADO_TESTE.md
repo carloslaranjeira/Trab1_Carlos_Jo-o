@@ -1,22 +1,22 @@
-# Teste — Dia da apresentação (simulação n.º 7: 10 cenas difíceis)
+# Teste — Dia da apresentação (simulação n.º 8: 10 cenas aleatórias)
 
 As cenas estão na pasta `cenas_teste/`. Foram geradas pelo simulador e **não têm** `ground_truth.json` nem `config.json`.
 
-Cada cena tem entre **2 e 4 imagens** (câmaras num arco, 45° a 75° entre vizinhas). Muitas cenas têm caixas da
-**mesma cor** encostadas ou empilhadas.
+As cenas têm dificuldades diferentes e entre **1 e 8 imagens**. Com 1 a 4 imagens, as câmaras estão num arco (45° a 75°
+entre vizinhas); com 5 a 8, dão a volta à mesa.
 
 | cena | caixas | imagens |
 |---|---|---|
-| cena_1 | 2 | 3 |
-| cena_2 | 3 | 4 |
-| cena_3 | 2 | 3 |
-| cena_4 | 3 | 4 |
-| cena_5 | 4 | 4 |
-| cena_6 | 3 | 3 |
-| cena_7 | 3 | 2 |
-| cena_8 | 4 | 4 |
-| cena_9 | 2 | 2 |
-| cena_10 | 4 | 4 |
+| cena_1 | 3 | 5 |
+| cena_2 | 2 | 2 |
+| cena_3 | 2 | 6 |
+| cena_4 | 4 | 8 |
+| cena_5 | 3 | 1 |
+| cena_6 | 2 | 7 |
+| cena_7 | 4 | 3 |
+| cena_8 | 1 | 3 |
+| cena_9 | 2 | 6 |
+| cena_10 | 3 | 4 |
 
 ## O que tem de fazer
 
