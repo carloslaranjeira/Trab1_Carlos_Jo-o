@@ -209,9 +209,17 @@ verde fica com 2 caixas (mesma regra dos topos e da área) e é dividido pela ge
 
 **Pilhas da mesma cor:** a cor não separa as caixas e o topo da caixa de baixo só se vê em pedaços à volta da de cima.
 Os pedaços de topo à mesma altura (< 1.5 cm) são juntos num só **nível** (uma caixa). Para uma caixa com caixas mais
-altas por cima, o retângulo usa também as suas **paredes laterais**: pontos entre o nível de baixo e o seu topo, fora
-dos retângulos das caixas mais altas. Sem isto, no teste 5 uma torre de 3 caixas da mesma cor ficava com uma caixa
-pousada na mesa em vez de empilhada (IoU 0.48).
+altas por cima, o retângulo usa também as suas **paredes laterais**: pontos entre o nível de baixo e o seu topo, menos
+os que estão no contorno das caixas mais altas (a menos de 1.5 cm: são as paredes delas). Sem isto, no teste 5 uma
+torre de 3 caixas da mesma cor ficava com uma caixa pousada na mesa em vez de empilhada (IoU 0.48).
+
+Quando a caixa de cima está **rodada e sai para fora** da de baixo, o que se vê da de baixo fica partido: só os cantos,
+ou um pedaço de cada lado, e as paredes por baixo da parte saliente ficam dentro do retângulo da caixa de cima. Por
+isso (teste 8): (1) só se tiram as paredes no contorno da caixa de cima, não todas as que estão dentro do retângulo dela;
+(2) ficam todos os pedaços grandes (≥ 50 pontos) e não só o maior; (3) deixou de se acrescentar os cantos da caixa de
+cima ao retângulo da de baixo (alargava-a quando a de cima sai para fora). Nas cenas 1 e 3 do teste 8 (torre de 3 e
+pilha de 2, da mesma cor, rodadas) o IoU passou de 0.49 e 0.46 para 0.97 e 0.98; nas pilhas dos testes anteriores
+ficou igual ou melhor.
 
 **Caixas empilhadas:** a contagem de caixas por cluster também conta os topos a alturas diferentes (uma pilha tem
 pouca área vista de cima, mas 2 topos → pelo menos 2 caixas). Contam-se as **alturas** diferentes e não os pedaços

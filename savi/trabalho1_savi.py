@@ -1116,6 +1116,25 @@ def footprint_area(points_xy):
     return a * b
 
 
+def components_with(points, n_seed, eps=0.012, min_seed=10, min_size=50):
+    """Índices das componentes ligadas (DBSCAN) que pertencem à caixa.
+
+    Os primeiros n_seed pontos são os de confiança (o topo de uma caixa). Fica uma componente que tem
+    pelo menos min_seed desses pontos, ou que é grande (min_size pontos): um pedaço de parede pode
+    não tocar no topo visível (a caixa de cima tapa o topo quase todo). Saem os grupos pequenos de
+    pontos soltos.
+    """
+    if len(points) < 20:
+        return np.arange(len(points))
+    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points)).cluster_dbscan(eps, 5))
+    seed = labels[:n_seed]
+    keep = [k for k in range(labels.max() + 1)
+            if np.sum(seed == k) >= min_seed or np.sum(labels == k) >= min_size]
+    if not keep:
+        return largest_component(points, eps)
+    return np.nonzero(np.isin(labels, keep))[0]
+
+
 def top_surface_points(points, cell=0.02, tolerance=0.006):
     """Índices dos pontos que estão no TOPO de alguma caixa.
 
@@ -1446,7 +1465,9 @@ def split_geometric(points, n, method="kmeans"):
     4. Retângulo de cada caixa visto de cima. Para um nível que não foi dividido e que tem caixas
        mais altas no cluster, o topo visível pode ser só uma moldura ou um pedaço (o resto está
        tapado pela caixa de cima). Juntam-se então as PAREDES dessa caixa: pontos entre o nível de
-       baixo e o seu topo, fora dos retângulos das caixas mais altas (que já estão calculados).
+       baixo e o seu topo, menos os que estão no contorno das caixas mais altas (as paredes delas).
+       Se a caixa de cima está rodada e sai para fora, o que se vê da de baixo fica em vários
+       pedaços (cantos, um de cada lado): ficam todos os pedaços grandes, não só o maior.
     Saída: lista de n caixas [x, y, yaw, length, width, topo] (ainda sem z: ver place_on_supports).
     """
     top = points[top_surface_points(points)]
@@ -1497,17 +1518,18 @@ def split_geometric(points, n, method="kmeans"):
         if whole_level and alone and heights[0] > heights[i] + 0.015:
             below = max([h for h in heights if h < heights[i] - 0.015], default=0.0)
             wall = points[(points[:, 2] > below + 0.01) & (points[:, 2] < heights[i] - 0.01)]
-            for b in boxes:                                     # fora das caixas mais altas
-                wall = wall[~inside_rect(wall[:, :2], b[:5], margin=0.01)]
+            # Tira as paredes das caixas mais altas: estão no contorno delas (a menos de 1-1.5 cm).
+            # Os pontos BEM dentro do retângulo de uma caixa mais alta ficam: são paredes desta caixa,
+            # por baixo de uma parte da caixa de cima que sai para fora (caixa de cima rodada).
+            for b in boxes:
+                wall = wall[~(inside_rect(wall[:, :2], b[:5], margin=0.01) &
+                              ~inside_rect(wall[:, :2], b[:5], margin=-0.015))]
             candidates = np.vstack([g, wall])
-            candidates = candidates[largest_component(candidates)]
+            # Fica com todas as componentes ligadas que têm pontos do topo desta caixa (e não só a
+            # maior): se a caixa de cima está rodada e sai para fora, divide o que se vê da caixa de
+            # baixo em pedaços separados (um de cada lado, ou só os cantos), todos da mesma caixa.
+            candidates = candidates[components_with(candidates, len(g))]
             rect = rect_params(candidates[:, :2])
-            # Uma caixa da pilha tem de suportar as que estão por cima dela: se o centro de uma caixa
-            # mais alta está sobre esta, os cantos dela também ficam dentro do retângulo (com poucas
-            # câmaras, as paredes e o topo visível desta caixa podem ser só de um lado).
-            corners = [box_corners_2d(*b[:5]) for b in boxes if inside_rect(b[None, :2], rect, margin=0.02)[0]]
-            if corners:
-                rect = rect_params(np.vstack([candidates[:, :2]] + corners))
         boxes.append(np.append(rect, heights[i]))
     return boxes
 
