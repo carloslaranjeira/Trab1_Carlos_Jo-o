@@ -511,9 +511,41 @@ def alignment_score(source, target, T, distance=0.02, max_color_diff=0.08):
     src.transform(T)
     tree = cKDTree(np.asarray(dst.points))                     # para achar o vizinho mais próximo
     dist, idx = tree.query(np.asarray(src.points), k=1)
-    color_diff = np.abs(np.asarray(dst.colors)[idx] - np.asarray(src.colors)).mean(axis=1)
+    src_colors = exposure_corrected(np.asarray(src.colors), np.asarray(dst.colors)[idx], dist < distance)
+    color_diff = np.abs(np.asarray(dst.colors)[idx] - src_colors).mean(axis=1)
     good = (dist < distance) & (color_diff < max_color_diff)
     return good.mean()
+
+
+def exposure_fit(colors, colors_target, close, min_points=50):
+    """Ganho s e desvio b que levam a exposição de uma imagem à de outra: cor' = s * cor + b.
+
+    Com exposição automática, a mesma superfície pode aparecer mais clara ou mais escura em cada
+    imagem (no teste 10, uma imagem tinha s = 0.66 e b = -0.06). s e b estimam-se por mínimos
+    quadrados com os pares de pontos que coincidem em geometria ('close'), em duas passagens: a
+    segunda sem os 30% de pares com maior resíduo (arestas, sombras, pares de objetos diferentes).
+    Sem pares suficientes: s = 1, b = 0 (não se corrige).
+    """
+    if close.sum() < min_points:
+        return 1.0, 0.0
+    x, y = colors[close].ravel(), colors_target[close].ravel()
+    keep = np.ones(len(x), bool)
+    for _ in range(2):
+        A = np.stack([x[keep], np.ones(keep.sum())], axis=1)
+        s, b = np.linalg.lstsq(A, y[keep], rcond=None)[0]
+        residual = np.abs(y - (s * x + b))
+        keep = residual <= np.percentile(residual, 70)
+    return float(np.clip(s, 0.5, 2.0)), float(np.clip(b, -0.2, 0.2))
+
+
+def exposure_corrected(colors, colors_target, close):
+    """Cores de uma imagem com a exposição corrigida para a de outra (ver exposure_fit).
+
+    Sem isto, comparar cores diretamente dava score ~0 a TODAS as hipóteses de um par com exposições
+    diferentes, e a certa deixava de se distinguir da errada (mesa rodada 180°).
+    """
+    s, b = exposure_fit(colors, colors_target, close)
+    return np.clip(s * colors + b, 0.0, 1.0)
 
 
 def free_space_violation(view_target, K, T_target_source, cloud_source, margin=0.03):
@@ -567,7 +599,7 @@ def is_confident(candidates):
     - score médio (>= LOW_PAIR_SCORE): só se for pelo menos MARGIN_RATIO vezes melhor do que a
       melhor hipótese que leva a uma solução DIFERENTE. Com poucas câmaras a sobreposição entre
       vistas é pequena e o score do par correto fica baixo, mas o da alternativa errada fica muito
-      mais baixo ainda;
+      mais baixo ainda. Sem nenhuma hipótese diferente, tem de ser MARGIN_RATIO x LOW_PAIR_SCORE;
     - abaixo disso: não.
     """
     best = max(candidates, key=lambda c: c[0])
@@ -575,8 +607,10 @@ def is_confident(candidates):
         return True
     if best[0] < LOW_PAIR_SCORE:
         return False
+    # Sem rivais, compara-se com uma rival imaginária no limite (LOW_PAIR_SCORE): uma hipótese sozinha
+    # não é prova de que está certa (no teste 10 a única que sobrou estava rodada 180°, score 0.054)
     rivals = [c[0] for c in candidates if is_different(c[1], best[1])]
-    return not rivals or best[0] >= MARGIN_RATIO * max(rivals)
+    return best[0] >= MARGIN_RATIO * max(rivals + [LOW_PAIR_SCORE])
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -801,7 +835,8 @@ def register_scene(scene, loop_closure=True, verbose=True):
 
 
 def aggregate(scene, T_camera0_cameras):
-    """Junta todas as nuvens (resolução original) no referencial da câmara 0.
+    """Junta todas as nuvens (resolução original) no referencial da câmara 0, com a exposição de
+    cada imagem corrigida para a da câmara 0.
 
     Saída: (nuvem agregada, índice da câmara que adquiriu cada ponto).
     """
@@ -810,6 +845,14 @@ def aggregate(scene, T_camera0_cameras):
     for k, (view, T) in enumerate(zip(scene.views, T_camera0_cameras)):
         cloud = copy.deepcopy(view.cloud)       # cópia, para não alterar a nuvem original
         cloud.transform(T)                      # leva os pontos para o referencial da câmara 0
+        if k > 0:
+            # Exposição: a cor desta imagem passa a ter a exposição das anteriores. A cromaticidade
+            # (chroma_features) cancela o ganho s mas não o desvio b, e com cores de exposições
+            # diferentes duas caixas de cores parecidas (laranja e castanho) deixavam de se separar.
+            small, ref = cloud.voxel_down_sample(0.01), aggregated.voxel_down_sample(0.01)
+            dist, idx = cKDTree(np.asarray(ref.points)).query(np.asarray(small.points), k=1)
+            s, b = exposure_fit(np.asarray(small.colors), np.asarray(ref.colors)[idx], dist < 0.01)
+            cloud.colors = o3d.utility.Vector3dVector(np.clip(s * np.asarray(cloud.colors) + b, 0.0, 1.0))
         aggregated += cloud
         camera_index.append(np.full(len(cloud.points), k))
     return aggregated, np.concatenate(camera_index)

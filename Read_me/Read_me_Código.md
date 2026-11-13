@@ -119,7 +119,16 @@ No nível 4: erros entre 0.4 e 2.4 mm e abaixo de 0.05°.
 - **Teste de espaço livre:** cada pixel de uma câmara diz que entre ela e a superfície medida não há nada; uma
   hipótese que põe pontos da outra câmara nesse espaço vazio (com margem 3 cm + 0.005·z², o ruído cresce com
   z²) é descartada se mais de 10% dos pontos o violarem (corretas: 1–5%; erradas: 19–40%).
-- **Confiança:** score ≥ 0.18, ou score ≥ 0.05 e pelo menos 1.5× melhor que a melhor hipótese diferente.
+- **Confiança:** score ≥ 0.18, ou score ≥ 0.05 e pelo menos 1.5× melhor que a melhor hipótese diferente. Uma
+  hipótese sozinha (sem nenhuma diferente) tem de ter score ≥ 1.5 × 0.05 = 0.075: no teste 10 a única hipótese
+  que sobrou num par estava rodada 180° e tinha score 0.054.
+- **Mudanças de exposição:** com exposição automática, a cor de cada imagem é `s · cor + b` (no teste 10, uma
+  imagem tinha s = 0.66, b = −0.06). `exposure_fit` estima s e b por mínimos quadrados com os pontos que
+  coincidem em geometria (2 passagens, sem os 30% de maior resíduo). Usa-se em dois sítios:
+  (1) no `alignment_score`, antes de comparar cores: sem isto todas as hipóteses tinham score ~0.003 e a mesa
+  rodada 180° ganhou (erro de 2.35 m numa câmara); (2) no `aggregate`, cada imagem fica com a exposição das
+  anteriores: a cromaticidade cancela s mas não b, e o laranja e o castanho de uma torre deixavam de se
+  separar. Cena 2 do teste 10 (torre de 3, exposição diferente): IoU 0.45 → 0.97.
 - **Sem fecho de ciclo em arco:** se a primeira e a última câmara olharem com mais de 100° de diferença não
   têm nada em comum, e o par 3→0 só dava soluções erradas.
 - **Faces nunca vistas:** no ajuste, o termo de cobertura só conta faces viradas para alguma câmara.
