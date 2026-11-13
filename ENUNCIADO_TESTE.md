@@ -1,4 +1,4 @@
-# Teste — Dia da apresentação (simulação n.º 9: 10 cenas aleatórias)
+# Teste — Dia da apresentação (simulação n.º 10: 10 cenas aleatórias)
 
 As cenas estão na pasta `cenas_teste/`. Foram geradas pelo simulador e **não têm** `ground_truth.json` nem `config.json`.
 
@@ -7,16 +7,16 @@ entre vizinhas); com 5 a 8, dão a volta à mesa.
 
 | cena | caixas | imagens |
 |---|---|---|
-| cena_1 | 2 | 1 |
-| cena_2 | 2 | 8 |
-| cena_3 | 1 | 4 |
-| cena_4 | 3 | 3 |
-| cena_5 | 2 | 6 |
-| cena_6 | 4 | 6 |
-| cena_7 | 4 | 2 |
-| cena_8 | 2 | 5 |
-| cena_9 | 3 | 7 |
-| cena_10 | 3 | 3 |
+| cena_1 | 2 | 3 |
+| cena_2 | 3 | 3 |
+| cena_3 | 3 | 1 |
+| cena_4 | 2 | 6 |
+| cena_5 | 1 | 8 |
+| cena_6 | 2 | 5 |
+| cena_7 | 4 | 7 |
+| cena_8 | 4 | 6 |
+| cena_9 | 3 | 4 |
+| cena_10 | 2 | 2 |
 
 ## O que tem de fazer
 
