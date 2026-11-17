@@ -7,11 +7,12 @@ Utilização:
     python run_test.py --git        # e faz git add + commit + push depois de cada cena
     python run_test.py --redo       # volta a correr cenas que já têm resultado
 
-Para cada cena test/<cena>/ corre os 2 scripts:
-    1. savi/detecao_caixas.py  -> test/<cena>/detecao/ (nuvem de pontos só das caixas + câmaras e mesa)
-    2. savi/avaliador_caixas.py -> results_test/<cena>/result.json (e a figura top_view.png)
-O número de caixas de cada cena (só o script 2 precisa dele) vem de test/num_boxes.json; se faltar,
-é perguntado no terminal, para todas as cenas, antes de começar.
+Corre os 2 scripts um depois do outro, em duas fases:
+    FASE 1. savi/detecao_caixas.py em TODAS as cenas -> test/<cena>/detecao/
+            (nuvem de pontos só das caixas + câmaras e mesa; não precisa do número de caixas)
+    FASE 2. só depois de a fase 1 acabar: savi/avaliador_caixas.py em cada cena. É aqui que é
+            pedido, cena a cena, o número de caixas -> results_test/<cena>/result.json (e top_view.png)
+O número de caixas de uma cena que esteja em test/num_boxes.json não é perguntado.
 
 Pensado para não perder resultados:
     - um erro numa cena não pára as outras (fica registado e passa-se à seguinte);
@@ -126,27 +127,40 @@ def main_test():
         print(f"Não há cenas em {scenes_dir} (cada cena tem de ter a subpasta point_clouds/)")
         return
 
-    # Primeiro recolhe o número de caixas de TODAS as cenas, para depois correr sem interrupções
     known = read_num_boxes(scenes_dir / "num_boxes.json")
-    num_boxes = {s.name: known[s.name] if s.name in known else ask_num_boxes(s.name) for s in scenes}
-    print("\nCenas a processar:", ", ".join(f"{k} ({v} caixas)" for k, v in num_boxes.items()))
-
+    todo = [s for s in scenes if args.redo or not (output / s.name / "result.json").exists()]
+    for s in scenes:
+        if s not in todo:
+            print(f"{s.name}: já tem resultado, saltada")
     start = time.time()
-    done, failed = [], []
-    for k, scene in enumerate(scenes, 1):
-        result_path = output / scene.name / "result.json"
-        if result_path.exists() and not args.redo:
-            print(f"\n[{k}/{len(scenes)}] {scene.name}: já tem resultado, saltada")
-            continue
+    failed = []
 
-        print(f"\n[{k}/{len(scenes)}] {scene.name} ({num_boxes[scene.name]} caixas)"
-              f" - {(time.time() - start) / 60:.1f} min desde o início")
+    # ---------------- FASE 1: script 1 (deteção) em todas as cenas ----------------
+    # Não precisa do número de caixas, por isso corre sem interrupções.
+    print(f"\n===== FASE 1: deteção (script 1) em {len(todo)} cenas =====")
+    detected = []
+    for k, scene in enumerate(todo, 1):
+        print(f"\n[{k}/{len(todo)}] {scene.name} - {(time.time() - start) / 60:.1f} min desde o início")
         try:
-            # Script 1: deteção -> nuvem de pontos só das caixas em test/<cena>/detecao/
-            detection = scene / "detecao"
-            detecao.run_detection(scene, detection)
-            # Script 2: avaliador -> caixas com o número indicado -> result.json
-            r = avaliador.run(detection, num_boxes[scene.name])
+            # Nuvem de pontos só das caixas em test/<cena>/detecao/
+            detecao.run_detection(scene, scene / "detecao")
+            detected.append(scene)
+        except Exception:
+            # Não deixa uma cena com problemas impedir as restantes
+            traceback.print_exc()
+            print(f"  ERRO na deteção da cena {scene.name}: passa à seguinte")
+            failed.append(scene.name)
+
+    # ---------------- FASE 2: script 2 (avaliador) ----------------
+    # Só agora, com a deteção de todas as cenas feita, é pedido o número de caixas de cada cena.
+    print(f"\n===== FASE 2: avaliador (script 2) em {len(detected)} cenas =====")
+    done = []
+    for k, scene in enumerate(detected, 1):
+        result_path = output / scene.name / "result.json"
+        print(f"\n[{k}/{len(detected)}] {scene.name}")
+        n = known[scene.name] if scene.name in known else ask_num_boxes(scene.name)
+        try:
+            r = avaliador.run(scene / "detecao", n)
             boxes = avaliador.boxes_to_camera0(r["params_opt"], r["table"].T_camera0_table)
             avaliador.write_result(result_path, r["images"], r["T_cams"], boxes)
             print(f"  -> {result_path}")
@@ -160,9 +174,8 @@ def main_test():
             if args.git:
                 git_push(output, f"Resultado da cena {scene.name}")
         except Exception:
-            # Não deixa uma cena com problemas impedir as restantes
             traceback.print_exc()
-            print(f"  ERRO na cena {scene.name}: passa à seguinte")
+            print(f"  ERRO no avaliador da cena {scene.name}: passa à seguinte")
             failed.append(scene.name)
 
     print(f"\nTerminado em {(time.time() - start) / 60:.1f} min. "
