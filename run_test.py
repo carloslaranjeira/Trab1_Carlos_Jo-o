@@ -7,8 +7,11 @@ Utilização:
     python run_test.py --git        # e faz git add + commit + push depois de cada cena
     python run_test.py --redo       # volta a correr cenas que já têm resultado
 
-Para cada cena test/<cena>/ escreve results_test/<cena>/result.json (e a figura top_view.png).
-O número de caixas de cada cena vem de test/num_boxes.json; se faltar, é perguntado no terminal.
+Para cada cena test/<cena>/ corre os 2 scripts:
+    1. savi/detecao_caixas.py  -> test/<cena>/detecao/ (nuvem de pontos só das caixas + câmaras e mesa)
+    2. savi/avaliador_caixas.py -> results_test/<cena>/result.json (e a figura top_view.png)
+O número de caixas de cada cena (só o script 2 precisa dele) vem de test/num_boxes.json; se faltar,
+é perguntado no terminal, para todas as cenas, antes de começar.
 
 Pensado para não perder resultados:
     - um erro numa cena não pára as outras (fica registado e passa-se à seguinte);
@@ -30,7 +33,8 @@ from pathlib import Path
 FOLDER = Path(__file__).resolve().parent         # pasta principal do trabalho
 # O código está na pasta savi/: junta-a aos sítios onde o Python procura módulos
 sys.path.insert(0, str(FOLDER / "savi"))
-import trabalho1_savi as t1                       # noqa: E402 (tem de vir depois do sys.path)
+import avaliador_caixas as avaliador              # noqa: E402 (script 2; tem de vir depois do sys.path)
+import detecao_caixas as detecao                  # noqa: E402 (script 1)
 
 
 def natural_key(path):
@@ -138,14 +142,18 @@ def main_test():
         print(f"\n[{k}/{len(scenes)}] {scene.name} ({num_boxes[scene.name]} caixas)"
               f" - {(time.time() - start) / 60:.1f} min desde o início")
         try:
-            r = t1.run(scene, num_boxes[scene.name])
-            boxes = t1.boxes_to_camera0(r["params_opt"], r["table"].T_camera0_table)
-            t1.write_result(result_path, [v.name for v in r["scene"].views], r["T_cams"], boxes)
+            # Script 1: deteção -> nuvem de pontos só das caixas em test/<cena>/detecao/
+            detection = scene / "detecao"
+            detecao.run_detection(scene, detection)
+            # Script 2: avaliador -> caixas com o número indicado -> result.json
+            r = avaliador.run(detection, num_boxes[scene.name])
+            boxes = avaliador.boxes_to_camera0(r["params_opt"], r["table"].T_camera0_table)
+            avaliador.write_result(result_path, r["images"], r["T_cams"], boxes)
             print(f"  -> {result_path}")
             try:
                 # Figura da vista de cima (se falhar, o result.json já está escrito)
-                t1.save_top_view(result_path.parent / "top_view.png", r["seg"].points,
-                                 r["seg"].colors, r["params_opt"], r["params_bbox"], title=scene.name)
+                avaliador.save_top_view(result_path.parent / "top_view.png", r["seg"].points,
+                                        r["seg"].colors, r["params_opt"], r["params_bbox"], title=scene.name)
             except Exception as error:
                 print(f"  (figura não gravada: {error})")
             done.append(scene.name)
