@@ -1159,6 +1159,18 @@ def footprint_area(points_xy):
     return a * b
 
 
+def large_components(points, eps=0.012, fraction=0.1, min_size=50):
+    """Índices das componentes ligadas (DBSCAN) com pelo menos 10% dos pontos da maior (e 50 pontos)."""
+    if len(points) < 20:
+        return np.arange(len(points))
+    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points)).cluster_dbscan(eps, 5))
+    if labels.max() < 0:
+        return np.arange(len(points))
+    sizes = np.bincount(labels[labels >= 0])
+    keep = np.nonzero(sizes >= max(fraction * sizes.max(), min_size))[0]
+    return np.nonzero(np.isin(labels, keep))[0]
+
+
 def components_with(points, n_seed, eps=0.012, min_seed=10, min_size=50):
     """Índices das componentes ligadas (DBSCAN) que pertencem à caixa.
 
@@ -1636,7 +1648,10 @@ def initial_boxes(seg, split_method="kmeans"):
             tops = []
             for g, c in per_color.items():
                 sel = np.nonzero(groups == g)[0]
-                sel = sel[largest_component(pts[sel])]          # retira pontos soltos com a cor errada
+                # Retira pontos soltos com a cor errada. Com uma caixa desta cor fica a maior componente;
+                # com várias, ficam as componentes grandes: numa torre com cores alternadas (laranja,
+                # rosa, laranja, rosa) as caixas da mesma cor não se tocam (teste 11, cena 6).
+                sel = sel[largest_component(pts[sel]) if c == 1 else large_components(pts[sel])]
                 color = np.median(chroma_features(cols[sel]), axis=0)
                 if c == 1:
                     labels[idx[sel]] = first + len(tops)

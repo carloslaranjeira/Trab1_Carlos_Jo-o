@@ -214,7 +214,11 @@ tantas partes como caixas. Há dois métodos de divisão:
 
 **Cor parcial:** num cluster com n caixas onde algumas têm a mesma cor, o k-means com n cores falha. Experimenta-se
 então n-1, ..., 2 cores: por exemplo, duas caixas verdes encostadas e uma rosa por cima dão 2 grupos de cor; o grupo
-verde fica com 2 caixas (mesma regra dos topos e da área) e é dividido pela geometria.
+verde fica com 2 caixas (mesma regra dos topos e da área) e é dividido pela geometria. Os pontos de cada cor
+passam por um filtro de pontos soltos: com 1 caixa dessa cor fica só a maior componente ligada; com várias
+ficam todas as componentes grandes (≥ 10% da maior). Numa torre de cores alternadas (laranja, rosa, laranja,
+rosa) as caixas da mesma cor não se tocam, e ficar só com a maior deitava fora a de cima (teste 11, cena 6:
+IoU 0.25 → 0.985).
 
 **Pilhas da mesma cor:** a cor não separa as caixas e o topo da caixa de baixo só se vê em pedaços à volta da de cima.
 Os pedaços de topo à mesma altura (< 1.5 cm) são juntos num só **nível** (uma caixa). Para uma caixa com caixas mais
