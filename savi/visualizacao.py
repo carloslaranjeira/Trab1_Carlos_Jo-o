@@ -35,7 +35,10 @@ CAMERA_NAMES = ["azul", "laranja", "verde", "vermelho", "roxo", "castanho", "ros
 WINDOW_SIZE = (1100, 750)     # pixels de cada janela
 POINT_SIZE = 2.0              # tamanho de cada ponto desenhado (pixels)
 WHITE = (1.0, 1.0, 1.0)       # cor do fundo
-FRAME_SECONDS = 0.8           # duração de cada passo das animações
+FRAME_SECONDS = 1.2           # duração de cada passo das animações
+CAPTION_FONT = ("Segoe UI", 20, "bold")      # legenda das animações (comentário de cada passo)
+CAPTION_COLORS = ("#ffffff", "#1f2937")      # letra branca sobre fundo cinzento escuro
+CAPTION_MARGIN = 40           # pixels entre a legenda e o fundo da janela
 REPEAT_SECONDS = 3.0          # pausa no fim de uma animação, antes de recomeçar
 
 
@@ -195,16 +198,84 @@ def _look_at(vis, view):
 KEY_RIGHT, KEY_LEFT = 262, 263      # códigos das setas -> e <- no visualizador do Open3D (GLFW)
 
 
+def _window_handle(window):
+    """Identificador (HWND) da janela do Open3D no Windows, procurado pelo título com que foi criada;
+    0 noutros sistemas ou se ainda não existir."""
+    if os.name != "nt":
+        return 0
+    if not window.get("hwnd"):
+        import ctypes
+        window["hwnd"] = ctypes.windll.user32.FindWindowW(None, window["created_title"])
+    return window["hwnd"]
+
+
 def _set_window_title(window, text):
     """Muda o título de uma janela (o visualizador do Open3D não o permite: usa-se a API do Windows)."""
-    if os.name != "nt":
-        return
-    import ctypes
-    user32 = ctypes.windll.user32
-    if not window.get("hwnd"):
-        window["hwnd"] = user32.FindWindowW(None, window["created_title"])
-    if window["hwnd"]:
-        user32.SetWindowTextW(window["hwnd"], text)
+    hwnd = _window_handle(window)
+    if hwnd:
+        import ctypes
+        ctypes.windll.user32.SetWindowTextW(hwnd, text)
+
+
+class Caption:
+    """Legenda grande, em baixo e ao centro de uma janela 3D (como as legendas de um filme), para os
+    comentários das animações. O visualizador do Open3D usado aqui não escreve texto na imagem 3D: a
+    legenda é uma pequena janela do tkinter, sem moldura, que pertence à janela do Open3D (fica sempre
+    por cima dela, mexe-se e minimiza com ela, e não fica por cima de outros programas). Só no Windows
+    (usa a API do Windows para saber onde está a janela do Open3D).
+    Não está nas aulas: o tkinter e a API do Windows (ctypes)."""
+    _root = None                         # uma só aplicação tkinter para todas as legendas
+
+    def __init__(self, owner):
+        import ctypes
+        import tkinter as tk
+        if Caption._root is None:
+            Caption._root = tk.Tk()
+            Caption._root.withdraw()
+        self.owner, self.text, self.place = owner, None, None
+        self.top = tk.Toplevel(Caption._root)
+        self.top.overrideredirect(True)                 # sem moldura nem título
+        self.top.attributes("-alpha", 0.9)
+        self.label = tk.Label(self.top, font=CAPTION_FONT, fg=CAPTION_COLORS[0], bg=CAPTION_COLORS[1],
+                              padx=28, pady=12, justify="center")
+        self.label.pack()
+        self.top.withdraw()
+        self.top.update_idletasks()
+        # A janela do Open3D passa a ser a "dona" da legenda (GWLP_HWNDPARENT = -8)
+        ctypes.windll.user32.SetWindowLongPtrW(int(self.top.wm_frame(), 16), -8, owner)
+
+    def show(self, text):
+        """Mostra o texto (ou esconde a legenda, sem texto ou com a janela minimizada), centrado em baixo."""
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        if not text or user32.IsIconic(self.owner) or not user32.IsWindowVisible(self.owner):
+            if self.place is not None:
+                self.top.withdraw()
+                self.place = None
+            return
+        rect = wintypes.RECT()
+        user32.GetWindowRect(self.owner, ctypes.byref(rect))
+        width = rect.right - rect.left
+        if text != self.text:
+            self.label.config(text=text, wraplength=max(300, width - 160))
+            self.text = None                             # tamanho novo: volta a calcular a posição
+        self.top.update_idletasks()
+        w, h = self.top.winfo_reqwidth(), self.top.winfo_reqheight()
+        place = (rect.left + (width - w) // 2, rect.bottom - h - CAPTION_MARGIN)
+        if place != self.place or self.text is None:
+            self.top.geometry(f"+{place[0]}+{place[1]}")
+            self.top.deiconify()
+            self.place, self.text = place, text
+
+    def destroy(self):
+        self.top.destroy()
+
+    @staticmethod
+    def update():
+        """Deixa o tkinter desenhar as legendas (chamado em cada tick)."""
+        if Caption._root is not None:
+            Caption._root.update()
 
 
 class SceneWindows:
@@ -216,7 +287,7 @@ class SceneWindows:
     Uma vista (dicionário) tem: "name" (identifica a vista), "title", "items" (o que desenhar), "view"
     ({"center", "eye", "up"}; sem view, a vista inicial do draw_geometries) e, para as animações,
     "frames" (o que desenhar em cada passo, por cima dos items), "notes" (opcional: um comentário por
-    passo, mostrado no título da janela) e "durations" (opcional: segundos de cada passo; por omissão
+    passo, mostrado numa legenda grande em baixo da janela: Caption) e "durations" (opcional: segundos de cada passo; por omissão
     FRAME_SECONDS, e REPEAT_SECONDS no último). Uma vista pode também ser só uma imagem
     2D (image_item), por exemplo um gráfico do matplotlib.
     """
@@ -277,12 +348,12 @@ class SceneWindows:
 
     @staticmethod
     def _update_title(window):
-        """Título da janela: a vista que está a ser mostrada, de quantas, e (nas animações com comentários)
-        o comentário do passo que está a ser mostrado, logo no início, para se ler bem."""
+        """Título da janela: a vista que está a ser mostrada, de quantas. Os comentários das animações vão
+        para a legenda (Caption); só fora do Windows, sem legenda, vão para o início do título."""
         k = window["current"]
         spec = window["views"][k]
         notes, frame = spec.get("notes"), window.get("frame")
-        note = f"{notes[frame]}   |   " if notes is not None and frame is not None else ""
+        note = f"{notes[frame]}   |   " if notes is not None and frame is not None and os.name != "nt" else ""
         _set_window_title(window, f"{window['group']}  [{k + 1}/{len(window['views'])}]  {note}"
                                   f"{spec['title']}   (setas <- -> mudam de vista)")
 
@@ -316,10 +387,31 @@ class SceneWindows:
                 if spec.get("notes") is not None:
                     self._update_title(window)               # comentário do novo passo
             if not vis.poll_events():                       # a janela foi fechada
+                if window.get("caption") is not None:
+                    window["caption"].destroy()
                 vis.destroy_window()
                 del self.groups[group]
                 continue
             vis.update_renderer()
+            self._update_caption(window)
+        Caption.update()
+
+    @staticmethod
+    def _update_caption(window):
+        """Legenda da janela: o comentário do passo da animação que está a ser mostrado (ou nada)."""
+        spec = window["views"][window["current"]]
+        notes, frame = spec.get("notes"), window.get("frame")
+        text = str(notes[frame]) if notes is not None and frame is not None else None
+        if window.get("caption") is None:
+            if text is None or not _window_handle(window):
+                return
+            try:
+                window["caption"] = Caption(_window_handle(window))
+            except Exception:                              # sem tkinter: fica só o título
+                window["caption"] = False
+                return
+        if window["caption"]:
+            window["caption"].show(text)
 
     def run(self):
         """Espera que todas as janelas sejam fechadas."""

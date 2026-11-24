@@ -74,7 +74,9 @@ CLUSTER_EPS = 0.015          # 3. m: no DBSCAN, pontos a menos de 1.5 cm ficam n
 WALL_MAX_NZ = 0.3            # 5. |n_z| máximo de um ponto de parede de caixa (normal quase horizontal)
 MIN_ROTATION = 10            # 5. graus: paredes com orientações mais próximas do que isto são da mesma caixa
 MIN_WALL_FRACTION = 0.10     # 5. fração mínima das paredes de um cluster numa orientação para contar como caixa
-LATERAL_STEP = 0.008         # 5. m: salto do centro do topo (desvio lateral) que marca uma junta entre caixas
+LATERAL_STEP = 0.005         # 5. m: salto do centro do topo (desvio lateral) que marca uma junta entre caixas
+                             #    (numa caixa isolada o salto medido nunca passou de 2.3 mm; com 4 mm já
+                             #    apareciam juntas falsas)
 WIDTH_STEP = 0.015           # 5. m: salto da largura do topo (larguras diferentes) que marca uma junta
 MIN_BOX_SIDE = 0.05          # 5. m: lado mínimo de uma caixa (juntas mais próximas do que isto são a mesma)
 

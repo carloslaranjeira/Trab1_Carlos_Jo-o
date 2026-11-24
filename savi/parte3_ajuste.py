@@ -934,7 +934,7 @@ def soft_l1_cost(residuals, f_scale=LOSS_SCALE):
 # as caixas a tremer. Só ficam as avaliações que melhoraram o custo (a 'trajetória'). Duas formas:
 #   - janela 3D com a animação (--visualize; dados em figure_data e janela em make_windows, secção 5):
 #     começa na bounding box (método base), passa à estimativa inicial e segue os passos da otimização
-#     até ao resultado final; o título da janela diz em que etapa se está e o custo de cada passo;
+#     até ao resultado final; uma legenda grande, em baixo da janela, diz em que etapa se está e o custo;
 #   - janela do Open3D (--open3d, animate_optimization), a mais parecida com as aulas.
 def evolution_snapshots(history):
     """Do histórico de avaliações, fica só com as que melhoraram o custo (a 'trajetória').
@@ -1183,7 +1183,6 @@ def figure_data(r1, r2, r3):
             "params_bbox": np.asarray(r3["params_bbox"]).reshape(-1, NUM_PARAMS),
             "params_opt": np.asarray(r3["params_opt"]).reshape(-1, NUM_PARAMS), "frames": frames,
             "frame_notes": np.array(notes),
-            "total_steps": len(snapshots) - 1,
             **{f"view_{k}": v for k, v in view.items()}}
 
 
@@ -1202,8 +1201,8 @@ def make_windows(data):
     2. a cena em 3D com as caixas da bounding box;
     3. a cena em 3D com as caixas da otimização;
     4. a evolução das caixas em 3D, sobre os pontos dos objetos (animação, mais lenta no início): a
-       bounding box, a estimativa inicial, os passos da otimização e o resultado final; o título da
-       janela diz em que etapa se está (comentário de cada passo, com o custo)."""
+       bounding box, a estimativa inicial, os passos da otimização e o resultado final; uma legenda
+       grande, em baixo da janela, diz em que etapa se está (comentário de cada passo, com o custo)."""
     title = f"Parte 3 - {data['cena']}"
     view = data_view(data)
     objects = points_item(data["objects"], data["object_colors"], 3.0)
@@ -1226,7 +1225,7 @@ def make_windows(data):
     durations = [BBOX_SECONDS if note.startswith("Método base") else
                  INITIAL_SECONDS if note.startswith("Estimativa inicial") else FRAME_SECONDS for note in notes]
     windows.append({"name": "_evolucao",
-                    "title": f"{title}: da bounding box à otimização, em 3D ({int(data['total_steps'])} passos, animação)",
+                    "title": f"{title}: da bounding box à otimização, em 3D (animação)",
                     "items": [objects], "view": close_view(view, data["objects"]), "frames": frames,
                     "notes": notes, "durations": durations})
     return windows

@@ -50,7 +50,7 @@ Opções de cada parte (todas têm `--scene`, a pasta da cena):
 | `parte3_ajuste.py` | `--output` | onde escrever o `result.json` (por omissão: dentro da pasta da cena) |
 | | `--method bbox` | usa a bounding box no `result.json`, em vez da otimização |
 | | `--no_color` | não usa a cor na otimização |
-| | `--visualize` | 4 vistas: gráfico 2D visto de cima com as caixas dos dois métodos (como o `top_view.png`); bounding box em 3D na cena; otimização em 3D na cena; evolução em 3D (animação lenta: bounding box → estimativa inicial → passos da otimização → resultado final, com o comentário de cada etapa e o custo no título da janela) |
+| | `--visualize` | 4 vistas: gráfico 2D visto de cima com as caixas dos dois métodos (como o `top_view.png`); bounding box em 3D na cena; otimização em 3D na cena; evolução em 3D (animação lenta: bounding box → estimativa inicial → passos da otimização → resultado final, 1.2 s por passo, com o comentário de cada etapa e o custo numa legenda grande em baixo da janela) |
 | | `--open3d` | janela do Open3D com a evolução da otimização (como nas aulas) |
 | `avaliador.py` | `--scene` | cena já corrida: pergunta o n.º real de caixas e, se houver `ground_truth.json`, escreve `avaliacao.md` |
 | | `--result` | o `result.json` a avaliar (por omissão: `<cena>/result.json`); o relatório fica ao lado dele |
@@ -246,7 +246,7 @@ Parte 08, Ex. 4 (chão → mesa → referencial da mesa → objetos → clusters
 2. **Cores:** o número de cores diferentes (Nível 4);
 3. **Desvio lateral** (`count_lateral_steps`, só em clusters com um único topo): o topo é cortado em fatias de 1 cm
    ao longo da fila, no referencial das caixas; em cada fatia mede-se o centro e a largura do topo. Uma junta entre
-   caixas desviadas para o lado (ou de larguras diferentes) é um salto do centro (> `LATERAL_STEP`) ou da largura
+   caixas desviadas para o lado (ou de larguras diferentes) é um salto do centro (> `LATERAL_STEP` = 5 mm) ou da largura
    (> `WIDTH_STEP`) entre as 3 fatias antes e as 3 depois. Caixas = 1 + juntas;
 4. **Rotações** (`wall_orientations`): as normais dos pontos (Parte 07, Ex. 5) com ângulo com z perto de 90° são de
    paredes (Ex. 6 e 7); a direção de cada uma, módulo 90°, é a orientação da caixa (as 4 paredes dão o mesmo valor).
