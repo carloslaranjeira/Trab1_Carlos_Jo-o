@@ -7,6 +7,7 @@ Utilização:
     python run_test.py --git        # e faz git add + commit + push depois de cada cena
     python run_test.py --redo       # volta a correr cenas que já têm resultado
     python run_test.py --sem_janelas   # não abre janelas
+    python run_test.py --ver cena_1    # volta a abrir as janelas de uma cena já feita (não recalcula nada)
 
 Corre as cenas UMA DE CADA VEZ: em cada cena, os 4 ficheiros (savi/) um depois do outro e o avaliador,
 e no fim mostra a janela da cena; só depois passa à cena seguinte:
@@ -244,6 +245,46 @@ def run_scene(scene, output, views, show, known, push=False):
         print(f"  ERRO no avaliador da cena {scene.name}")
 
 
+def saved_views(scene_name, output):
+    """Vistas de uma cena JÁ FEITA, só com o que ficou gravado em results_test/<cena>/ (registo, fotometria,
+    segmentação, ajuste e result.json): não volta a correr nenhuma parte nem o avaliador.
+    Só a nuvem agregada é juntada outra vez (com as poses gravadas no registo.json: é rápido).
+    Saída: lista de (figure_data, parte), pela mesma ordem do run_scene (Partes 1, 2 e 3, fotometria e,
+    se a cena tiver ground truth, o avaliador).
+    """
+    import avaliador
+    import comum
+    import extra_fotometria as extra
+    import parte1_registo as parte1
+    import parte2_segmentacao as parte2
+    import parte3_ajuste as parte3
+
+    parts = Path(output) / scene_name / comum.OUTPUT_FOLDER
+    if not (parts / parte1.REGISTRATION_FILE).exists():
+        raise SystemExit(f"{scene_name}: não há resultados em {parts} (corra primeiro o run_test.py)")
+    r1 = parte1.load_registration(parts)
+    r1["scene"] = comum.load_scene(r1["scene_folder"])
+    r1["cloud"], r1["camera_index"] = parte1.aggregate(r1["scene"], r1["T_cams"], r1["registered"])
+    table, points, colors = parte2.load_objects(parts)
+    seg = parte2.load_segmentation(parts)
+    r2 = {"table": table, "object_points": points, "object_colors": colors, "seg": seg,
+          "num_boxes": sum(seg.boxes_per_cluster.values()), "cloud": r1["cloud"],
+          "scene_folder": Path(r1["scene_folder"])}
+    r3 = parte3.load_fit(parts)
+    views = []
+    collect(views, lambda: parte1.figure_data(r1), "parte1_registo")
+    collect(views, lambda: parte2.figure_data(r1, r2), "parte2_segmentacao")
+    collect(views, lambda: parte3.figure_data(r1, r2, r3), "parte3_ajuste")
+    if (parts / extra.PHOTOMETRY_FILE).exists():
+        rx = {"photometry": json.loads((parts / extra.PHOTOMETRY_FILE).read_text(encoding="utf-8"))}
+        collect(views, lambda: extra.figure_data(r1, rx), "extra_fotometria")
+    result_path = Path(output) / scene_name / "result.json"
+    if result_path.exists():
+        collect(views, lambda: avaliador.scene_figure_data(r1["scene_folder"], result_path), "avaliador")
+        views[:] = [(data, part) for data, part in views if data is not None]   # sem ground truth
+    return views
+
+
 def open_windows(folder, parent_pid):
     """Lado do processo das janelas: abre as janelas de cada pedido que aparece na pasta.
 
@@ -292,6 +333,8 @@ def main_test():
     parser.add_argument("--redo", action="store_true", help="volta a correr cenas que já têm resultado")
     parser.add_argument("--download", metavar="URL", help="copia primeiro as cenas deste repositório GitHub para --scenes")
     parser.add_argument("--sem_janelas", action="store_true", help="não abre janelas")
+    parser.add_argument("--ver", nargs="+", metavar="CENA",
+                        help="só volta a abrir as janelas destas cenas já feitas (não recalcula nada)")
     parser.add_argument("--janelas", help=argparse.SUPPRESS)       # uso interno: processo das janelas
     parser.add_argument("--pid", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -301,6 +344,16 @@ def main_test():
         return
 
     scenes_dir, output = Path(args.scenes), Path(args.output)
+    if args.ver:
+        # Só janelas: lê os resultados gravados de cada cena e abre a janela dela (uma por cena)
+        windows = Windows()
+        for name in args.ver:
+            print(f"{name}: a ler os resultados gravados em {output / name}...")
+            for data, part in saved_views(name, output):
+                windows.add(data, f"{name} - {part}")
+        windows.finish()
+        print("As janelas ficam abertas até serem fechadas (setas <- -> mudam de vista).")
+        return
     if args.download:
         download_scenes(args.download, scenes_dir)
     # Uma cena é qualquer subpasta com point_clouds/

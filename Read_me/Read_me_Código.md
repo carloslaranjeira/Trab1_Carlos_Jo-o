@@ -56,6 +56,7 @@ Opções de cada parte (todas têm `--scene`, a pasta da cena):
 | | `--result` | o `result.json` a avaliar (por omissão: `<cena>/result.json`); o relatório fica ao lado dele |
 | | `--num_boxes` | número real de caixas (sem pergunta no terminal) |
 | | `--visualize` | 6 vistas: nuvem estimada sobre a verdadeira (toda e de perto); caixas de cada método sobre as verdadeiras, de cima e em 3D |
+| | `--ver` | só volta a abrir essas janelas de uma cena já avaliada, com o que está gravado (não recalcula, não pergunta e não reescreve o relatório) |
 
 **Nota:** foi feita uma alteração de uma linha no simulador (`cv2.imwrite` → `cv2.imencode(...).tofile(...)`), porque
 no Windows o OpenCV não escreve ficheiros em caminhos com acentos (como "Trabalho prático") e as imagens RGB não eram gravadas.
@@ -86,7 +87,10 @@ O `run_test.py` (na pasta principal) corre os 4 ficheiros e o avaliador em todas
 `results_test/<cena>/`. As cenas correm **uma de cada vez**: em cada cena correm seguidas a Parte 1, o extra, a Parte 2 e a Parte 3 (sem perguntas), abre a janela 3D (Open3D) dessa cena, com as vistas de todas as partes, por esta ordem: Parte 1, Parte 2, Parte 3 e, no fim, as do extra de fotometria (setas ← e → para mudar de vista), e por fim o avaliador pede o número real de caixas (se a cena não estiver em `test/num_boxes.json`) e compara; só depois passa à cena seguinte. As janelas **não param o programa** (são desenhadas por um segundo processo): pode ver-se a cena 3 sem fechar as
 janelas das cenas 1 e 2 (os pedidos ao segundo processo ficam na pasta temporária do sistema, `SAVIBoxes_janelas`).
 A pasta `test/` só é lida: os resultados intermédios de cada parte ficam em `results_test/<cena>/partes/`, que não
-vai para o git (`.gitignore`). Com `--sem_janelas` não abre janelas. Cada função tem um comentário que diz o
+vai para o git (`.gitignore`). Com `--sem_janelas` não abre janelas. Com `--ver cena_1 [cena_2 ...]` não corre
+nada: lê o que ficou gravado em `results_test/<cena>/` (registo, fotometria, segmentação, ajuste e `result.json`)
+e volta a abrir a janela de cada cena, com as vistas de todas as partes e do avaliador (cerca de 10 s por cena,
+só para voltar a juntar a nuvem com as poses gravadas). Cada função tem um comentário que diz o
 que faz, o que recebe, o que devolve e porque foi feita assim.
 
 | Ficheiro | Secção | Funções principais | Para que serve |

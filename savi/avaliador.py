@@ -8,6 +8,8 @@ COMO CORRER
     python savi/avaliador.py --scene test/cena_1                                    # result.json da cena
     python savi/avaliador.py --scene test/cena_1 --result results_test/cena_1/result.json
     python savi/avaliador.py --scene test/cena_1 --num_boxes 3 --visualize          # sem pergunta; janelas 3D
+    python savi/avaliador.py --scene test/cena_1 --result results_test/cena_1/result.json --ver
+                                         # só volta a abrir as janelas (não recalcula nem reescreve nada)
 
 1. Pergunta no terminal o número REAL de caixas e diz se é o número de caixas do result.json. As 4 partes
    nunca recebem o número de caixas (a Parte 2 estima-o).
@@ -36,7 +38,7 @@ ORGANIZAÇÃO DESTE FICHEIRO
                            simetrias; caixas estimadas sobre as verdadeiras
     5. Extra - fotometria  s e b estimados de cada imagem contra os verdadeiros
     6. Relatório           avaliacao.md e figuras (janelas 3D)
-    7. Programa principal  evaluate_scene() e main()
+    7. Programa principal  evaluate_scene(), scene_figure_data() (janelas sem recalcular) e main()
 """
 
 import argparse
@@ -531,11 +533,6 @@ def evaluate_scene(scene_folder, result_path=None, num_boxes=None, verbose=True)
 
     # 2. Parte 1
     cams = camera_errors(result, ground_truth)
-    try:
-        registered = load_registration(parts)["registered"]       # câmaras que entraram na nuvem
-    except OSError:
-        registered = None
-    est_cloud, gt_cloud = registration_clouds(scene, result, ground_truth, registered)
 
     # 3. Parte 2 (com as poses verdadeiras)
     if verbose:
@@ -557,12 +554,7 @@ def evaluate_scene(scene_folder, result_path=None, num_boxes=None, verbose=True)
     photometry = photometry_errors(parts, ground_truth)
 
     # 6. Relatório e figuras
-    T_world_camera0 = np.array(ground_truth["cameras"][0]["T_world_camera"])
-    gt_params = np.array([world_params(box_in_world(b["T_world_box"], b["length"], b["width"], b["height"]))
-                          for b in ground_truth["boxes"]])
-    data = figure_data(scene_folder.name, est_cloud, gt_cloud, T_world_camera0,
-                       {k: boxes_in_world(v, ground_truth) if v is not None else None for k, v in est.items()},
-                       gt_params)
+    data = scene_figure_data(scene_folder, result_path, ground_truth, scene)
     write_report(out / REPORT_FILE, scene_folder.name, (found, real, len(ground_truth["boxes"])), cams, seg,
                  boxes, photometry)
     if verbose:
@@ -578,21 +570,55 @@ def evaluate_scene(scene_folder, result_path=None, num_boxes=None, verbose=True)
     return data
 
 
+def scene_figure_data(scene_folder, result_path, ground_truth=None, scene=None):
+    """Dados das janelas do avaliador SÓ com o que já está gravado: o result.json, o registo e o ajuste
+    (partes/registo.json e partes/ajuste.npz, ao lado do result.json) e o ground truth. Não volta a correr
+    nenhuma parte nem a avaliação da segmentação (partes_gt), por isso é rápido: serve para voltar a abrir
+    as janelas de uma cena já avaliada (--ver).
+    Saída: figure_data, ou None se a cena não tiver ground_truth.json.
+    """
+    scene_folder, result_path = Path(scene_folder), Path(result_path)
+    ground_truth = ground_truth if ground_truth is not None else load_ground_truth(scene_folder)
+    if ground_truth is None:
+        return None
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    parts = result_path.parent / OUTPUT_FOLDER
+    try:
+        registered = load_registration(parts)["registered"]       # câmaras que entraram na nuvem
+    except OSError:
+        registered = None
+    scene = scene if scene is not None else load_scene(scene_folder)
+    est_cloud, gt_cloud = registration_clouds(scene, result, ground_truth, registered)
+    est = {"otimizacao": result["boxes"], "bounding_box": bbox_boxes(parts)}
+    T_world_camera0 = np.array(ground_truth["cameras"][0]["T_world_camera"])
+    gt_params = np.array([world_params(box_in_world(b["T_world_box"], b["length"], b["width"], b["height"]))
+                          for b in ground_truth["boxes"]])
+    return figure_data(scene_folder.name, est_cloud, gt_cloud, T_world_camera0,
+                       {k: boxes_in_world(v, ground_truth) if v is not None else None for k, v in est.items()},
+                       gt_params)
+
+
 def main():
-    """Lê os argumentos da linha de comandos e avalia uma cena."""
+    """Lê os argumentos da linha de comandos e avalia uma cena (ou, com --ver, só abre as janelas)."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scene", required=True, help="pasta da cena (já com as 4 partes feitas)")
     parser.add_argument("--result", help="result.json a avaliar (por omissão: <cena>/result.json)")
     parser.add_argument("--num_boxes", type=int, help="número real de caixas (se faltar, é perguntado)")
     parser.add_argument("--visualize", action="store_true", help="abre as janelas 3D com as figuras")
+    parser.add_argument("--ver", action="store_true",
+                        help="só volta a abrir as janelas de uma cena já avaliada (não recalcula nada)")
     args = parser.parse_args()
 
     result_path = Path(args.result) if args.result else Path(args.scene) / "result.json"
-    data = evaluate_scene(args.scene, result_path, args.num_boxes)
-    if data is None:
-        return
-    if not args.visualize:
-        return
+    if args.ver:
+        data = scene_figure_data(args.scene, result_path)
+        if data is None:
+            print("A cena não tem ground_truth.json: o avaliador não tem janelas.")
+            return
+    else:
+        data = evaluate_scene(args.scene, result_path, args.num_boxes)
+        if data is None or not args.visualize:
+            return
     windows = SceneWindows()
     for spec in make_windows(data):
         windows.add(spec, group=str(data["cena"]))
