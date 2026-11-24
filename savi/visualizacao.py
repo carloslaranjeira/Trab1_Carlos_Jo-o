@@ -62,6 +62,17 @@ def image_item(image):
     return {"type": "image", "image": np.ascontiguousarray(np.asarray(image, np.uint8)[..., :3])}
 
 
+def camera_item(T, K, width, height, color, depth=0.15):
+    """Uma câmara desenhada como uma pirâmide: o bico na posição da câmara (pose T) e a base, a depth
+    metros à frente, com a forma da imagem (os 4 cantos da imagem projetados para trás com K)."""
+    corners = [[(u - K[0, 2]) / K[0, 0] * depth, (v - K[1, 2]) / K[1, 1] * depth, depth]
+               for u, v in ((0, 0), (width, 0), (width, height), (0, height))]
+    points = np.vstack([[0.0, 0.0, 0.0], corners])                       # referencial da câmara
+    points = (np.asarray(T)[:3, :3] @ points.T).T + np.asarray(T)[:3, 3]   # -> referencial da nuvem
+    lines = [[0, 1], [0, 2], [0, 3], [0, 4], [1, 2], [2, 3], [3, 4], [4, 1]]
+    return lines_item(points, lines, color, width=4.0)
+
+
 def frame_item(size=0.1):
     """Os eixos de um referencial na origem (x vermelho, y verde, z azul)."""
     return {"type": "frame", "size": size}

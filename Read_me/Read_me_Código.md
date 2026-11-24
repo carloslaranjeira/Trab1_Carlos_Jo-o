@@ -72,7 +72,8 @@ o seu resultado numa pasta `partes/` ao lado do `result.json` (quando cada parte
    imagens a cores (`fotometria/NNN.png`). Grava `fotometria.json` (a comparação com o ground truth está no avaliador).
 3. **`parte2_segmentacao.py` — Parte 2.** Deteta a mesa (RANSAC), retira a mesa e o fundo e separa as caixas
    (clusters e cor); **estima o número de caixas** (em cada cluster, o maior entre o n.º de topos a alturas
-   diferentes e o n.º de cores; caixas da mesma cor e da mesma altura encostadas contam como uma). Grava `objetos.ply` (nuvem **só dos objetos**, com cor, no
+   diferentes, o n.º de cores, o n.º de caixas em fila pelos degraus do topo e o n.º de orientações das paredes;
+   caixas iguais perfeitamente alinhadas contam como uma). Grava `objetos.ply` (nuvem **só dos objetos**, com cor, no
    referencial da mesa), `mesa.json` e `segmentacao.npz`.
 4. **`parte3_ajuste.py` — Parte 3.** Estimativa inicial, ajuste por otimização e bounding box. Escreve o
    `result.json` e grava `ajuste.npz`.
@@ -104,7 +105,7 @@ que faz, o que recebe, o que devolve e porque foi feita assim.
 | parte 2 | 2. Retirar mesa e fundo | `extract_objects` | Pontos acima da mesa e dentro dos limites do tampo |
 | parte 2 | 3. Clustering | `euclidean_clusters`, `figure_data`, `make_windows` | Clusters euclidianos (DBSCAN); figuras (objetos isolados, uma cor por cluster) |
 | parte 2 | 4. Cor | `chroma_features`, `color_split`, `split_by_color` | Separar caixas em contacto pela cor (Nível 4) |
-| parte 2 | 5. Extra | `top_surface_points`, `count_top_levels`, `count_colors`, `estimate_boxes` | Número de caixas desconhecido: caixas estimadas por cluster |
+| parte 2 | 5. Extra | `top_surface_points`, `count_top_levels`, `count_colors`, `wall_orientations`, `count_lateral_steps`, `estimate_boxes` | Número de caixas desconhecido: caixas estimadas por cluster |
 | parte 2 | 6. Programa principal | `segment`, `save_objects`, `save_segmentation`, `run_segmentation`, `main` | Junta as subpartes; grava `objetos.ply`, `mesa.json`, `segmentacao.npz` |
 | parte 3 | 1. Método base | `bbox_box`, `bbox_method` | Bounding box orientada de cada conjunto de pontos, no referencial da caixa, para comparar |
 | parte 3 | 2.1 Parâmetros | `to_box_frame`, `normalize_box` | `x, y, yaw, length, width, height, z` de cada caixa no referencial da mesa |
@@ -240,8 +241,19 @@ Parte 08, Ex. 4 (chão → mesa → referencial da mesa → objetos → clusters
    escuras (a\*, b\*) aproximam-se de zero. Numa cena de teste, um azul e um roxo deixaram de se distinguir
    (IoU 0.00–0.58); com (r, g) passaram a 0.991–0.998.
 
-**Extra — número de caixas desconhecido:** em cada cluster, o número de caixas é o maior entre o número de topos a
-alturas diferentes e o número de cores. Caixas da mesma cor e da mesma altura encostadas contam como uma.
+**Extra — número de caixas desconhecido:** em cada cluster, o número de caixas é o maior de 4 contagens:
+1. **Alturas:** o número de topos a alturas diferentes (caixas empilhadas ou de alturas diferentes);
+2. **Cores:** o número de cores diferentes (Nível 4);
+3. **Desvio lateral** (`count_lateral_steps`, só em clusters com um único topo): o topo é cortado em fatias de 1 cm
+   ao longo da fila, no referencial das caixas; em cada fatia mede-se o centro e a largura do topo. Uma junta entre
+   caixas desviadas para o lado (ou de larguras diferentes) é um salto do centro (> `LATERAL_STEP`) ou da largura
+   (> `WIDTH_STEP`) entre as 3 fatias antes e as 3 depois. Caixas = 1 + juntas;
+4. **Rotações** (`wall_orientations`): as normais dos pontos (Parte 07, Ex. 5) com ângulo com z perto de 90° são de
+   paredes (Ex. 6 e 7); a direção de cada uma, módulo 90°, é a orientação da caixa (as 4 paredes dão o mesmo valor).
+   Cada pico separado do histograma circular dessas orientações é uma caixa rodada.
+
+Caixas iguais, da mesma cor e perfeitamente alinhadas continuam a contar como uma (não há nenhuma junta visível).
+O perfil do topo, o histograma circular e o PCA dos pontos do topo não estão nas aulas.
 A divisão de cada cluster em caixas é feita na estimativa inicial da Parte 3.
 
 A avaliação usa as caixas verdadeiras com margem de 5 mm. A precisão fica acima de 0.98. O recall (~0.66) é mais

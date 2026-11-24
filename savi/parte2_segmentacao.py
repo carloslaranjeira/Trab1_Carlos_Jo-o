@@ -31,6 +31,7 @@ ORGANIZAÇÃO DESTE FICHEIRO (as 4 subpartes do enunciado, pela mesma ordem)
                             (Parte 07, Ex. 4; Parte 08, Ex. 4)
     4. Cor                  separar caixas em contacto pela cor (Nível 4; ideia do HSV da Parte 02)
     5. Extra                número de caixas desconhecido: estimar quantas caixas tem cada cluster
+                            (alturas, cores, desvio lateral e rotações; normais da Parte 07, Ex. 5-7)
     6. Programa principal   segment(), gravar e ler objetos.ply / mesa.json / segmentacao.npz,
                             run_segmentation() e main()
 (As convenções - T_A_B, referencial da mesa - estão em comum.py.)
@@ -70,6 +71,12 @@ ABOVE_TABLE_MAX = 0.60       # 2. m: pontos acima disto já não são objetos so
 TABLE_MARGIN = 0.01          # 2. m: margem para dentro dos limites do tampo
 OBJECT_VOXEL = 0.004         # 2. m: voxel usado nos pontos dos objetos
 CLUSTER_EPS = 0.015          # 3. m: no DBSCAN, pontos a menos de 1.5 cm ficam no mesmo cluster
+WALL_MAX_NZ = 0.3            # 5. |n_z| máximo de um ponto de parede de caixa (normal quase horizontal)
+MIN_ROTATION = 10            # 5. graus: paredes com orientações mais próximas do que isto são da mesma caixa
+MIN_WALL_FRACTION = 0.10     # 5. fração mínima das paredes de um cluster numa orientação para contar como caixa
+LATERAL_STEP = 0.008         # 5. m: salto do centro do topo (desvio lateral) que marca uma junta entre caixas
+WIDTH_STEP = 0.015           # 5. m: salto da largura do topo (larguras diferentes) que marca uma junta
+MIN_BOX_SIDE = 0.05          # 5. m: lado mínimo de uma caixa (juntas mais próximas do que isto são a mesma)
 
 
 @dataclass
@@ -493,8 +500,16 @@ def split_by_color(colors, n):
 # 5. EXTRA: NÚMERO DE CAIXAS DESCONHECIDO (não faz parte das 4 subpartes)
 # #####################################################################################################
 # O número de caixas NÃO é dado às partes (só o avaliador o conhece): estima-se quantas caixas tem cada
-# cluster pelos topos a alturas diferentes (caixas empilhadas ou de alturas diferentes) e pelas cores.
-# A divisão final de cada cluster em caixas é feita na estimativa inicial da Parte 3 (initial_boxes).
+# cluster de 4 formas, e fica a maior (estimate_boxes):
+#   1. topos a alturas diferentes (caixas empilhadas ou de alturas diferentes);
+#   2. cores diferentes (Nível 4);
+#   3. desvio lateral: caixas da mesma altura e cor encostadas em fila, desviadas para o lado ou de larguras
+#      diferentes, têm um degrau no contorno do topo em cada junta;
+#   4. rotações: caixas rodadas entre si têm paredes viradas para direções diferentes (normais, Parte 07).
+# Caixas iguais e PERFEITAMENTE alinhadas continuam a ser uma só (não há nenhuma junta visível; é um dos
+# casos impossíveis do Nível 3). A divisão de cada cluster em caixas é feita na Parte 3 (initial_boxes).
+# O que não está nas aulas: o perfil do topo (degraus), o histograma circular das orientações das paredes
+# (módulo 90°) e o PCA (SVD); as normais e o ângulo com z são os da Parte 07 (Ex. 5 a 7).
 def top_surface_points(points, cell=0.02, tolerance=0.006):
     """Índices dos pontos que estão no TOPO de alguma caixa.
 
@@ -547,25 +562,138 @@ def count_colors(colors, max_k=4, min_fraction=0.10):
     return 1
 
 
+def wall_orientations(points, min_rotation=MIN_ROTATION, min_fraction=MIN_WALL_FRACTION, min_points=40):
+    """Orientações (graus, entre 0 e 90) das paredes das caixas de um cluster, da mais vista para a menos.
+
+    1. Normal de cada ponto (PCA dos vizinhos num raio de 1.5 cm, Parte 07, Ex. 5);
+    2. Pontos de PAREDE: normal quase horizontal, isto é, com um ângulo com z perto de 90° (Parte 07,
+       Ex. 6 e 7: |n_z| < 0.3);
+    3. Direção de cada normal no plano da mesa, MÓDULO 90°: as 4 paredes de uma caixa dão o mesmo valor
+       (a caixa com yaw 20° tem paredes viradas para 20°, 110°, 200° e 290°, todas 20° módulo 90°);
+    4. Histograma circular de 1° (0° e 90° são vizinhos), suavizado em ±5°; cada máximo local com pelo
+       menos 10% das paredes é uma orientação, desde que esteja a mais de MIN_ROTATION graus das já
+       aceites e que entre os dois haja um vale (abaixo de metade do pico): o ruído das normais junto às
+       arestas alarga cada pico, mas não cria um segundo pico separado por um vale.
+    Saída: lista de orientações (graus), vazia se o cluster tiver poucas paredes.
+    """
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.015, max_nn=30))
+    normals = np.asarray(pc.normals)
+    wall = np.abs(normals[:, 2]) < WALL_MAX_NZ
+    if wall.sum() < min_points:
+        return []
+    angles = np.degrees(np.arctan2(normals[wall, 1], normals[wall, 0])) % 90.0
+    hist = np.bincount(np.floor(angles).astype(int) % 90, minlength=90).astype(float)
+    smoothed = np.convolve(np.concatenate([hist[-5:], hist, hist[:5]]), np.ones(11), "valid")   # circular
+    is_max = (smoothed >= np.roll(smoothed, 1)) & (smoothed > np.roll(smoothed, -1))
+    peaks = []
+    for i in np.argsort(-smoothed):
+        if smoothed[i] < max(min_fraction * hist.sum(), min_points):
+            break
+        if not is_max[i]:
+            continue
+        separate = True
+        for j in peaks:
+            gap = min(abs(i - j), 90 - abs(i - j))                 # distância circular
+            direction = 1 if (j - i) % 90 <= 45 else -1            # caminho mais curto de i para j
+            valley = smoothed[[(i + direction * s) % 90 for s in range(1, gap)]]
+            if gap < min_rotation or (len(valley) and valley.min() > 0.5 * smoothed[i]):
+                separate = False
+                break
+        if separate:
+            peaks.append(int(i))
+    return [float(p) for p in peaks]
+
+
+def count_lateral_steps(points, orientation=None, slice_size=0.01, window=3):
+    """Número de caixas em fila num cluster com um só topo, pelos degraus do contorno do topo.
+
+    Caixas da mesma altura e cor encostadas formam um topo plano único. Se estiverem desviadas para o lado
+    umas das outras, ou tiverem larguras diferentes, o contorno desse topo tem um degrau em cada junta:
+      1. Pontos do topo (top_surface_points), no referencial das caixas: o eixo u é a orientação das
+         paredes (wall_orientations) ou a perpendicular, a que for ao longo da fila (o lado maior). Assim
+         o contorno de cada caixa é paralelo a u (sem orientação: eixo principal do topo, PCA);
+      2. Fatias de 1 cm ao longo de u; em cada uma, os limites do topo em v (percentis 3 e 97, para
+         ignorar pontos soltos), e daí o CENTRO e a LARGURA do topo nessa fatia;
+      3. Em cada posição compara-se a mediana das 3 fatias antes com a das 3 depois: há uma junta se o
+         centro salta mais do que LATERAL_STEP (desvio lateral) ou a largura mais do que WIDTH_STEP
+         (larguras diferentes);
+      4. Fica o maior salto de cada zona: as juntas ficam a pelo menos MIN_BOX_SIDE umas das outras e
+         das pontas da fila.
+    Saída: 1 + número de juntas. Caixas iguais perfeitamente alinhadas não têm degrau: contam como uma.
+    """
+    top = points[top_surface_points(points)]
+    if len(top) < 100:
+        return 1
+    xy = top[:, :2]
+    if orientation is None:
+        _, _, Vt = np.linalg.svd(xy - xy.mean(axis=0), full_matrices=False)
+        a = np.arctan2(Vt[0, 1], Vt[0, 0])
+    else:
+        a = np.radians(orientation)
+    axes = [np.array([np.cos(a), np.sin(a)]), np.array([-np.sin(a), np.cos(a)])]
+    u_axis = axes[int(np.argmax([np.ptp(xy @ ax) for ax in axes]))]     # ao longo da fila
+    u, v = xy @ u_axis, xy @ np.array([-u_axis[1], u_axis[0]])
+
+    edges = np.arange(u.min(), u.max() + slice_size, slice_size)
+    which = np.digitize(u, edges) - 1                                    # fatia de cada ponto
+    lo = np.full(len(edges), np.nan)
+    hi = np.full(len(edges), np.nan)
+    for b in range(len(edges)):
+        vb = v[which == b]
+        if len(vb) >= 10:
+            lo[b], hi[b] = np.percentile(vb, 3), np.percentile(vb, 97)
+    center, width = (lo + hi) / 2, hi - lo
+    position = edges + slice_size / 2 - u.min()
+
+    score = np.zeros(len(edges))                                         # salto / limiar (> 1: junta)
+    for b in range(len(edges)):
+        if position[b] < MIN_BOX_SIDE or position[-1] - position[b] < MIN_BOX_SIDE:
+            continue
+        before, after = slice(max(0, b - window), b), slice(b + 1, b + 1 + window)
+        if np.sum(~np.isnan(center[before])) < 2 or np.sum(~np.isnan(center[after])) < 2:
+            continue
+        jump_center = abs(np.nanmedian(center[after]) - np.nanmedian(center[before]))
+        jump_width = abs(np.nanmedian(width[after]) - np.nanmedian(width[before]))
+        score[b] = max(jump_center / LATERAL_STEP, jump_width / WIDTH_STEP)
+    joints = []
+    for b in np.argsort(-score):                                         # do maior salto para o menor
+        if score[b] <= 1.0:
+            break
+        if all(abs(position[b] - position[j]) >= MIN_BOX_SIDE for j in joints):
+            joints.append(b)
+    return 1 + len(joints)
+
+
 def estimate_boxes(points, colors, clusters, use_color=True):
     """ESTIMA quantas caixas há em cada cluster (o número de caixas não é dado).
 
-    Em cada cluster euclidiano, o número de caixas é o maior destes dois:
+    Em cada cluster euclidiano, o número de caixas é o maior destes quatro:
     - o número de TOPOS a alturas diferentes (count_top_levels): caixas empilhadas, ou encostadas
       com alturas diferentes (Nível 3);
-    - o número de CORES diferentes (count_colors): caixas encostadas de cores diferentes (Nível 4).
-    Limitação: caixas da mesma cor e da mesma altura encostadas umas às outras ficam contadas como
-    uma só (vistas de cima são uma única superfície plana; com caixas iguais e alinhadas é mesmo
-    impossível saber quantas são, como diz o enunciado no Nível 3).
+    - o número de CORES diferentes (count_colors): caixas encostadas de cores diferentes (Nível 4);
+    - o número de caixas em fila pelos DEGRAUS do contorno do topo (count_lateral_steps): caixas da
+      mesma altura e cor desviadas para o lado ou de larguras diferentes. Só em clusters com um só
+      topo e uma só orientação das paredes: numa pilha, a caixa de cima (mais estreita) criava degraus
+      falsos no topo do cluster, e uma caixa rodada tem o contorno inclinado (degraus em todas as fatias);
+    - o número de ORIENTAÇÕES diferentes das paredes (wall_orientations): caixas rodadas entre si.
+    Limitação: caixas iguais, da mesma cor e PERFEITAMENTE alinhadas, encostadas umas às outras, ficam
+    contadas como uma só (vistas de cima são uma única superfície retangular, sem nenhuma junta; é um
+    dos casos impossíveis do Nível 3, como diz o enunciado).
     Todos os clusters contam (os pontos soltos já ficaram de fora no euclidean_clusters).
     Saída: dicionário cluster -> número de caixas.
     """
     counts = {}
     for k in range(clusters.max() + 1):
         mine = clusters == k
-        n = count_top_levels(points[mine])
+        levels = count_top_levels(points[mine])
+        n = levels
         if use_color:
             n = max(n, count_colors(colors[mine]))
+        orientations = wall_orientations(points[mine])
+        n = max(n, len(orientations))
+        if levels == 1 and len(orientations) <= 1:
+            n = max(n, count_lateral_steps(points[mine], orientations[0] if orientations else None))
         counts[k] = n
     return counts
 

@@ -50,11 +50,13 @@ import numpy as np
 import open3d as o3d                         # nuvens de pontos: RANSAC, ICP, grafo de poses
 from scipy.spatial import cKDTree            # procura rápida do vizinho mais próximo
 
-from comum import OUTPUT_FOLDER, load_scene, rotation_angle_deg, rz4, transform_points
+from comum import intrinsics_matrix, OUTPUT_FOLDER, load_scene, rotation_angle_deg, rz4, transform_points
 # EXTRA fotometria: comparar cores de imagens com exposições diferentes (alignment_score) e juntar as
 # nuvens com a mesma exposição (aggregate)
 from extra_fotometria import exposure_corrected, match_exposure
-from visualizacao import CAMERA_COLORS, CAMERA_NAMES, colors_uint8, data_view, points_item, scene_view, show_windows
+from visualizacao import (  # janelas 3D (comuns a todas as partes)
+    CAMERA_COLORS, CAMERA_NAMES, camera_item, colors_uint8, data_view, points_item, scene_view, show_windows,
+)
 
 
 reg = o3d.pipelines.registration             # atalho para o módulo de registo do Open3D
@@ -306,25 +308,51 @@ def aggregate(scene, T_camera0_cameras, registered=None, photometric=True, expos
 # ----------------------------------------------------------------------------------------------------
 def figure_data(r):
     """Dados das janelas da Parte 1 (r = resultado de run_registration): a nuvem agregada inteira, a cor
-    de cada ponto, a câmara que o adquiriu e o ponto de vista (atrás da câmara 000)."""
+    de cada ponto, a câmara que o adquiriu, a pose e os parâmetros intrínsecos das câmaras (para as
+    desenhar) e o ponto de vista (atrás da câmara 000)."""
     view = scene_view(r["T_cams"], r["registered"])
+    if r.get("scene") is not None:
+        K, size = r["scene"].K, (r["scene"].width, r["scene"].height)
+    else:                                        # resultado de load_registration: lê só o intrinsics.json
+        intrinsics = json.loads((Path(r["scene_folder"]) / "intrinsics.json").read_text(encoding="utf-8"))
+        K, size = intrinsics_matrix(intrinsics), (intrinsics["width"], intrinsics["height"])
     return {"parte": "parte1_registo", "cena": Path(r["scene_folder"]).name,
             "points": np.asarray(r["cloud"].points, np.float32), "colors": colors_uint8(r["cloud"].colors),
             "camera": np.asarray(r["camera_index"], np.uint8), "images": np.array(r["images"]),
-            "registered": np.array(r["registered"], bool), **{f"view_{k}": v for k, v in view.items()}}
+            "registered": np.array(r["registered"], bool), "T_cams": np.array(r["T_cams"]),
+            "K": np.asarray(K, float), "image_size": np.array(size), **{f"view_{k}": v for k, v in view.items()}}
 
 
 def make_windows(data):
     """Janelas da Parte 1, como a figura do enunciado: a nuvem agregada com a cor de cada píxel e a mesma
-    nuvem com uma cor por câmara (cada uma na sua janela)."""
+    nuvem com uma cor por câmara (cada uma na sua janela). Na segunda, cada câmara registada aparece
+    também na sua posição (uma pirâmide virada para onde a câmara olha), com a cor dos seus pontos."""
     left_out = [str(n) for n, ok in zip(data["images"], data["registered"]) if not ok]
     note = f" (sem registo de confiança, fora da nuvem: {', '.join(left_out)})" if left_out else ""
     title = f"Parte 1 - {data['cena']}: nuvem agregada"
     cameras = ", ".join(f"{n}: {CAMERA_NAMES[k % 10]}" for k, n in enumerate(data["images"]) if data["registered"][k])
+    width, height = (int(v) for v in data["image_size"])
+    camera_items = [camera_item(T, data["K"], width, height, CAMERA_COLORS[k % 10])
+                    for k, T in enumerate(data["T_cams"]) if data["registered"][k]]
+    # Ponto de vista que mostra as câmaras todas: a olhar para o mesmo sítio, mas mais para trás e para
+    # cima, do lado das câmaras (2 vezes a distância média do centro às câmaras, e outra vez essa distância
+    # acima). Com câmaras à volta da mesa toda, a média das câmaras fica no centro: usa-se o lado da 000.
+    view = data_view(data)
+    center = np.asarray(view["center"], float)
+    up = np.asarray(view["up"], float) / np.linalg.norm(view["up"])
+    positions = np.asarray(data["T_cams"])[data["registered"]][:, :3, 3] - center
+    radius = float(np.linalg.norm(positions, axis=1).mean())
+    direction = positions.mean(axis=0)
+    if np.linalg.norm(direction) < 0.3 * radius:
+        direction = positions[0]
+    direction = direction / np.linalg.norm(direction)
+    cameras_view = {"center": center, "up": up, "eye": center + radius * (2.0 * direction + up)}
     return [{"name": "_cor_pixeis", "title": f"{title} com a cor dos píxeis{note}",
              "items": [points_item(data["points"], data["colors"])], "view": data_view(data)},
-            {"name": "_cor_camaras", "title": f"{title} com uma cor por câmara ({cameras}){note}",
-             "items": [points_item(data["points"], CAMERA_COLORS[data["camera"] % 10])], "view": data_view(data)}]
+            {"name": "_cor_camaras", "title": f"{title} com uma cor por câmara e a posição de cada câmara "
+                                              f"({cameras}){note}",
+             "items": [points_item(data["points"], CAMERA_COLORS[data["camera"] % 10])] + camera_items,
+             "view": cameras_view}]
 
 
 def show_registration(scene, T_est):
