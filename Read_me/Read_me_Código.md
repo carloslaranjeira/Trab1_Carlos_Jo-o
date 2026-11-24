@@ -55,7 +55,7 @@ Opções de cada parte (todas têm `--scene`, a pasta da cena):
 | | `--method bbox` | usa a bounding box no `result.json`, em vez da otimização |
 | | `--no_color` | não usa a cor na otimização |
 | | `--visualize` | 5 vistas: bounding box vista de cima; otimização vista de cima; bounding box em 3D na cena; otimização em 3D na cena; evolução da otimização em 3D (animação) |
-| | `--open3d` | janelas antigas do Open3D (segmentação, evolução, resultado final) |
+| | `--open3d` | janela do Open3D com a evolução da otimização (como nas aulas) |
 | `avaliador.py` | `--scene` | tabelas de erros de uma cena já corrida (precisa do `ground_truth.json`) |
 | | `--evaluate_scenes CENA...` | corre as 4 partes em várias cenas com ground truth e escreve as tabelas |
 | | `--gt_registration` | com `--evaluate_scenes`: usa as poses verdadeiras (avalia só segmentação e ajuste) |
@@ -104,9 +104,15 @@ que faz, o que recebe, o que devolve e porque foi feita assim.
 | parte 2 | 4. Cor | `chroma_features`, `color_split`, `split_by_color` | Separar caixas em contacto pela cor (Nível 4) |
 | parte 2 | 5. Extra | `top_surface_points`, `count_top_levels`, `count_colors`, `estimate_boxes` | Número de caixas desconhecido: caixas estimadas por cluster |
 | parte 2 | 6. Programa principal | `segment`, `save_objects`, `save_segmentation`, `run_segmentation`, `main` | Junta as subpartes; grava `objetos.ply`, `mesa.json`, `segmentacao.npz` |
-| parte 3 | 1. Otimização | `initial_boxes`, `allocate_boxes`, `split_geometric`, `split_profile`, `place_on_supports`, `distances_to_boxes`, `FitProblem.residuals`, `fit_boxes` | Estimativa inicial e otimização com `least_squares` |
-| parte 3 | 2. Método base | `bbox_box`, `bbox_method` | Bounding box orientada, para comparar |
-| parte 3 | 3–5. Saída, visualização, principal | `write_scene_result`, `save_fit`, `make_windows`, `save_top_view`, `run_fit` | `result.json` e `ajuste.npz`; 5 vistas 3D (bounding box e otimização de cima e na cena, evolução) |
+| parte 3 | 1. Método base | `bbox_box`, `bbox_method` | Bounding box orientada de cada conjunto de pontos, no referencial da caixa, para comparar |
+| parte 3 | 2.1 Parâmetros | `to_box_frame`, `normalize_box` | `x, y, yaw, length, width, height, z` de cada caixa no referencial da mesa |
+| parte 3 | 2.2 Função objetivo | `distances_to_boxes`, `surface_samples`, `facing_some_camera`, `overlap_area`, `objective_function` | Um erro por ponto (caixa que melhor o explica), cobertura, sobreposição e apoio |
+| parte 3 | 2.3 Otimização | `fit_boxes` | `least_squares(partial(objective_function, data=...))`, associações recalculadas em cada avaliação |
+| parte 3 | 2.4 Estimativa inicial | `initial_boxes`, `split_geometric`, `split_profile`, `place_on_supports`, `fit_from_initial_estimates` | Caixas iniciais a partir da segmentação; duas estimativas iniciais quando é incerta |
+| parte 3 | 2.5 Pontos errados | `soft_l1_cost` | Perda robusta `soft_l1` (Parte 06, Ex. 5) |
+| parte 3 | 2.6 Visualização | `evolution_snapshots`, `save_evolution`, `animate_optimization` | Evolução das caixas ao longo da otimização |
+| parte 3 | 3. Extra | `color_distances`, `setup_color` | Cor na otimização (Nível 4) |
+| parte 3 | 4–6. Saída, figuras, principal | `write_scene_result`, `save_fit`, `make_windows`, `save_top_view`, `run_fit` | `result.json` e `ajuste.npz`; 5 vistas 3D (bounding box e otimização de cima e na cena, evolução) |
 | avaliador | 1–3. Avaliação | `camera_errors`, `evaluate_segmentation`, `evaluate_boxes`, `iou_3d`, `print_evaluation` | Erros em relação ao ground truth |
 | avaliador | 5. Várias cenas | `run_all`, `evaluate_scenes` | Corre as 4 partes em várias cenas e escreve as tabelas em `results_offline/results.md` |
 
@@ -239,17 +245,34 @@ retira de propósito.
 
 ## Parte 3 — Ajuste das caixas
 
+O código da Parte 3 (`savi/parte3_ajuste.py`) está organizado pelos dois métodos do enunciado: (1) o método base,
+a bounding box, e (2) o método principal, a otimização, dividida pelos seus 6 itens (2.1 parâmetros, 2.2 função
+objetivo, 2.3 `least_squares`, 2.4 estimativa inicial, 2.5 pontos errados, 2.6 visualização da evolução). Seguem-se
+o extra da cor (secção 3, Nível 4), a saída, as figuras e o programa principal. As referências são as Partes 05 e
+06 (otimização) e a Parte 08, Ex. 5 (bounding boxes).
+
 ### Método base: bounding box
-`get_minimal_oriented_bounding_box()` sobre cada conjunto de pontos, depois de remover outliers (estatístico + maior
-componente ligada). O eixo mais alinhado com o z da mesa passa a ser a altura. Se a caixa assenta na mesa, a base é
-posta na mesa; se está empilhada (decidido na estimativa inicial), a base é o fundo da bounding box.
+`get_minimal_oriented_bounding_box()` sobre cada conjunto de pontos (os conjuntos vêm da estimativa inicial, 2.4):
+- **outliers:** remoção estatística (`remove_statistical_outlier`) e maior componente ligada (DBSCAN, Parte 07);
+- **pontos extremos:** nos eixos da bounding box, cada dimensão vai do percentil 0.5 ao 99.5 dos pontos, e não do
+  mínimo ao máximo. Com as poses verdadeiras das câmaras, o IoU médio das 8 cenas de teste passou de 0.768 para
+  0.810, e melhorou em todas. Com 2–5 % a média subia um pouco mais (0.82), mas piorava nas cenas com caixas em
+  contacto (Nível 4). A otimização dá 0.90 nas mesmas cenas;
+- **referencial da caixa:** o eixo mais alinhado com o z da mesa passa a ser a altura (Parte 08, Ex. 5: "O eixo z da
+  OBB fica perpendicular à mesa?" Não fica). Se a caixa assenta na mesa, a base é posta na mesa; se está empilhada
+  (decidido na estimativa inicial), a base é o fundo da bounding box.
+
+A `get_oriented_bounding_box()` (PCA) foi sempre pior (IoU médio 0.55 contra 0.77, sem corte).
 
 ### Método principal: otimização
+Como nas Partes 05 e 06, a função objetivo recebe os dados com `partial(objective_function, data=problem)` e devolve
+um vetor de erros que o `least_squares` minimiza. Todas as caixas são ajustadas ao mesmo tempo.
+
 Parâmetros por caixa: `x, y, yaw, length, width, height, z` (referencial da mesa), em que `z` é a altura da base acima
 da mesa (0 para uma caixa na mesa, o topo da caixa de baixo para uma caixa empilhada). No código `z` vem em último lugar
 para os índices dos outros parâmetros não mudarem. Nas caixas assentes na mesa `z` fica fixo em 0 (não é otimizado):
 se fosse livre, a caixa podia subir alguns mm sem custo, porque a segmentação corta os pontos até 8 mm acima da mesa.
-Resíduos (`least_squares`, perda `soft_l1`):
+Resíduos (`least_squares`, perda `soft_l1`, Parte 06, Ex. 5):
 
 1. **Dados → modelo:** distância de cada ponto à face mais próxima **com orientação compatível com a sua normal**,
    na caixa que melhor o explica. A associação (argmin) é recalculada **em cada avaliação** da função objetivo.
@@ -267,7 +290,12 @@ tanto como os n erros de píxel. Aqui é igual: os resíduos de **sobreposição
 caixa empilhada) são multiplicados por √M, com M o número de pontos. Os de **cobertura** são muitos (S amostras por
 caixa), por isso o fator é √(M / (N·S)): o conjunto da cobertura pesa tanto como o conjunto dos pontos.
 
-**Estimativa inicial:** retângulo de área mínima de cada cluster/grupo de cor. Para caixas da mesma cor em contacto:
+**Evolução da otimização:** os parâmetros de cada avaliação ficam guardados e são desenhados no fim (animação 3D
+com `--visualize`, figura PNG no avaliador, janela do Open3D com `--open3d`). Nas Partes 05 e 06 o desenho é feito
+dentro da função objetivo, mas aqui cada iteração avalia a função 7N+1 vezes (jacobiano por diferenças finitas), e
+desenhar em direto era lento e mostrava as caixas a tremer.
+
+**Estimativa inicial** (Parte 06, Ex. 6: a otimização tem de começar perto da solução): retângulo de área mínima de cada cluster/grupo de cor. Para caixas da mesma cor em contacto:
 pontos do topo agrupados por altura (DBSCAN 3D) e, se faltarem grupos, divisão do topo em duas partes, repetida até haver
 tantas partes como caixas. Há dois métodos de divisão:
 - **k-means no plano:** divide a área ao meio, sem olhar ao contorno;
@@ -343,7 +371,7 @@ Tabelas completas (erro por câmara, por caixa, precisão/recall) em `results_of
 
 Registo: erro máximo de 1.2 a 3.6 mm e 0.04° a 0.23° por câmara, conforme a cena.
 
-A bounding box sobrestima sempre as dimensões em 4–11 mm, porque se encosta aos pontos mais extremos, que são os
+(Esta tabela é de antes do corte dos pontos extremos na bounding box.) A bounding box sobrestima sempre as dimensões em 4–11 mm, porque se encosta aos pontos mais extremos, que são os
 mais ruidosos. A otimização erra menos de 1 mm nas caixas isoladas. Nos níveis 3 a bounding box é muito pior,
 porque depende da divisão inicial dos pontos entre as caixas, que é apenas aproximada. A otimização corrige essa divisão.
 
@@ -363,6 +391,7 @@ porque depende da divisão inicial dos pontos entre as caixas, que é apenas apr
   superfície não muda se a caixa crescer no plano).
 - *Porque é a bounding box tão sensível ao ruído?* Usa só os pontos extremos (o invólucro convexo): um único
   *flying pixel* ou um ponto ruidoso numa face alarga a caixa. O ajuste usa todos os pontos com uma perda robusta.
+  Cortar 0.5 % dos pontos em cada extremo de cada eixo reduz este efeito, mas não o elimina.
 
 ## Níveis de dificuldade
 

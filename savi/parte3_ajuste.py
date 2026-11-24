@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SAVIBoxes - Trabalho 1 de SAVI. PARTE 3: AJUSTE DAS CAIXAS (otimização e bounding box -> result.json).
+"""SAVIBoxes - Trabalho 1 de SAVI. PARTE 3: AJUSTE DAS CAIXAS (bounding box e otimização -> result.json).
 
 =====================================================================================================
 COMO CORRER
@@ -8,6 +8,7 @@ COMO CORRER
     python savi/parte3_ajuste.py --scene test/cena_1
     python savi/parte3_ajuste.py --scene test/cena_1 --visualize   # janelas 3D: bounding box, otimização
                                                                    # e evolução da otimização (animação)
+    python savi/parte3_ajuste.py --scene test/cena_1 --open3d      # evolução numa janela do Open3D
 
 Lê <cena>/partes/ (registo.json da Parte 1; objetos.ply, mesa.json e segmentacao.npz da Parte 2),
 ajusta as caixas pelos dois métodos do enunciado e escreve o result.json (por omissão, na pasta da cena)
@@ -22,26 +23,36 @@ Ordem das partes (o run_test.py corre-as todas, cena a cena):
     avaliador.py           -> pede o n.º real de caixas e compara com o ground truth (se a cena o tiver)
 
 =====================================================================================================
-ORGANIZAÇÃO DESTE FICHEIRO
+ORGANIZAÇÃO DESTE FICHEIRO (os dois métodos do enunciado; a otimização pelos seus 6 itens)
 =====================================================================================================
-    1. Otimização         estimativa inicial + modelo da caixa + função objetivo + least_squares
-    2. Método base        bounding box orientada (só para comparar com a otimização)
-    3. Saída              gravar e ler o ajuste.npz e escrever o result.json
-    4. Visualização       janelas 3D: cena com as caixas da bounding box, com as da otimização e evolução
-    5. Programa principal run_fit() e main()
+    1. Método base         bounding box orientada de cada conjunto de pontos (Parte 08, Ex. 5), no
+                           referencial da caixa, sem outliers e menos sensível aos pontos extremos
+    2. Método principal    ajuste por otimização (Partes 05 e 06):
+       2.1 Parâmetros         x, y, yaw, length, width, height, z de cada caixa, no referencial da mesa
+       2.2 Função objetivo    um erro por ponto (distância à caixa que melhor o explica), e os termos que
+                              impedem uma caixa de crescer para o vazio ou duas de ocuparem o mesmo espaço
+       2.3 Otimização         scipy.optimize.least_squares, associações recalculadas em cada avaliação
+       2.4 Estimativa inicial a partir da segmentação (Parte 06, Ex. 6)
+       2.5 Pontos errados     perda robusta soft_l1 (Parte 06, Ex. 5)
+       2.6 Visualização       evolução das caixas ao longo da otimização
+    3. Extra               cor na otimização (Nível 4)
+    4. Saída               gravar e ler o ajuste.npz e escrever o result.json
+    5. Figuras             caixas dos dois métodos sobre a nuvem e sobre as verdadeiras (ground truth)
+    6. Programa principal  run_fit() e main()
 (Convenções: caixa = [x, y, yaw, length, width, height, z] no referencial da mesa; ver comum.py.)
 """
 
 import argparse
 import time
 from dataclasses import dataclass, field
+from functools import partial                # a função objetivo recebe os dados com partial (Parte 06)
 from pathlib import Path
 
 import cv2                                   # OpenCV: k-means, retângulos
-import matplotlib.pyplot as plt              # figuras PNG vistas de cima (secção 4)
+import matplotlib.pyplot as plt              # figuras PNG vistas de cima (secções 2.6 e 5)
 import numpy as np
 import open3d as o3d                         # nuvens de pontos: bounding boxes, janelas 3D
-from scipy.optimize import least_squares     # otimização (Parte 05/06)
+from scipy.optimize import least_squares     # otimização (Partes 05 e 06)
 from scipy.spatial import cKDTree            # procura rápida do vizinho mais próximo
 
 from comum import (  # geometria e leitura da cena (comuns a todas as partes)
@@ -59,33 +70,441 @@ from parte2_segmentacao import (  # funções da Parte 2 usadas aqui
 )
 
 
+# Parâmetros (valores escolhidos com testes nas cenas do simulador)
+BBOX_TRIM = 0.5           # 1. %: percentis cortados em cada eixo da bounding box (pontos extremos)
+NUM_PARAMS = 7            # 2.1 parâmetros de cada caixa: x, y, yaw, length, width, height, z
+ON_TABLE = 0.03           # 2.1 m: uma caixa com a base a menos de 3 cm da mesa assenta na mesa (z = 0)
+NORMAL_PENALTY = 0.02     # 2.2 m: custo extra de explicar um ponto com uma face de orientação errada
+HIDDEN_MARGIN = 0.02      # 2.2 m: faces a menos de 2 cm de outra caixa são consideradas escondidas
+FIT_VOXEL = 0.006         # 2.3 m: os pontos são reduzidos a este voxel antes da otimização
+MAX_FIT_POINTS = 12000    # 2.3 e limitados a este número (velocidade)
+LOSS_SCALE = 0.004        # 2.5 m: f_scale da perda robusta (resíduos >> 4 mm contam pouco)
+MAX_FRAMES = 60           # 2.6 passos da otimização mostrados na animação
+GEOMETRIC_SIGMA = 0.003   # 3. m: ruído geométrico típico, usado para pesar a cor
+
+
 # #####################################################################################################
-# 1. PARTE 3 - AJUSTE DAS CAIXAS POR OTIMIZAÇÃO
+# 1. MÉTODO BASE: BOUNDING BOX ORIENTADA (só para comparar com a otimização)
 # #####################################################################################################
-# Função objetivo (um vetor de resíduos que o scipy.optimize.least_squares minimiza, Parte 05/06):
-#   1. Dados -> modelo: para cada ponto, a distância à superfície da caixa que melhor o explica.
-#      A associação ponto -> caixa é recalculada em CADA avaliação (argmin), sem ciclo exterior;
-#   2. Modelo -> dados (cobertura): pontos amostrados nas faces visíveis de cada caixa têm de ter
-#      dados por perto. Impede que uma caixa cresça para espaço vazio sem custo;
-#   3. Sobreposição: duas caixas não podem ocupar o mesmo espaço;
-#   3b. Apoio: uma caixa empilhada tem de assentar no topo da caixa de baixo;
-#   4. (opcional) Cor: cada caixa tem uma cor e um ponto escolhe a caixa que melhor explica a sua
-#      posição E a sua cor (Nível 4).
-# A perda robusta 'soft_l1' (Parte 06, Ex. 5) faz com que uns poucos pontos errados (flying pixels,
-# cores trocadas junto às fronteiras) não estraguem o resultado.
-NUM_PARAMS = 7            # x, y, yaw, length, width, height, z
-FIT_VOXEL = 0.006         # m: os pontos são reduzidos a este voxel antes da otimização
-MAX_FIT_POINTS = 12000    # e limitados a este número (velocidade)
-GEOMETRIC_SIGMA = 0.003   # m: ruído geométrico típico, usado para pesar a cor
-LOSS_SCALE = 0.004        # m: f_scale da perda robusta (resíduos >> 4 mm contam pouco)
-HIDDEN_MARGIN = 0.02      # m: faces a menos de 2 cm de outra caixa são consideradas escondidas
-ON_TABLE = 0.03           # m: uma caixa com a base a menos de 3 cm da mesa assenta na mesa (z = 0)
-NORMAL_PENALTY = 0.02     # m: custo extra de explicar um ponto com uma face de orientação errada
+# Como na Parte 08 (Ex. 5): get_oriented_bounding_box() (PCA) ou get_minimal_oriented_bounding_box() (a de
+# menor volume; não está nas aulas, vem do enunciado e da documentação do Open3D). A bounding box só ajusta
+# uma caixa a UM conjunto de pontos: os conjuntos de pontos de cada caixa vêm da estimativa inicial (2.4).
+# O que não está nas aulas:
+#   - a conversão para o referencial da caixa (z perpendicular à mesa), que responde à pergunta da
+#     Parte 08, Ex. 5: "O eixo z da OBB fica perpendicular à mesa?" (não fica);
+#   - a remoção de outliers com remove_statistical_outlier (documentação do Open3D); a maior componente
+#     ligada é o DBSCAN da Parte 07;
+#   - o corte dos pontos extremos: as dimensões vão dos percentis BBOX_TRIM a 100 - BBOX_TRIM, e não do
+#     mínimo ao máximo (a bounding box usa só os pontos extremos: um ponto solto que fique muda a caixa).
+#     Com 0.5% o IoU melhorou em todas as cenas de teste (média 0.768 -> 0.810); com 2-5% a média subia
+#     um pouco mais, mas piorava nas cenas com caixas em contacto (Nível 4). A otimização ficou à frente
+#     em todas (média 0.90).
+
+def bbox_box(points, minimal=True, stacked=False, trim=BBOX_TRIM):
+    """Bounding box orientada (Parte 08, Ex. 5) de um conjunto de pontos -> [x, y, yaw, l, w, h, z].
+
+    1. Remove outliers (estatístico + maior componente ligada), para tratar o método de forma justa;
+    2. Calcula a bounding box com get_minimal_oriented_bounding_box() (menor volume) ou
+       get_oriented_bounding_box() (PCA);
+    3. Pontos extremos: no referencial da bounding box, cada dimensão vai do percentil 'trim' ao
+       percentil 100 - 'trim' dos pontos nesse eixo, em vez de ir do mínimo ao máximo;
+    4. O eixo z da caixa tem de ser perpendicular à mesa: dos 3 eixos da bounding box, o mais
+       alinhado com o z da mesa passa a ser a altura; os outros dois dão o yaw e as dimensões;
+    5. Caixa na mesa: a base é posta em z = 0 e a altura vai até ao topo da bounding box (sem isto
+       a caixa perdia os ~8 mm cortados junto à mesa). Caixa empilhada ('stacked', decidido na
+       estimativa inicial): a base é o fundo da bounding box. Não basta olhar para o fundo: uma
+       caixa da qual só se viu o topo teria o fundo no ar.
+    """
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+    pc, _ = pc.remove_statistical_outlier(nb_neighbors=20, std_ratio=1.5)
+    pts = np.asarray(pc.points)
+    pts = pts[largest_component(pts)]
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+
+    obb = pc.get_minimal_oriented_bounding_box() if minimal else pc.get_oriented_bounding_box()
+    R, extent, center = np.asarray(obb.R), np.asarray(obb.extent), np.asarray(obb.center)
+    if trim > 0:                                  # coordenadas dos pontos nos eixos da bounding box
+        local = (pts - center) @ R
+        lo, hi = np.percentile(local, [trim, 100 - trim], axis=0)
+        center, extent = center + R @ ((lo + hi) / 2), hi - lo
+
+    k = int(np.argmax(np.abs(R[2, :])))           # eixo da bounding box mais alinhado com o z da mesa
+    others = [i for i in range(3) if i != k]
+    axis_x = R[:, others[0]]
+    yaw = np.arctan2(axis_x[1], axis_x[0])
+    length, width = extent[others[0]], extent[others[1]]
+    top = center[2] + extent[k] / 2
+    base = center[2] - extent[k] / 2
+    z = base if stacked and base > ON_TABLE else 0.0
+    return normalize_box(np.array([center[0], center[1], yaw, length, width, top - z, z]))
+
+
+def bbox_method(seg_points, box_labels, num_boxes, minimal=True, init_params=None):
+    """Aplica a bounding box a cada conjunto de pontos (box_labels[i] = caixa do ponto i).
+
+    init_params: estimativa inicial (diz que caixas estão empilhadas: z > 0).
+    """
+    boxes = []
+    for j in range(num_boxes):
+        pts = seg_points[box_labels == j]
+        if len(pts) < 10:
+            continue
+        stacked = init_params is not None and init_params[j][6] > ON_TABLE
+        boxes.append(bbox_box(pts, minimal, stacked))
+    return np.array(boxes)
+
+
+# #####################################################################################################
+# 2. MÉTODO PRINCIPAL: AJUSTE POR OTIMIZAÇÃO
+# #####################################################################################################
+# Como nas Partes 05 e 06: um modelo com parâmetros (a Parabola da Parte 05, ex4), uma função objetivo que
+# devolve um vetor de erros e o scipy.optimize.least_squares, que procura os parâmetros que minimizam a
+# soma dos quadrados desses erros. Todas as caixas são ajustadas ao mesmo tempo.
 
 
 # ----------------------------------------------------------------------------------------------------
-# 1.1 Estimativa inicial (Parte 06, Ex. 6: a otimização precisa de começar perto da solução)
+# 2.1 Parâmetros
 # ----------------------------------------------------------------------------------------------------
+# Cada caixa é [x, y, yaw, length, width, height, z] no referencial da mesa, com z = altura da base acima da
+# mesa (0 numa caixa assente na mesa, o topo da caixa de baixo numa caixa empilhada). Os parâmetros de
+# todas as caixas vão seguidos num só vetor (NUM_PARAMS por caixa). O z das caixas assentes na mesa fica
+# fixo em 0 e os limites das dimensões são dados ao least_squares (bounds, Parte 06, Ex. 4.3): ver fit_boxes.
+def to_box_frame(points, p):
+    """Escreve pontos do referencial da mesa no referencial da caixa p (origem no centro da caixa)."""
+    x, y, yaw, _, _, h, z = p
+    c, s = np.cos(yaw), np.sin(yaw)
+    dx, dy = points[:, 0] - x, points[:, 1] - y
+    # Rotação inversa do yaw (R^T) e translação para o centro da caixa (a z + h/2 da mesa)
+    return np.stack([c * dx + s * dy, -s * dx + c * dy, points[:, 2] - (z + h / 2)], axis=1)
+
+
+def normalize_box(p):
+    """Põe a caixa numa forma canónica: length >= width e yaw em [-90°, 90°).
+
+    Trocar length com width e rodar 90° (ou rodar 180°) dá exatamente a mesma caixa.
+    """
+    x, y, yaw, l, w, h, z = p
+    if w > l:
+        l, w, yaw = w, l, yaw + np.pi / 2
+    yaw = wrap_angle(2 * yaw) / 2                 # módulo 180°
+    return np.array([x, y, yaw, l, w, h, z])
+
+
+# ----------------------------------------------------------------------------------------------------
+# 2.2 Função objetivo
+# ----------------------------------------------------------------------------------------------------
+# Um erro por ponto (e não a média: Parte 06, Ex. 2.3), a distância do ponto à superfície da caixa que
+# melhor o explica (como o computeError da Parabola da Parte 05, mas com um erro por ponto). Só com este
+# termo, duas das perguntas do enunciado ("A analisar") correm mal, e por isso há mais termos:
+#   - uma caixa pode crescer para o espaço vazio sem que o erro aumente -> termo modelo -> dados
+#     (cobertura): as faces que alguma câmara vê têm de ter pontos medidos por perto;
+#   - duas caixas podem ocupar o mesmo espaço -> termo de sobreposição;
+#   - e, do item 1 (z de uma caixa empilhada = topo da de baixo), o termo de apoio.
+# Estes termos são poucos ao lado dos M erros dos pontos: são pesados por sqrt(M), como os erros de brilho e
+# de contraste ao lado dos erros de cada píxel na Parte 06, Ex. 3.
+# O que não está nas aulas: a distância a uma caixa (signed distance function, comum.py) e a comparação
+# da normal de cada ponto com a orientação da face (a ideia de usar as normais vem da Parte 07).
+def distances_to_boxes(points, params, normals=None):
+    """Matriz M x B com a distância de cada ponto à superfície de cada caixa.
+
+    Sem normais: distância à superfície (valor absoluto da signed distance function).
+
+    Com normais: distância à FACE mais próxima cuja orientação é compatível com a normal do ponto.
+    Porquê? Quando duas caixas se tocam, os pontos do topo da caixa mais baixa junto à caixa mais
+    alta estão a poucos mm da face LATERAL da alta. Só com distâncias, a caixa baixa podia encolher
+    alguns mm sem o erro aumentar (esses pontos passavam a ser 'explicados' pela face lateral).
+    Exigindo que um ponto com normal vertical seja explicado por uma face horizontal (e vice-versa),
+    a ambiguidade desaparece (é a mesma ideia de filtrar pelas normais da Parte 07, Ex. 6-8).
+    Faces de orientação errada não são proibidas, só custam mais NORMAL_PENALTY (as normais nas
+    arestas não são fiáveis). A face de baixo nunca conta: assenta na mesa ou noutra caixa.
+    """
+    D = np.empty((len(points), len(params)))
+    for j, p in enumerate(params):
+        half = np.array([p[3], p[4], p[5]]) / 2                   # meias-dimensões
+        local = to_box_frame(points, p)
+        if normals is None:
+            D[:, j] = np.abs(box_signed_distance(local, half))
+            continue
+        # Normais no referencial da caixa (só a rotação do yaw); o sinal não interessa (abs)
+        c, s = np.cos(p[2]), np.sin(p[2])
+        n_local = np.abs(np.stack([c * normals[:, 0] + s * normals[:, 1],
+                                   -s * normals[:, 0] + c * normals[:, 1], normals[:, 2]], axis=1))
+        best = np.full(len(points), np.inf)
+        for axis in range(3):                    # face perpendicular ao eixo x, y ou z da caixa
+            for sign in (-1.0, 1.0):             # face do lado - ou do lado +
+                if axis == 2 and sign < 0:
+                    continue                     # a face de baixo assenta na mesa ou noutra caixa
+                # Projeção do ponto no retângulo da face: fixa a coordenada do eixo e limita as outras
+                proj = np.clip(local, -half, half)
+                proj[:, axis] = sign * half[axis]
+                d = np.linalg.norm(local - proj, axis=1)
+                d += NORMAL_PENALTY * (n_local[:, axis] < 0.7)     # orientação incompatível
+                best = np.minimum(best, d)
+        D[:, j] = best
+    return D
+
+
+def unit_surface_samples(n=7):
+    """Amostras (e a normal de cada uma) na superfície de uma caixa unitária ([-1, 1] em cada eixo).
+
+    n x n amostras no topo e em cada uma das 4 faces laterais. Não há amostras na face de baixo (nunca
+    é vista) nem na parte de baixo das faces laterais (os pontos junto à mesa são cortados na Parte 2).
+    São multiplicadas pelas meias-dimensões de cada caixa em surface_samples.
+    """
+    t = np.linspace(-1, 1, n)
+    a, b = np.meshgrid(t, t)
+    a, b = a.ravel(), b.ravel()
+    one = np.ones_like(a)
+    faces = [(np.stack([a, b, one], 1), (0, 0, 1)),                                        # topo
+             (np.stack([one, a, b], 1), (1, 0, 0)), (np.stack([-one, a, b], 1), (-1, 0, 0)),   # +x e -x
+             (np.stack([a, one, b], 1), (0, 1, 0)), (np.stack([a, -one, b], 1), (0, -1, 0))]   # +y e -y
+    samples = np.concatenate([f for f, _ in faces])
+    normals = np.concatenate([np.tile(nrm, (len(f), 1)) for f, nrm in faces]).astype(float)
+    keep = samples[:, 2] > -0.75
+    return samples[keep], normals[keep]
+
+
+UNIT_SAMPLES, UNIT_NORMALS = unit_surface_samples()     # calculadas uma só vez
+
+
+def surface_samples(p):
+    """Amostras na superfície da caixa p e a normal da face de cada uma (referencial da mesa)."""
+    x, y, yaw, l, w, h, z = p
+    local = UNIT_SAMPLES * np.array([l, w, h]) / 2
+    c, s = np.cos(yaw), np.sin(yaw)
+    points = np.stack([x + c * local[:, 0] - s * local[:, 1],
+                       y + s * local[:, 0] + c * local[:, 1],
+                       local[:, 2] + z + h / 2], axis=1)
+    normals = np.stack([c * UNIT_NORMALS[:, 0] - s * UNIT_NORMALS[:, 1],
+                        s * UNIT_NORMALS[:, 0] + c * UNIT_NORMALS[:, 1], UNIT_NORMALS[:, 2]], axis=1)
+    return points, normals
+
+
+def facing_some_camera(samples, normals, camera_centers, min_cos=0.2):
+    """True para as amostras cuja face está virada para pelo menos uma câmara.
+
+    Uma face só pode ser vista de uma câmara se a normal apontar para o lado da câmara:
+    cos(ângulo entre a normal e a direção amostra -> câmara) > min_cos (~78°; faces quase de perfil
+    também não dão pontos). Com poucas câmaras há faces que nenhuma câmara vê: não têm pontos, e
+    isso não quer dizer que a caixa seja mais pequena. (Não considera oclusões por outras caixas.)
+    """
+    if camera_centers is None:
+        return np.ones(len(samples), bool)
+    to_cam = camera_centers[None, :, :] - samples[:, None, :]             # S x C x 3
+    to_cam /= np.linalg.norm(to_cam, axis=2, keepdims=True)
+    cos = np.einsum("sck,sk->sc", to_cam, normals)                        # produto interno
+    return (cos > min_cos).any(axis=1)
+
+
+def height_overlap(p, q):
+    """Sobreposição (m) dos intervalos de altura [z, z + height] de duas caixas (0 se não se cruzam)."""
+    return max(0.0, min(p[6] + p[5], q[6] + q[5]) - max(p[6], q[6]))
+
+
+def overlap_area(p, q):
+    """Área da interseção dos retângulos de duas caixas vistas de cima (cv2.rotatedRectangleIntersection)."""
+    r1 = ((p[0], p[1]), (p[3], p[4]), np.degrees(p[2]))
+    r2 = ((q[0], q[1]), (q[3], q[4]), np.degrees(q[2]))
+    status, region = cv2.rotatedRectangleIntersection(r1, r2)
+    if status == cv2.INTERSECT_NONE or region is None or len(region) < 3:
+        return 0.0
+    return float(cv2.contourArea(cv2.convexHull(region.reshape(-1, 2).astype(np.float32))))
+
+
+@dataclass
+class FitProblem:
+    """Os dados de que a função objetivo precisa (o 'data' da Parte 06), passados com partial."""
+    points: np.ndarray                 # M x 3, pontos dos objetos no referencial da mesa
+    tree: cKDTree                      # KD-tree dos pontos (para o termo modelo -> dados)
+    num_boxes: int
+    x_full: np.ndarray = None          # parâmetros de todas as caixas seguidas (os fixos com o seu valor)
+    free: np.ndarray = None            # True nos parâmetros otimizados (o z das caixas na mesa é fixo)
+    normals: np.ndarray = None         # M x 3, normal estimada de cada ponto
+    camera_centers: np.ndarray = None  # C x 3, posição das câmaras no referencial da mesa
+    stacked: tuple = ()                # índices das caixas empilhadas (z livre)
+    coverage_weight: float = 1.0
+    overlap_weight: float = 1.0
+    chroma: np.ndarray = None          # 3. Extra: M x 2, cor (cromaticidade) de cada ponto, se a cor for usada
+    box_chroma: np.ndarray = None      # 3. Extra: B x 2, cor de cada caixa
+    color_weight: float = 0.0          # 3. Extra: lambda, converte diferenças de cor em 'metros equivalentes'
+    history: list = field(default_factory=list)   # 2.6: (parâmetros, custo) de cada avaliação
+
+
+def objective_function(x_free, data):
+    """Função objetivo: o vetor de resíduos para os parâmetros otimizados x_free.
+
+    Como na Parte 06, o least_squares chama-a com partial(objective_function, data=problem). Os
+    parâmetros fixos (o z das caixas assentes na mesa) vêm de data.x_full.
+    Resíduos: 1. um por ponto (dados -> modelo); 2. cobertura (modelo -> dados); 3. sobreposição;
+    3b. apoio das caixas empilhadas; e, no extra da cor (secção 3), um resíduo de cor por ponto.
+    """
+    x = data.x_full.copy()
+    x[data.free] = x_free
+    params = x.reshape(data.num_boxes, NUM_PARAMS)
+    M = len(data.points)
+
+    # 1. Dados -> modelo, com a associação ponto -> caixa recalculada AQUI (em cada avaliação)
+    D = distances_to_boxes(data.points, params, data.normals)
+    if data.chroma is not None:
+        # 3. Extra (cor): distância de cor de cada ponto à cor de cada caixa, pesada por lambda
+        C = color_distances(data)
+        assoc = np.argmin(D ** 2 + C ** 2, axis=1)         # caixa que melhor explica posição + cor
+        rows = np.arange(M)
+        res_points = np.concatenate([D[rows, assoc], C[rows, assoc]])
+    else:
+        assoc = np.argmin(D, axis=1)                        # caixa mais próxima do ponto
+        res_points = D[np.arange(M), assoc]
+
+    # 2. Modelo -> dados (pergunta 'uma caixa pode crescer sem que o erro aumente?'):
+    #    cada amostra da superfície tem de ter um ponto medido por perto.
+    #    Não contam: faces que nenhuma câmara vê, e amostras dentro ou a menos de HIDDEN_MARGIN de
+    #    outra caixa (faces de contacto, invisíveis). Uma margem pequena (ex.: 5 mm) criava uma
+    #    barreira: a face só deixava de ser penalizada quando já estava encostada à outra caixa e
+    #    o otimizador ficava parado a ~1 cm dela.
+    res_cover = []
+    # Fator de escala (adaptação do sqrt(n) da Parte 06, Ex. 3): há num_boxes * S resíduos de
+    # cobertura e M resíduos dos pontos. Multiplicar cada um por sqrt(M / (num_boxes * S)) faz com
+    # que o conjunto da cobertura pese tanto como o conjunto dos pontos (a soma dos quadrados fica
+    # com o mesmo número 'efetivo' de termos).
+    scale = np.sqrt(M / (data.num_boxes * len(UNIT_SAMPLES)))
+    for j, p in enumerate(params):
+        samples, sample_normals = surface_samples(p)
+        hidden = ~facing_some_camera(samples, sample_normals, data.camera_centers)
+        for k, q in enumerate(params):
+            if k != j:
+                hidden |= box_signed_distance(to_box_frame(samples, q), np.array(q[3:6]) / 2) < HIDDEN_MARGIN
+        dist, _ = data.tree.query(samples, k=1)                 # ponto medido mais próximo
+        dist[hidden] = 0.0
+        res_cover.append(data.coverage_weight * scale * dist)
+
+    # Parte 06, Ex. 3: os resíduos 'globais' da sobreposição e do apoio são POUCOS (um por par de
+    # caixas / por caixa empilhada) e os dos pontos são M. Por isso cada um é multiplicado por
+    # sqrt(M), exatamente como na aula (erros de brilho/contraste * sqrt(n) ao lado dos n erros
+    # de píxel): ao quadrado fica M * erro^2, isto é, cada erro global vale tanto como os M pontos juntos.
+    # 3. Sobreposição (pergunta 'duas caixas podem ocupar o mesmo espaço?'):
+    #    raiz da área da interseção vista de cima (unidades de comprimento). Só conta
+    #    se as alturas também se cruzarem: o fator cresce de 0 a 1 no primeiro centímetro de
+    #    interpenetração, para uma caixa empilhada poder encostar à de baixo sem custo.
+    res_overlap = [data.overlap_weight * np.sqrt(M) * np.sqrt(overlap_area(params[i], params[j]))
+                   * min(1.0, height_overlap(params[i], params[j]) / 0.01)
+                   for i in range(data.num_boxes) for j in range(i + 1, data.num_boxes)]
+
+    # 3b. Apoio: uma caixa empilhada (z livre) tem de assentar no topo da caixa mais alta que está
+    #     por baixo dela (sobreposição vista de cima e topo abaixo da base + 3 cm)
+    res_support = []
+    for j in data.stacked:
+        p = params[j]
+        below = [q[6] + q[5] for k, q in enumerate(params)
+                 if k != j and q[6] + q[5] < p[6] + 0.03 and overlap_area(p, q) > 0]
+        support = max(below) if below else 0.0             # sem nada por baixo: a mesa
+        res_support.append(data.overlap_weight * np.sqrt(M) * (p[6] - support))
+
+    residuals = np.concatenate([res_points] + res_cover +
+                               [np.array(res_overlap), np.array(res_support)])
+    # 2.6: guarda os parâmetros e o custo (como o soft_l1 o calcula, 2.5) para mostrar a evolução
+    data.history.append((x.copy(), soft_l1_cost(residuals)))
+    return residuals
+
+
+def associations(x, data):
+    """Caixa associada a cada ponto, para os parâmetros x de todas as caixas (a mesma regra da função
+    objetivo; usada no fim, para avaliar e desenhar a segmentação final)."""
+    params = x.reshape(data.num_boxes, NUM_PARAMS)
+    D = distances_to_boxes(data.points, params, data.normals)
+    if data.chroma is not None:
+        C = color_distances(data)
+        return np.argmin(D ** 2 + C ** 2, axis=1)
+    return np.argmin(D, axis=1)
+
+
+# ----------------------------------------------------------------------------------------------------
+# 2.3 Otimização com scipy.optimize.least_squares
+# ----------------------------------------------------------------------------------------------------
+# least_squares(partial(objective_function, data=problem), x0, ...), como na Parte 06. As associações
+# ponto -> caixa são recalculadas DENTRO da função objetivo, em cada avaliação (2.2): não há um ciclo
+# exterior que alterne entre associar e otimizar, e uma associação errada no início corrige-se quando as
+# caixas se mexem. Não está nas aulas: x_scale, diff_step e max_nfev (documentação do scipy).
+def fit_boxes(seg, init_params, init_colors, use_color=True, use_normals=True, camera_centers=None,
+              verbose=True):
+    """Ajusta todas as caixas AO MESMO TEMPO com scipy.optimize.least_squares.
+
+    Entradas: segmentação, estimativa inicial (caixas e cores), se usa a cor e as normais, e a
+    posição das câmaras no referencial da mesa (para não exigir pontos em faces que ninguém vê).
+    1. Reduz os pontos (voxel de 6 mm e no máximo 12000 pontos) para a otimização ser rápida;
+    2. Estima a normal de cada ponto;
+    3. (Extra) a cor e o seu peso (setup_color, secção 3);
+    4. O z das caixas assentes na mesa fica fixo em 0 (não é otimizado); só o das empilhadas é livre.
+       Se fosse livre em todas, uma caixa na mesa podia 'subir' alguns mm sem custo (a segmentação
+       corta os pontos até 8 mm acima da mesa);
+    5. least_squares(partial(objective_function, data=problem)), como na Parte 06, com a perda
+       soft_l1 (2.5) e limites nas dimensões (bounds, Parte 06 Ex. 4.3).
+    Saída: (caixas finais N x 7, o problema (com o histórico), pontos usados, associações finais).
+    """
+    # 1. Redução dos pontos
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(seg.points))
+    pc.colors = o3d.utility.Vector3dVector(seg.colors)
+    pc = pc.voxel_down_sample(FIT_VOXEL)
+    points, colors = np.asarray(pc.points), np.asarray(pc.colors)
+    if len(points) > MAX_FIT_POINTS:
+        sel = np.random.default_rng(0).choice(len(points), MAX_FIT_POINTS, replace=False)
+        points, colors = points[sel], colors[sel]
+
+    # 2. Normais de cada ponto (PCA dos vizinhos num raio de 1.5 cm); o sinal não interessa
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.015, max_nn=30))
+    normals = np.asarray(pc.normals)
+
+    n = len(init_params)
+    problem = FitProblem(points, cKDTree(points), n, normals=normals if use_normals else None)
+    problem.camera_centers = None if camera_centers is None else np.asarray(camera_centers)
+
+    # 3. (Extra) cor
+    if use_color:
+        setup_color(problem, seg, colors, init_colors)
+
+    # 4. Parâmetros livres e fixos (z = 0 fixo nas caixas assentes na mesa)
+    x_full = np.concatenate(init_params).astype(float)
+    problem.stacked = tuple(j for j, p in enumerate(init_params) if p[6] > ON_TABLE)
+    free = np.ones(len(x_full), bool)
+    for j in range(n):
+        if j not in problem.stacked:
+            free[j * NUM_PARAMS + 6] = False
+            x_full[j * NUM_PARAMS + 6] = 0.0
+    problem.x_full, problem.free = x_full, free
+
+    # Limites: dimensões entre 2 cm e 1 m, base entre a mesa e 1 m; posição e yaw livres
+    lower = np.tile([-np.inf, -np.inf, -np.inf, 0.02, 0.02, 0.02, 0.0], n)[free]
+    upper = np.tile([np.inf, np.inf, np.inf, 1.0, 1.0, 1.0, 1.0], n)[free]
+    x0 = np.clip(x_full[free], lower + 1e-6, upper - 1e-6)
+    # Escala típica de cada parâmetro (ajuda o otimizador): 1 cm nas distâncias, ~3° no yaw
+    x_scale = np.tile([0.01, 0.01, 0.05, 0.01, 0.01, 0.01, 0.01], n)[free]
+
+    # 5. Otimização (2.5: perda robusta soft_l1, para os pontos errados)
+    result = least_squares(partial(objective_function, data=problem), x0, bounds=(lower, upper), loss="soft_l1",
+                           f_scale=LOSS_SCALE, x_scale=x_scale, diff_step=1e-4, max_nfev=200)
+    x_final = x_full.copy()
+    x_final[free] = result.x
+    params = np.array([normalize_box(p) for p in x_final.reshape(n, NUM_PARAMS)])
+    if verbose:
+        print(f"  otimização: {result.nfev} iterações, custo {problem.history[0][1]:.1f} -> "
+              f"{min(h[1] for h in problem.history):.1f}, "
+              f"cor {'sim' if problem.chroma is not None else 'não'} ({len(points)} pontos)")
+    return params, problem, points, associations(x_final, problem)
+
+
+# ----------------------------------------------------------------------------------------------------
+# 2.4 Estimativa inicial (Parte 06, Ex. 6)
+# ----------------------------------------------------------------------------------------------------
+# A otimização tem de começar perto da solução (na Parte 06, Ex. 6, a partir do meio da imagem ficava presa
+# numa posição errada; lá a estimativa vinha do template matching, aqui vem da segmentação):
+#   - cluster com uma caixa: retângulo de área mínima visto de cima e topo = percentil 98 da altura;
+#   - várias caixas de cores distintas: o mesmo, para cada grupo de cor;
+#   - várias caixas da mesma cor: o cluster é dividido pela geometria (topos a alturas diferentes, degraus
+#     do contorno, forma de L, k-means). Esta divisão é o resto do extra da Parte 2 (n.º de caixas);
+#   - com caixas da mesma cor em contacto, a estimativa é incerta: experimentam-se duas estimativas iniciais
+#     e fica a que acaba com menor custo (fit_from_initial_estimates).
+# O que não está nas aulas: cv2.minAreaRect, cv2.kmeans, o PCA (SVD) e a tentativa de várias estimativas
+# iniciais (multi-start). O DBSCAN é o da Parte 07.
 # Funções de apoio para dividir um cluster em caixas (estavam na Parte 2, mas só a Parte 3 as usa)
 def largest_component(points, eps=0.012):
     """Índices da maior componente ligada (DBSCAN) de um conjunto de pontos (retira pontos soltos)."""
@@ -312,7 +731,7 @@ def split_geometric(points, n, method="kmeans"):
          - c = 2, method="profile": no degrau do contorno (split_profile); sem degrau, partes iguais;
          - restantes casos: c partes iguais, numa grelha (fila ou 2x2) com as caixas menos alongadas (split_equal).
        A divisão é só uma aproximação: a otimização corrige a fronteira. Mas, se começar muito
-       longe, pode ficar presa num mínimo local, por isso run() experimenta os dois métodos;
+       longe, pode ficar presa num mínimo local, por isso fit_from_initial_estimates experimenta os dois;
     4. Retângulo de cada caixa visto de cima. Para um nível que não foi dividido e que tem caixas
        mais altas no cluster, o topo visível pode ser só uma moldura ou um pedaço (o resto está
        tapado pela caixa de cima). Juntam-se então as PAREDES dessa caixa: pontos entre o nível de
@@ -423,7 +842,8 @@ def initial_boxes(seg, split_method="kmeans"):
     - Cluster com várias caixas da mesma cor: split_geometric (topos + divisão).
     Em todos os casos a base (z) vem de place_on_supports (caixas empilhadas assentam na de baixo).
     Saída: (lista de caixas, cor de cada caixa, rótulo da caixa de cada ponto da segmentação).
-    Os rótulos são os 'conjuntos de pontos' de cada caixa, usados pela bounding box e na avaliação.
+    Os rótulos são os 'conjuntos de pontos' de cada caixa, usados pela bounding box (secção 1)
+    e na avaliação.
     """
     params, colors = [], []
     labels = np.full(len(seg.points), -1)
@@ -470,231 +890,58 @@ def initial_boxes(seg, split_method="kmeans"):
     return params, colors, labels
 
 
-# ----------------------------------------------------------------------------------------------------
-# 1.2 Modelo da caixa
-# ----------------------------------------------------------------------------------------------------
-def to_box_frame(points, p):
-    """Escreve pontos do referencial da mesa no referencial da caixa p (origem no centro da caixa)."""
-    x, y, yaw, _, _, h, z = p
-    c, s = np.cos(yaw), np.sin(yaw)
-    dx, dy = points[:, 0] - x, points[:, 1] - y
-    # Rotação inversa do yaw (R^T) e translação para o centro da caixa (a z + h/2 da mesa)
-    return np.stack([c * dx + s * dy, -s * dx + c * dy, points[:, 2] - (z + h / 2)], axis=1)
+def fit_from_initial_estimates(seg, camera_centers, use_color=True, verbose=True):
+    """Estimativa inicial + otimização, com mais de uma estimativa inicial quando é incerta (multi-start).
 
-
-def distances_to_boxes(points, params, normals=None):
-    """Matriz M x B com a distância de cada ponto à superfície de cada caixa.
-
-    Sem normais: distância à superfície (valor absoluto da signed distance function).
-
-    Com normais: distância à FACE mais próxima cuja orientação é compatível com a normal do ponto.
-    Porquê? Quando duas caixas se tocam, os pontos do topo da caixa mais baixa junto à caixa mais
-    alta estão a poucos mm da face LATERAL da alta. Só com distâncias, a caixa baixa podia encolher
-    alguns mm sem o erro aumentar (esses pontos passavam a ser 'explicados' pela face lateral).
-    Exigindo que um ponto com normal vertical seja explicado por uma face horizontal (e vice-versa),
-    a ambiguidade desaparece (é a mesma ideia de filtrar pelas normais da Parte 07, Ex. 6-8).
-    Faces de orientação errada não são proibidas, só custam mais NORMAL_PENALTY (as normais nas
-    arestas não são fiáveis). A face de baixo nunca conta: assenta na mesa ou noutra caixa.
+    Com caixas da mesma cor em contacto, a divisão do cluster em caixas é incerta e a otimização pode
+    ficar presa num mínimo local (Parte 06, Ex. 6). Experimentam-se então duas estimativas iniciais
+    (k-means e degraus do contorno) e fica a que acaba com MENOR CUSTO (os custos são comparáveis: a
+    função objetivo e os pontos são os mesmos nas duas tentativas).
+    Saída: (estimativa inicial, cores das caixas, caixa de cada ponto da segmentação, caixas finais,
+    problema de otimização, pontos usados, associações finais).
     """
-    D = np.empty((len(points), len(params)))
-    for j, p in enumerate(params):
-        half = np.array([p[3], p[4], p[5]]) / 2                   # meias-dimensões
-        local = to_box_frame(points, p)
-        if normals is None:
-            D[:, j] = np.abs(box_signed_distance(local, half))
-            continue
-        # Normais no referencial da caixa (só a rotação do yaw); o sinal não interessa (abs)
-        c, s = np.cos(p[2]), np.sin(p[2])
-        n_local = np.abs(np.stack([c * normals[:, 0] + s * normals[:, 1],
-                                   -s * normals[:, 0] + c * normals[:, 1], normals[:, 2]], axis=1))
-        best = np.full(len(points), np.inf)
-        for axis in range(3):                    # face perpendicular ao eixo x, y ou z da caixa
-            for sign in (-1.0, 1.0):             # face do lado - ou do lado +
-                if axis == 2 and sign < 0:
-                    continue                     # a face de baixo assenta na mesa ou noutra caixa
-                # Projeção do ponto no retângulo da face: fixa a coordenada do eixo e limita as outras
-                proj = np.clip(local, -half, half)
-                proj[:, axis] = sign * half[axis]
-                d = np.linalg.norm(local - proj, axis=1)
-                d += NORMAL_PENALTY * (n_local[:, axis] < 0.7)     # orientação incompatível
-                best = np.minimum(best, d)
-        D[:, j] = best
-    return D
-
-
-def unit_surface_samples(n=7):
-    """Amostras (e a normal de cada uma) na superfície de uma caixa unitária ([-1, 1] em cada eixo).
-
-    n x n amostras no topo e em cada uma das 4 faces laterais. Não há amostras na face de baixo (nunca
-    é vista) nem na parte de baixo das faces laterais (os pontos junto à mesa são cortados na Parte 2).
-    São multiplicadas pelas meias-dimensões de cada caixa em surface_samples.
-    """
-    t = np.linspace(-1, 1, n)
-    a, b = np.meshgrid(t, t)
-    a, b = a.ravel(), b.ravel()
-    one = np.ones_like(a)
-    faces = [(np.stack([a, b, one], 1), (0, 0, 1)),                                        # topo
-             (np.stack([one, a, b], 1), (1, 0, 0)), (np.stack([-one, a, b], 1), (-1, 0, 0)),   # +x e -x
-             (np.stack([a, one, b], 1), (0, 1, 0)), (np.stack([a, -one, b], 1), (0, -1, 0))]   # +y e -y
-    samples = np.concatenate([f for f, _ in faces])
-    normals = np.concatenate([np.tile(nrm, (len(f), 1)) for f, nrm in faces]).astype(float)
-    keep = samples[:, 2] > -0.75
-    return samples[keep], normals[keep]
-
-
-UNIT_SAMPLES, UNIT_NORMALS = unit_surface_samples()     # calculadas uma só vez
-
-
-def surface_samples(p):
-    """Amostras na superfície da caixa p e a normal da face de cada uma (referencial da mesa)."""
-    x, y, yaw, l, w, h, z = p
-    local = UNIT_SAMPLES * np.array([l, w, h]) / 2
-    c, s = np.cos(yaw), np.sin(yaw)
-    points = np.stack([x + c * local[:, 0] - s * local[:, 1],
-                       y + s * local[:, 0] + c * local[:, 1],
-                       local[:, 2] + z + h / 2], axis=1)
-    normals = np.stack([c * UNIT_NORMALS[:, 0] - s * UNIT_NORMALS[:, 1],
-                        s * UNIT_NORMALS[:, 0] + c * UNIT_NORMALS[:, 1], UNIT_NORMALS[:, 2]], axis=1)
-    return points, normals
-
-
-def facing_some_camera(samples, normals, camera_centers, min_cos=0.2):
-    """True para as amostras cuja face está virada para pelo menos uma câmara.
-
-    Uma face só pode ser vista de uma câmara se a normal apontar para o lado da câmara:
-    cos(ângulo entre a normal e a direção amostra -> câmara) > min_cos (~78°; faces quase de perfil
-    também não dão pontos). Com poucas câmaras há faces que nenhuma câmara vê: não têm pontos, e
-    isso não quer dizer que a caixa seja mais pequena. (Não considera oclusões por outras caixas.)
-    """
-    if camera_centers is None:
-        return np.ones(len(samples), bool)
-    to_cam = camera_centers[None, :, :] - samples[:, None, :]             # S x C x 3
-    to_cam /= np.linalg.norm(to_cam, axis=2, keepdims=True)
-    cos = np.einsum("sck,sk->sc", to_cam, normals)                        # produto interno
-    return (cos > min_cos).any(axis=1)
-
-
-def height_overlap(p, q):
-    """Sobreposição (m) dos intervalos de altura [z, z + height] de duas caixas (0 se não se cruzam)."""
-    return max(0.0, min(p[6] + p[5], q[6] + q[5]) - max(p[6], q[6]))
-
-
-def overlap_area(p, q):
-    """Área da interseção dos retângulos de duas caixas vistas de cima (cv2.rotatedRectangleIntersection)."""
-    r1 = ((p[0], p[1]), (p[3], p[4]), np.degrees(p[2]))
-    r2 = ((q[0], q[1]), (q[3], q[4]), np.degrees(q[2]))
-    status, region = cv2.rotatedRectangleIntersection(r1, r2)
-    if status == cv2.INTERSECT_NONE or region is None or len(region) < 3:
-        return 0.0
-    return float(cv2.contourArea(cv2.convexHull(region.reshape(-1, 2).astype(np.float32))))
-
-
-def normalize_box(p):
-    """Põe a caixa numa forma canónica: length >= width e yaw em [-90°, 90°).
-
-    Trocar length com width e rodar 90° (ou rodar 180°) dá exatamente a mesma caixa.
-    """
-    x, y, yaw, l, w, h, z = p
-    if w > l:
-        l, w, yaw = w, l, yaw + np.pi / 2
-    yaw = wrap_angle(2 * yaw) / 2                 # módulo 180°
-    return np.array([x, y, yaw, l, w, h, z])
+    methods = ["kmeans", "profile"] if needs_geometric_split(seg) else ["kmeans"]
+    best = None
+    for method in methods:
+        init_params, init_colors, box_labels = initial_boxes(seg, method)
+        params_opt, problem, fit_points, fit_assoc = fit_boxes(seg, init_params, init_colors,
+                                                               use_color=use_color,
+                                                               camera_centers=camera_centers, verbose=verbose)
+        cost = min(h[1] for h in problem.history)
+        if verbose and len(methods) > 1:
+            print(f"    estimativa inicial '{method}': custo final {cost:.1f}")
+        if best is None or cost < best[0]:
+            best = (cost, init_params, init_colors, box_labels, params_opt, problem, fit_points, fit_assoc)
+    return best[1:]
 
 
 # ----------------------------------------------------------------------------------------------------
-# 1.3 Função objetivo e otimização
+# 2.5 Pontos errados (Parte 06, Ex. 5)
 # ----------------------------------------------------------------------------------------------------
-@dataclass
-class FitProblem:
-    """Tudo o que a função objetivo precisa. O método residuals() é chamado pelo least_squares."""
-    points: np.ndarray                 # M x 3, pontos dos objetos no referencial da mesa
-    tree: cKDTree                      # KD-tree dos pontos (para o termo modelo -> dados)
-    num_boxes: int
-    normals: np.ndarray = None         # M x 3, normal estimada de cada ponto
-    camera_centers: np.ndarray = None  # C x 3, posição das câmaras no referencial da mesa
-    chroma: np.ndarray = None          # M x 2, cor (cromaticidade) de cada ponto, se a cor for usada
-    box_chroma: np.ndarray = None      # B x 2, cor de cada caixa
-    color_weight: float = 0.0          # lambda: converte diferenças de cor em 'metros equivalentes'
-    stacked: tuple = ()                # índices das caixas empilhadas (z livre)
-    coverage_weight: float = 1.0
-    overlap_weight: float = 1.0
-    history: list = field(default_factory=list)   # (parâmetros, custo) de cada avaliação, para as figuras
+# loss='soft_l1' no least_squares (fit_boxes), como no Ex. 5.3: um resíduo pequeno conta como nos mínimos
+# quadrados normais, mas um resíduo muito maior do que f_scale = LOSS_SCALE (4 mm) conta quase só
+# linearmente. Assim, uns poucos pontos errados (flying pixels, pontos de outra caixa, cores trocadas junto
+# às fronteiras) não puxam as caixas. Não está nas aulas: o f_scale (documentação do scipy).
+def soft_l1_cost(residuals, f_scale=LOSS_SCALE):
+    """Custo de um vetor de resíduos com a perda soft_l1: soma de sqrt(1 + (r / f_scale)^2) - 1.
 
-    def residuals(self, x):
-        """Vetor de resíduos para os parâmetros x (todas as caixas seguidas, 7 números cada)."""
-        params = x.reshape(self.num_boxes, NUM_PARAMS)
-        M = len(self.points)
-
-        # 1. Dados -> modelo, com a associação ponto -> caixa recalculada AQUI (em cada avaliação)
-        D = distances_to_boxes(self.points, params, self.normals)
-        if self.chroma is not None:
-            # Cor: distância de cor de cada ponto à cor de cada caixa, pesada por lambda
-            C = np.linalg.norm(self.chroma[:, None, :] - self.box_chroma[None], axis=2) * self.color_weight
-            assoc = np.argmin(D ** 2 + C ** 2, axis=1)         # caixa que melhor explica posição + cor
-            rows = np.arange(M)
-            res_points = np.concatenate([D[rows, assoc], C[rows, assoc]])
-        else:
-            assoc = np.argmin(D, axis=1)                        # caixa mais próxima do ponto
-            res_points = D[np.arange(M), assoc]
-
-        # 2. Modelo -> dados: cada amostra da superfície tem de ter um ponto medido por perto.
-        #    Não contam: faces que nenhuma câmara vê, e amostras dentro ou a menos de HIDDEN_MARGIN de
-        #    outra caixa (faces de contacto, invisíveis). Uma margem pequena (ex.: 5 mm) criava uma
-        #    barreira: a face só deixava de ser penalizada quando já estava encostada à outra caixa e
-        #    o otimizador ficava parado a ~1 cm dela.
-        res_cover = []
-        # Fator de escala (adaptação do sqrt(n) da Parte 06, Ex. 3): há num_boxes * S resíduos de
-        # cobertura e M resíduos dos pontos. Multiplicar cada um por sqrt(M / (num_boxes * S)) faz com
-        # que o conjunto da cobertura pese tanto como o conjunto dos pontos (a soma dos quadrados fica
-        # com o mesmo número 'efetivo' de termos).
-        scale = np.sqrt(M / (self.num_boxes * len(UNIT_SAMPLES)))
-        for j, p in enumerate(params):
-            samples, sample_normals = surface_samples(p)
-            hidden = ~facing_some_camera(samples, sample_normals, self.camera_centers)
-            for k, q in enumerate(params):
-                if k != j:
-                    hidden |= box_signed_distance(to_box_frame(samples, q), np.array(q[3:6]) / 2) < HIDDEN_MARGIN
-            dist, _ = self.tree.query(samples, k=1)                 # ponto medido mais próximo
-            dist[hidden] = 0.0
-            res_cover.append(self.coverage_weight * scale * dist)
-
-        # Parte 06, Ex. 3: os resíduos 'globais' da sobreposição e do apoio são POUCOS (um por par de
-        # caixas / por caixa empilhada) e os dos pontos são M. Por isso cada um é multiplicado por
-        # sqrt(M), exatamente como na aula (erros de brilho/contraste * sqrt(n) ao lado dos n erros
-        # de píxel): ao quadrado fica M * erro^2, isto é, cada erro global vale tanto como os M pontos juntos.
-        # 3. Sobreposição: raiz da área da interseção vista de cima (unidades de comprimento). Só conta
-        #    se as alturas também se cruzarem: o fator cresce de 0 a 1 no primeiro centímetro de
-        #    interpenetração, para uma caixa empilhada poder encostar à de baixo sem custo.
-        res_overlap = [self.overlap_weight * np.sqrt(M) * np.sqrt(overlap_area(params[i], params[j]))
-                       * min(1.0, height_overlap(params[i], params[j]) / 0.01)
-                       for i in range(self.num_boxes) for j in range(i + 1, self.num_boxes)]
-
-        # 3b. Apoio: uma caixa empilhada (z livre) tem de assentar no topo da caixa mais alta que está
-        #     por baixo dela (sobreposição vista de cima e topo abaixo da base + 3 cm)
-        res_support = []
-        for j in self.stacked:
-            p = params[j]
-            below = [q[6] + q[5] for k, q in enumerate(params)
-                     if k != j and q[6] + q[5] < p[6] + 0.03 and overlap_area(p, q) > 0]
-            support = max(below) if below else 0.0             # sem nada por baixo: a mesa
-            res_support.append(self.overlap_weight * np.sqrt(M) * (p[6] - support))
-
-        residuals = np.concatenate([res_points] + res_cover +
-                                   [np.array(res_overlap), np.array(res_support)])
-        # Guarda o custo (como o soft_l1 o calcula) para as figuras da evolução da otimização
-        self.history.append((x.copy(), float(np.sum(np.sqrt(1 + (residuals / LOSS_SCALE) ** 2) - 1))))
-        return residuals
-
-    def associations(self, x):
-        """Caixa associada a cada ponto, para os parâmetros x (para avaliar a segmentação final)."""
-        params = x.reshape(self.num_boxes, NUM_PARAMS)
-        D = distances_to_boxes(self.points, params, self.normals)
-        if self.chroma is not None:
-            C = np.linalg.norm(self.chroma[:, None, :] - self.box_chroma[None], axis=2) * self.color_weight
-            return np.argmin(D ** 2 + C ** 2, axis=1)
-        return np.argmin(D, axis=1)
+    Um resíduo pequeno (r << f_scale) conta (r / f_scale)^2 / 2, como nos mínimos quadrados normais;
+    um resíduo grande conta só ~ |r| / f_scale. É o custo que o least_squares minimiza, a menos do
+    fator constante f_scale^2 (só serve para comparar custos: evolução e escolha da estimativa inicial).
+    """
+    return float(np.sum(np.sqrt(1 + (residuals / f_scale) ** 2) - 1))
 
 
+# ----------------------------------------------------------------------------------------------------
+# 2.6 Visualização: evolução das caixas ao longo da otimização
+# ----------------------------------------------------------------------------------------------------
+# Nas Partes 05 e 06 o desenho é feito dentro da função objetivo, em cada avaliação. Aqui os parâmetros de
+# cada avaliação são GUARDADOS (FitProblem.history) e desenhados no fim: em cada iteração o least_squares
+# avalia a função 7N+1 vezes (jacobiano por diferenças finitas), e desenhar em direto era lento e mostrava
+# as caixas a tremer. Só ficam as avaliações que melhoraram o custo (a 'trajetória'). Três formas:
+#   - janela 3D com a animação (--visualize; dados em figure_data e janela em make_windows, secção 5);
+#   - figura PNG com várias fases lado a lado (save_evolution, usada pelo avaliador.py);
+#   - janela do Open3D (--open3d, animate_optimization), a mais parecida com as aulas.
 def evolution_snapshots(history):
     """Do histórico de avaliações, fica só com as que melhoraram o custo (a 'trajetória')."""
     best, snapshots = np.inf, []
@@ -705,138 +952,103 @@ def evolution_snapshots(history):
     return snapshots
 
 
-def fit_boxes(seg, init_params, init_colors, use_color=True, use_normals=True, camera_centers=None,
-              verbose=True):
-    """Ajusta todas as caixas AO MESMO TEMPO com scipy.optimize.least_squares.
+def snapshot_frames(snapshots, max_frames=MAX_FRAMES):
+    """Até max_frames passos da otimização, igualmente espaçados (com o primeiro e o último), cada um como
+    uma lista de caixas [x, y, yaw, l, w, h, z]. Saída: (caixas de cada passo, número de cada passo)."""
+    snapshots = np.asarray(snapshots)
+    picks = np.unique(np.linspace(0, len(snapshots) - 1, min(max_frames, len(snapshots))).astype(int))
+    frames = np.array([[normalize_box(p) for p in snapshots[k].reshape(-1, NUM_PARAMS)] for k in picks])
+    return frames, picks
 
-    Entradas: segmentação, estimativa inicial (caixas e cores), se usa a cor e as normais, e a
-    posição das câmaras no referencial da mesa (para não exigir pontos em faces que ninguém vê).
-    1. Reduz os pontos (voxel de 6 mm e no máximo 12000 pontos) para a otimização ser rápida;
-    2. Estima a normal de cada ponto;
-    3. Peso da cor: lambda = sigma_geométrico / sigma_cor, isto é, cada erro é dividido pelo seu
-       desvio padrão, para 1 desvio de cor 'valer' 1 desvio de distância (põe as duas grandezas na
-       mesma unidade; não é o sqrt(n) da Parte 06 Ex. 3, que é usado na cobertura, sobreposição e apoio);
-    4. O z das caixas assentes na mesa fica fixo em 0 (não é otimizado); só o das empilhadas é livre.
-       Se fosse livre em todas, uma caixa na mesa podia 'subir' alguns mm sem custo (a segmentação
-       corta os pontos até 8 mm acima da mesa);
-    5. least_squares com perda soft_l1 e limites nas dimensões.
-    Saída: (caixas finais N x 7, o problema (com o histórico), pontos usados, associações finais).
-    """
-    # 1. Redução dos pontos
-    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(seg.points))
-    pc.colors = o3d.utility.Vector3dVector(seg.colors)
-    pc = pc.voxel_down_sample(FIT_VOXEL)
-    points, colors = np.asarray(pc.points), np.asarray(pc.colors)
-    if len(points) > MAX_FIT_POINTS:
-        sel = np.random.default_rng(0).choice(len(points), MAX_FIT_POINTS, replace=False)
-        points, colors = points[sel], colors[sel]
 
-    # 2. Normais de cada ponto (PCA dos vizinhos num raio de 1.5 cm); o sinal não interessa
+def save_evolution(path, points, problem, num_frames=6):
+    """Várias fases da otimização lado a lado (da estimativa inicial ao resultado final)."""
+    snaps = evolution_snapshots(problem.history)
+    picks = np.unique(np.linspace(0, len(snaps) - 1, min(num_frames, len(snaps))).astype(int))
+    fig, axes = plt.subplots(1, len(picks), figsize=(3.2 * len(picks), 3.4), squeeze=False)
+    sel = np.random.default_rng(0).choice(len(points), min(len(points), 6000), replace=False)
+    for ax, k in zip(axes[0], picks):
+        ax.scatter(points[sel, 0], points[sel, 1], c="0.6", s=0.5)
+        params = [normalize_box(p) for p in snaps[k].reshape(-1, NUM_PARAMS)]
+        _draw_rects(ax, params, {})
+        ax.set_aspect("equal")
+        ax.set_title(f"passo {k}/{len(snaps) - 1}", fontsize=9)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.suptitle("Evolução das caixas durante a otimização (vista de cima)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+def box_lineset(T, length, width, height, color):
+    """LineSet com as 12 arestas de uma caixa com pose T."""
+    corners, edges = box_lines_3d(T, length, width, height)
+    ls = o3d.geometry.LineSet(o3d.utility.Vector3dVector(corners), o3d.utility.Vector2iVector(edges))
+    ls.colors = o3d.utility.Vector3dVector([color] * len(edges))
+    return ls
+
+
+def params_linesets(params, color=None):
+    """LineSets das caixas (parâmetros no referencial da mesa)."""
+    return [box_lineset(box_T_table(p[0], p[1], p[2], p[5], p[6]), p[3], p[4], p[5],
+                        color or BOX_COLORS[j % len(BOX_COLORS)]) for j, p in enumerate(params)]
+
+
+def animate_optimization(points, colors, problem, delay=0.15):
+    """Janela do Open3D com a evolução das caixas ao longo da otimização, sobre a nuvem de pontos
+    (como o desenho em cada iteração das Partes 05 e 06, mas a partir do histórico guardado)."""
     pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.015, max_nn=30))
-    normals = np.asarray(pc.normals)
+    pc.colors = o3d.utility.Vector3dVector(colors)
+    vis = o3d.visualization.Visualizer()
+    vis.create_window("Evolução da otimização")
+    vis.add_geometry(pc)
+    current = []
+    for x in evolution_snapshots(problem.history):
+        for g in current:
+            vis.remove_geometry(g, reset_bounding_box=False)
+        current = params_linesets(x.reshape(-1, NUM_PARAMS))
+        for g in current:
+            vis.add_geometry(g, reset_bounding_box=False)
+        vis.poll_events()
+        vis.update_renderer()
+        time.sleep(delay)
+    vis.run()                    # fica aberta no estado final até o utilizador fechar
+    vis.destroy_window()
 
-    n = len(init_params)
-    problem = FitProblem(points, cKDTree(points), n, normals=normals if use_normals else None)
-    problem.camera_centers = None if camera_centers is None else np.asarray(camera_centers)
 
-    # 3. A cor só entra se a segmentação mostrou que as caixas têm cores distintas
+# #####################################################################################################
+# 3. EXTRA: COR NA OTIMIZAÇÃO (Nível 4: caixas em contacto de cores diferentes)
+# #####################################################################################################
+# Cada caixa tem uma cor (a cromaticidade da Parte 2) e cada ponto é associado à caixa que melhor explica a
+# sua posição E a sua cor; a diferença de cor entra também como resíduo (objective_function). Não está nas
+# aulas: o peso lambda = sigma_geométrico / sigma_cor (cada erro dividido pelo seu desvio padrão).
+def color_distances(data):
+    """Matriz M x B: distância de cor de cada ponto à cor de cada caixa, pesada por lambda (color_weight)."""
+    return np.linalg.norm(data.chroma[:, None, :] - data.box_chroma[None], axis=2) * data.color_weight
+
+
+def setup_color(problem, seg, colors, init_colors):
+    """Prepara a cor na otimização: cor de cada ponto e de cada caixa (da estimativa inicial) e o peso.
+
+    A cor só entra se a segmentação mostrou que as caixas têm cores distintas (e há mais de uma caixa).
+    Peso: lambda = sigma_geométrico / sigma_cor, isto é, cada erro é dividido pelo seu desvio padrão,
+    para 1 desvio de cor 'valer' 1 desvio de distância (põe as duas grandezas na mesma unidade; não é o
+    sqrt(n) da Parte 06 Ex. 3, que é usado na cobertura, sobreposição e apoio). O desvio da cor é
+    estimado de forma robusta: 1.4826 x mediana do desvio de cada ponto à cor da caixa mais parecida.
+    """
     color_informative = any(g is not None for g in seg.color_groups.values())
-    if use_color and color_informative and n > 1:
-        problem.chroma = chroma_features(colors)
-        problem.box_chroma = np.array(init_colors)
-        nearest = np.argmin(np.linalg.norm(problem.chroma[:, None] - problem.box_chroma[None], axis=2), axis=1)
-        spread = np.median(np.linalg.norm(problem.chroma - problem.box_chroma[nearest], axis=1)) * 1.4826
-        problem.color_weight = GEOMETRIC_SIGMA / max(spread, 1e-3)
-
-    # 4. Parâmetros livres e fixos (z = 0 fixo nas caixas assentes na mesa)
-    x_full = np.concatenate(init_params).astype(float)
-    problem.stacked = tuple(j for j, p in enumerate(init_params) if p[6] > ON_TABLE)
-    free = np.ones(len(x_full), bool)
-    for j in range(n):
-        if j not in problem.stacked:
-            free[j * NUM_PARAMS + 6] = False
-            x_full[j * NUM_PARAMS + 6] = 0.0
-
-    # Limites: dimensões entre 2 cm e 1 m, base entre a mesa e 1 m; posição e yaw livres
-    lower = np.tile([-np.inf, -np.inf, -np.inf, 0.02, 0.02, 0.02, 0.0], n)[free]
-    upper = np.tile([np.inf, np.inf, np.inf, 1.0, 1.0, 1.0, 1.0], n)[free]
-    x0 = np.clip(x_full[free], lower + 1e-6, upper - 1e-6)
-    # Escala típica de cada parâmetro (ajuda o otimizador): 1 cm nas distâncias, ~3° no yaw
-    x_scale = np.tile([0.01, 0.01, 0.05, 0.01, 0.01, 0.01, 0.01], n)[free]
-
-    def residuals_free(x_free):
-        """Junta os parâmetros otimizados com os fixos e calcula os resíduos."""
-        x = x_full.copy()
-        x[free] = x_free
-        return problem.residuals(x)
-
-    # 5. Otimização
-    result = least_squares(residuals_free, x0, bounds=(lower, upper), loss="soft_l1",
-                           f_scale=LOSS_SCALE, x_scale=x_scale, diff_step=1e-4, max_nfev=200)
-    x_final = x_full.copy()
-    x_final[free] = result.x
-    params = np.array([normalize_box(p) for p in x_final.reshape(n, NUM_PARAMS)])
-    if verbose:
-        print(f"  otimização: {result.nfev} iterações, custo {problem.history[0][1]:.1f} -> "
-              f"{min(h[1] for h in problem.history):.1f}, "
-              f"cor {'sim' if problem.chroma is not None else 'não'} ({len(points)} pontos)")
-    return params, problem, points, problem.associations(x_final)
+    if not color_informative or problem.num_boxes < 2:
+        return
+    problem.chroma = chroma_features(colors)
+    problem.box_chroma = np.array(init_colors)
+    nearest = np.argmin(np.linalg.norm(problem.chroma[:, None] - problem.box_chroma[None], axis=2), axis=1)
+    spread = np.median(np.linalg.norm(problem.chroma - problem.box_chroma[nearest], axis=1)) * 1.4826
+    problem.color_weight = GEOMETRIC_SIGMA / max(spread, 1e-3)
 
 
 # #####################################################################################################
-# 2. MÉTODO BASE: BOUNDING BOX ORIENTADA (só para comparar com a otimização)
-# #####################################################################################################
-def bbox_box(points, minimal=True, stacked=False):
-    """Bounding box orientada (Parte 08, Ex. 5) de um conjunto de pontos -> [x, y, yaw, l, w, h, z].
-
-    1. Remove outliers (estatístico + maior componente ligada), para tratar o método de forma justa;
-    2. Calcula a bounding box com get_minimal_oriented_bounding_box() (menor volume) ou
-       get_oriented_bounding_box() (PCA);
-    3. O eixo z da caixa tem de ser perpendicular à mesa: dos 3 eixos da bounding box, o mais
-       alinhado com o z da mesa passa a ser a altura; os outros dois dão o yaw e as dimensões;
-    4. Caixa na mesa: a base é posta em z = 0 e a altura vai até ao topo da bounding box (sem isto
-       a caixa perdia os ~8 mm cortados junto à mesa). Caixa empilhada ('stacked', decidido na
-       estimativa inicial): a base é o fundo da bounding box. Não basta olhar para o fundo: uma
-       caixa da qual só se viu o topo teria o fundo no ar.
-    """
-    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-    pc, _ = pc.remove_statistical_outlier(nb_neighbors=20, std_ratio=1.5)
-    pts = np.asarray(pc.points)
-    pts = pts[largest_component(pts)]
-    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
-
-    obb = pc.get_minimal_oriented_bounding_box() if minimal else pc.get_oriented_bounding_box()
-    R, extent, center = np.asarray(obb.R), np.asarray(obb.extent), np.asarray(obb.center)
-
-    k = int(np.argmax(np.abs(R[2, :])))           # eixo da bounding box mais alinhado com o z da mesa
-    others = [i for i in range(3) if i != k]
-    axis_x = R[:, others[0]]
-    yaw = np.arctan2(axis_x[1], axis_x[0])
-    length, width = extent[others[0]], extent[others[1]]
-    top = center[2] + extent[k] / 2
-    base = center[2] - extent[k] / 2
-    z = base if stacked and base > ON_TABLE else 0.0
-    return normalize_box(np.array([center[0], center[1], yaw, length, width, top - z, z]))
-
-
-def bbox_method(seg_points, box_labels, num_boxes, minimal=True, init_params=None):
-    """Aplica a bounding box a cada conjunto de pontos (box_labels[i] = caixa do ponto i).
-
-    init_params: estimativa inicial (diz que caixas estão empilhadas: z > 0).
-    """
-    boxes = []
-    for j in range(num_boxes):
-        pts = seg_points[box_labels == j]
-        if len(pts) < 10:
-            continue
-        stacked = init_params is not None and init_params[j][6] > ON_TABLE
-        boxes.append(bbox_box(pts, minimal, stacked))
-    return np.array(boxes)
-
-
-# #####################################################################################################
-# 3. SAÍDA: ajuste.npz (para o avaliador) e result.json
+# 4. SAÍDA: ajuste.npz (para o avaliador) e result.json
 # #####################################################################################################
 FIT_FILE = "ajuste.npz"     # caixas dos dois métodos, estimativa inicial, caixa de cada ponto, evolução
 
@@ -865,9 +1077,12 @@ def write_scene_result(path, r1, r2, r3, method="opt"):
 
 
 # #####################################################################################################
-# 4. VISUALIZAÇÃO
+# 5. FIGURAS: CAIXAS DOS DOIS MÉTODOS E CAIXAS VERDADEIRAS
 # #####################################################################################################
+# O enunciado pede as caixas estimadas sobrepostas às verdadeiras. Os erros (posição, altura, yaw,
+# dimensões, IoU 3D) são calculados no avaliador.py; aqui só se desenha.
 BOX_COLORS = [(0.9, 0.1, 0.1), (0.1, 0.4, 0.9), (0.1, 0.7, 0.2), (0.9, 0.6, 0.0), (0.6, 0.2, 0.8), (0.0, 0.7, 0.7)]
+GT_COLOR = (0.0, 0.0, 0.0)  # caixas verdadeiras (se houver ground truth): a preto
 
 
 def gt_params_in_table(ground_truth, T_camera0_table):
@@ -882,7 +1097,7 @@ def gt_params_in_table(ground_truth, T_camera0_table):
 
 
 # ----------------------------------------------------------------------------------------------------
-# Desenho das caixas vistas de cima (figuras PNG)
+# Figuras PNG vistas de cima (matplotlib), usadas pelo avaliador.py e pelo run_test.py
 # ----------------------------------------------------------------------------------------------------
 def _draw_rects(ax, params, style, label=None):
     for j, p in enumerate(params):
@@ -893,9 +1108,6 @@ def _draw_rects(ax, params, style, label=None):
                 label=label if j == 0 else None)
 
 
-# ----------------------------------------------------------------------------------------------------
-# Figuras PNG (vista de cima), usadas pelo avaliador.py --evaluate_scenes
-# ----------------------------------------------------------------------------------------------------
 def save_top_view(path, points, colors, params_opt, params_bbox=None, gt_params=None, title=""):
     """Vista de cima: pontos + caixas (otimização, bounding box e, se houver, verdadeiras)."""
     fig, ax = plt.subplots(figsize=(6, 6))
@@ -916,43 +1128,10 @@ def save_top_view(path, points, colors, params_opt, params_bbox=None, gt_params=
     plt.close(fig)
 
 
-def save_evolution(path, points, problem, num_frames=6):
-    """Várias fases da otimização lado a lado (da estimativa inicial ao resultado final)."""
-    snaps = evolution_snapshots(problem.history)
-    picks = np.unique(np.linspace(0, len(snaps) - 1, min(num_frames, len(snaps))).astype(int))
-    fig, axes = plt.subplots(1, len(picks), figsize=(3.2 * len(picks), 3.4), squeeze=False)
-    sel = np.random.default_rng(0).choice(len(points), min(len(points), 6000), replace=False)
-    for ax, k in zip(axes[0], picks):
-        ax.scatter(points[sel, 0], points[sel, 1], c="0.6", s=0.5)
-        params = [normalize_box(p) for p in snaps[k].reshape(-1, NUM_PARAMS)]
-        _draw_rects(ax, params, {})
-        ax.set_aspect("equal")
-        ax.set_title(f"passo {k}/{len(snaps) - 1}", fontsize=9)
-        ax.set_xticks([])
-        ax.set_yticks([])
-    fig.suptitle("Evolução das caixas durante a otimização (vista de cima)")
-    fig.tight_layout()
-    fig.savefig(path, dpi=110)
-    plt.close(fig)
-
-
 # ----------------------------------------------------------------------------------------------------
-# Janelas 3D do Open3D: a cena com as caixas da bounding box, com as caixas da otimização e a evolução
-# da otimização (animação)
+# Janelas 3D (visualizacao.py): a cena com as caixas de cada método, vista de cima e em 3D, e a
 # ----------------------------------------------------------------------------------------------------
-MAX_FRAMES = 60             # passos da otimização mostrados na animação
-GT_COLOR = (0.0, 0.0, 0.0)  # caixas verdadeiras (se houver ground truth): a preto
-
-
-def snapshot_frames(snapshots, max_frames=MAX_FRAMES):
-    """Até max_frames passos da otimização, igualmente espaçados (com o primeiro e o último), cada um como
-    uma lista de caixas [x, y, yaw, l, w, h, z]. Saída: (caixas de cada passo, número de cada passo)."""
-    snapshots = np.asarray(snapshots)
-    picks = np.unique(np.linspace(0, len(snapshots) - 1, min(max_frames, len(snapshots))).astype(int))
-    frames = np.array([[normalize_box(p) for p in snapshots[k].reshape(-1, NUM_PARAMS)] for k in picks])
-    return frames, picks
-
-
+# evolução da otimização (animação, 2.6)
 def figure_data(r1, r2, r3, gt_params=None):
     """Dados das janelas da Parte 3 (r1, r2 = Partes 1 e 2, r3 = run_fit ou load_fit), no referencial da
     mesa: a nuvem agregada (se existir; senão só os pontos dos objetos), os pontos dos objetos, as caixas
@@ -1018,100 +1197,30 @@ def make_windows(data):
     return windows
 
 
-# ----------------------------------------------------------------------------------------------------
-# Janelas antigas do Open3D (opção --open3d)
-# ----------------------------------------------------------------------------------------------------
-def box_lineset(T, length, width, height, color):
-    """LineSet com as 12 arestas de uma caixa com pose T."""
-    corners, edges = box_lines_3d(T, length, width, height)
-    ls = o3d.geometry.LineSet(o3d.utility.Vector3dVector(corners), o3d.utility.Vector2iVector(edges))
-    ls.colors = o3d.utility.Vector3dVector([color] * len(edges))
-    return ls
-
-
-def params_linesets(params, color=None):
-    """LineSets das caixas (parâmetros no referencial da mesa)."""
-    return [box_lineset(box_T_table(p[0], p[1], p[2], p[5], p[6]), p[3], p[4], p[5],
-                        color or BOX_COLORS[j % len(BOX_COLORS)]) for j, p in enumerate(params)]
-
-
-def show_segmentation(seg, labels):
-    """Pontos dos objetos coloridos pela caixa a que foram atribuídos."""
-    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(seg.points))
-    pc.colors = o3d.utility.Vector3dVector([BOX_COLORS[l % len(BOX_COLORS)] if l >= 0 else (0.5, 0.5, 0.5)
-                                            for l in labels])
-    o3d.visualization.draw_geometries([pc], window_name="Segmentação (cor = caixa)")
-
-
-def animate_optimization(points, colors, problem, delay=0.15):
-    """Mostra a evolução das caixas ao longo da otimização, sobre a nuvem de pontos."""
-    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-    pc.colors = o3d.utility.Vector3dVector(colors)
-    vis = o3d.visualization.Visualizer()
-    vis.create_window("Evolução da otimização")
-    vis.add_geometry(pc)
-    current = []
-    for x in evolution_snapshots(problem.history):
-        for g in current:
-            vis.remove_geometry(g, reset_bounding_box=False)
-        current = params_linesets(x.reshape(-1, NUM_PARAMS))
-        for g in current:
-            vis.add_geometry(g, reset_bounding_box=False)
-        vis.poll_events()
-        vis.update_renderer()
-        time.sleep(delay)
-    vis.run()                    # fica aberta no estado final até o utilizador fechar
-    vis.destroy_window()
-
-
-def show_final(points, colors, params_opt, params_bbox=None, gt_params=None):
-    """Caixas finais: otimização (cores por caixa), bounding box (cinzento), verdadeiras (preto)."""
-    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-    pc.colors = o3d.utility.Vector3dVector(colors)
-    geoms = [pc] + params_linesets(params_opt)
-    if params_bbox is not None:
-        geoms += params_linesets(params_bbox, (0.5, 0.5, 0.5))
-    if gt_params is not None:
-        geoms += params_linesets(gt_params, (0.0, 0.0, 0.0))
-    o3d.visualization.draw_geometries(geoms, window_name="Caixas finais")
-
-
 # #####################################################################################################
-# 5. PROGRAMA PRINCIPAL
+# 6. PROGRAMA PRINCIPAL
 # #####################################################################################################
 def run_fit(r1, r2, use_color=True, verbose=True):
-    """Parte 3 numa cena: estimativa inicial, ajuste por otimização e bounding box.
+    """Parte 3 numa cena: os dois métodos.
 
     Entrada: o resultado da Parte 1 (poses das câmaras) e da Parte 2 (mesa e segmentação).
+    1. Método principal: estimativa inicial (2.4) e otimização (2.3);
+    2. Método base: bounding box de cada conjunto de pontos da estimativa inicial (secção 1).
     Saída: dicionário com as caixas dos dois métodos (referencial da mesa), a estimativa inicial, a caixa
     de cada ponto, o problema de otimização (com o histórico) e os pontos usados. Grava o ajuste.npz.
     """
     t0 = time.time()
     seg, table = r2["seg"], r2["table"]
-
-    # Multi-start: com caixas da mesma cor em contacto a estimativa inicial é incerta e a otimização
-    # pode ficar presa num mínimo local. Experimentam-se duas estimativas iniciais (k-means e degraus
-    # do contorno) e fica a que acaba com MENOR CUSTO (os custos são comparáveis: a função objetivo e
-    # os pontos são os mesmos nas duas tentativas).
-    methods = ["kmeans", "profile"] if needs_geometric_split(seg) else ["kmeans"]
     # Centros das câmaras no referencial da mesa (para o ajuste saber que faces podem ser vistas)
-    T_table_camera0 = np.linalg.inv(table.T_camera0_table)
     # (só as câmaras que entraram na nuvem: uma câmara com o registo falhado está no sítio errado)
+    T_table_camera0 = np.linalg.inv(table.T_camera0_table)
     camera_centers = np.array([(T_table_camera0 @ T)[:3, 3] for T, ok in zip(r1["T_cams"], r1["registered"]) if ok])
-    best = None
-    for method in methods:
-        init_params, init_colors, box_labels = initial_boxes(seg, method)
-        params_opt, problem, fit_points, fit_assoc = fit_boxes(seg, init_params, init_colors,
-                                                               use_color=use_color,
-                                                               camera_centers=camera_centers, verbose=verbose)
-        cost = min(h[1] for h in problem.history)
-        if verbose and len(methods) > 1:
-            print(f"    estimativa inicial '{method}': custo final {cost:.1f}")
-        if best is None or cost < best[0]:
-            best = (cost, init_params, init_colors, box_labels, params_opt, problem, fit_points, fit_assoc)
-    _, init_params, init_colors, box_labels, params_opt, problem, fit_points, fit_assoc = best
 
-    # Método base, para comparação
+    # Método principal: estimativa inicial e otimização
+    init_params, _, box_labels, params_opt, problem, fit_points, fit_assoc = fit_from_initial_estimates(
+        seg, camera_centers, use_color=use_color, verbose=verbose)
+
+    # Método base, para comparação: os conjuntos de pontos de cada caixa vêm da estimativa inicial
     params_bbox = bbox_method(seg.points, box_labels, len(init_params), init_params=init_params)
     if verbose:
         print(f"  tempo: {time.time() - t0:.1f} s")
@@ -1132,7 +1241,8 @@ def main():
     parser.add_argument("--no_color", action="store_true", help="não usar a cor na otimização")
     parser.add_argument("--visualize", action="store_true",
                         help="janelas 3D: bounding box, otimização e evolução da otimização (animação)")
-    parser.add_argument("--open3d", action="store_true", help="janelas antigas do Open3D (segmentação, evolução, final)")
+    parser.add_argument("--open3d", action="store_true",
+                        help="janela do Open3D com a evolução da otimização (como nas aulas)")
     args = parser.parse_args()
 
     folder = Path(args.scene) / OUTPUT_FOLDER
@@ -1154,10 +1264,7 @@ def main():
         r2["cloud"], _ = aggregate(load_scene(r1["scene_folder"]), r1["T_cams"], r1["registered"])
         show_windows(make_windows(figure_data(r1, r2, r3, gt_params)))
     if args.open3d:
-        seg = r2["seg"]
-        show_segmentation(seg, r3["box_labels"])
         animate_optimization(r3["fit_points"], np.full_like(r3["fit_points"], 0.6), r3["problem"])
-        show_final(seg.points, seg.colors, r3["params_opt"], r3["params_bbox"], gt_params)
 
 
 if __name__ == "__main__":
