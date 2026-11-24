@@ -49,7 +49,8 @@ from functools import partial                # a função objetivo recebe os dad
 from pathlib import Path
 
 import cv2                                   # OpenCV: k-means, retângulos
-import matplotlib.pyplot as plt              # figuras PNG vistas de cima (secções 2.6 e 5)
+from matplotlib.backends.backend_agg import FigureCanvasAgg   # figura PNG vista de cima (secção 5)
+from matplotlib.figure import Figure
 import numpy as np
 import open3d as o3d                         # nuvens de pontos: bounding boxes, janelas 3D
 from scipy.optimize import least_squares     # otimização (Partes 05 e 06)
@@ -63,7 +64,7 @@ from parte1_registo import (  # funções da Parte 1 usadas aqui
     aggregate, load_registration,
 )
 from visualizacao import (  # janelas 3D (comuns a todas as partes)
-    box_item, camera_view, close_view, colors_uint8, data_view, points_item, show_windows,
+    box_item, camera_view, close_view, colors_uint8, data_view, image_item, points_item, show_windows,
 )
 from parte2_segmentacao import (  # funções da Parte 2 usadas aqui
     chroma_features, count_top_levels, load_objects, load_segmentation, top_surface_points,
@@ -406,17 +407,6 @@ def objective_function(x_free, data):
     return residuals
 
 
-def associations(x, data):
-    """Caixa associada a cada ponto, para os parâmetros x de todas as caixas (a mesma regra da função
-    objetivo; usada no fim, para avaliar e desenhar a segmentação final)."""
-    params = x.reshape(data.num_boxes, NUM_PARAMS)
-    D = distances_to_boxes(data.points, params, data.normals)
-    if data.chroma is not None:
-        C = color_distances(data)
-        return np.argmin(D ** 2 + C ** 2, axis=1)
-    return np.argmin(D, axis=1)
-
-
 # ----------------------------------------------------------------------------------------------------
 # 2.3 Otimização com scipy.optimize.least_squares
 # ----------------------------------------------------------------------------------------------------
@@ -438,7 +428,7 @@ def fit_boxes(seg, init_params, init_colors, use_color=True, use_normals=True, c
        corta os pontos até 8 mm acima da mesa);
     5. least_squares(partial(objective_function, data=problem)), como na Parte 06, com a perda
        soft_l1 (2.5) e limites nas dimensões (bounds, Parte 06 Ex. 4.3).
-    Saída: (caixas finais N x 7, o problema (com o histórico), pontos usados, associações finais).
+    Saída: (caixas finais N x 7, o problema (com o histórico), pontos usados).
     """
     # 1. Redução dos pontos
     pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(seg.points))
@@ -489,7 +479,7 @@ def fit_boxes(seg, init_params, init_colors, use_color=True, use_normals=True, c
         print(f"  otimização: {result.nfev} iterações, custo {problem.history[0][1]:.1f} -> "
               f"{min(h[1] for h in problem.history):.1f}, "
               f"cor {'sim' if problem.chroma is not None else 'não'} ({len(points)} pontos)")
-    return params, problem, points, associations(x_final, problem)
+    return params, problem, points
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -897,21 +887,20 @@ def fit_from_initial_estimates(seg, camera_centers, use_color=True, verbose=True
     ficar presa num mínimo local (Parte 06, Ex. 6). Experimentam-se então duas estimativas iniciais
     (k-means e degraus do contorno) e fica a que acaba com MENOR CUSTO (os custos são comparáveis: a
     função objetivo e os pontos são os mesmos nas duas tentativas).
-    Saída: (estimativa inicial, cores das caixas, caixa de cada ponto da segmentação, caixas finais,
-    problema de otimização, pontos usados, associações finais).
+    Saída: (estimativa inicial, caixa de cada ponto da segmentação, caixas finais, problema de
+    otimização, pontos usados).
     """
     methods = ["kmeans", "profile"] if needs_geometric_split(seg) else ["kmeans"]
     best = None
     for method in methods:
         init_params, init_colors, box_labels = initial_boxes(seg, method)
-        params_opt, problem, fit_points, fit_assoc = fit_boxes(seg, init_params, init_colors,
-                                                               use_color=use_color,
-                                                               camera_centers=camera_centers, verbose=verbose)
+        params_opt, problem, fit_points = fit_boxes(seg, init_params, init_colors, use_color=use_color,
+                                                    camera_centers=camera_centers, verbose=verbose)
         cost = min(h[1] for h in problem.history)
         if verbose and len(methods) > 1:
             print(f"    estimativa inicial '{method}': custo final {cost:.1f}")
         if best is None or cost < best[0]:
-            best = (cost, init_params, init_colors, box_labels, params_opt, problem, fit_points, fit_assoc)
+            best = (cost, init_params, box_labels, params_opt, problem, fit_points)
     return best[1:]
 
 
@@ -938,9 +927,8 @@ def soft_l1_cost(residuals, f_scale=LOSS_SCALE):
 # Nas Partes 05 e 06 o desenho é feito dentro da função objetivo, em cada avaliação. Aqui os parâmetros de
 # cada avaliação são GUARDADOS (FitProblem.history) e desenhados no fim: em cada iteração o least_squares
 # avalia a função 7N+1 vezes (jacobiano por diferenças finitas), e desenhar em direto era lento e mostrava
-# as caixas a tremer. Só ficam as avaliações que melhoraram o custo (a 'trajetória'). Três formas:
+# as caixas a tremer. Só ficam as avaliações que melhoraram o custo (a 'trajetória'). Duas formas:
 #   - janela 3D com a animação (--visualize; dados em figure_data e janela em make_windows, secção 5);
-#   - figura PNG com várias fases lado a lado (save_evolution, usada pelo avaliador.py);
 #   - janela do Open3D (--open3d, animate_optimization), a mais parecida com as aulas.
 def evolution_snapshots(history):
     """Do histórico de avaliações, fica só com as que melhoraram o custo (a 'trajetória')."""
@@ -954,31 +942,10 @@ def evolution_snapshots(history):
 
 def snapshot_frames(snapshots, max_frames=MAX_FRAMES):
     """Até max_frames passos da otimização, igualmente espaçados (com o primeiro e o último), cada um como
-    uma lista de caixas [x, y, yaw, l, w, h, z]. Saída: (caixas de cada passo, número de cada passo)."""
+    uma lista de caixas [x, y, yaw, l, w, h, z]. Saída: caixas de cada passo."""
     snapshots = np.asarray(snapshots)
     picks = np.unique(np.linspace(0, len(snapshots) - 1, min(max_frames, len(snapshots))).astype(int))
-    frames = np.array([[normalize_box(p) for p in snapshots[k].reshape(-1, NUM_PARAMS)] for k in picks])
-    return frames, picks
-
-
-def save_evolution(path, points, problem, num_frames=6):
-    """Várias fases da otimização lado a lado (da estimativa inicial ao resultado final)."""
-    snaps = evolution_snapshots(problem.history)
-    picks = np.unique(np.linspace(0, len(snaps) - 1, min(num_frames, len(snaps))).astype(int))
-    fig, axes = plt.subplots(1, len(picks), figsize=(3.2 * len(picks), 3.4), squeeze=False)
-    sel = np.random.default_rng(0).choice(len(points), min(len(points), 6000), replace=False)
-    for ax, k in zip(axes[0], picks):
-        ax.scatter(points[sel, 0], points[sel, 1], c="0.6", s=0.5)
-        params = [normalize_box(p) for p in snaps[k].reshape(-1, NUM_PARAMS)]
-        _draw_rects(ax, params, {})
-        ax.set_aspect("equal")
-        ax.set_title(f"passo {k}/{len(snaps) - 1}", fontsize=9)
-        ax.set_xticks([])
-        ax.set_yticks([])
-    fig.suptitle("Evolução das caixas durante a otimização (vista de cima)")
-    fig.tight_layout()
-    fig.savefig(path, dpi=110)
-    plt.close(fig)
+    return np.array([[normalize_box(p) for p in snapshots[k].reshape(-1, NUM_PARAMS)] for k in picks])
 
 
 def box_lineset(T, length, width, height, color):
@@ -1087,7 +1054,7 @@ BOX_COLORS = [(0.9, 0.1, 0.1), (0.1, 0.4, 0.9), (0.1, 0.7, 0.2), (0.9, 0.6, 0.0)
 # ----------------------------------------------------------------------------------------------------
 # Figura PNG vista de cima (matplotlib), usada pelo run_test.py
 # ----------------------------------------------------------------------------------------------------
-def _draw_rects(ax, params, style, label=None):
+def draw_rects(ax, params, style, label=None):
     for j, p in enumerate(params):
         c = box_corners_2d(p[0], p[1], p[2], p[3], p[4])
         c = np.vstack([c, c[:1]])
@@ -1096,22 +1063,38 @@ def _draw_rects(ax, params, style, label=None):
                 label=label if j == 0 else None)
 
 
-def save_top_view(path, points, colors, params_opt, params_bbox=None, title=""):
-    """Vista de cima: pontos + caixas (otimização e bounding box)."""
-    fig, ax = plt.subplots(figsize=(6, 6))
+def top_view_figure(points, colors, params_opt, params_bbox=None, title=""):
+    """Gráfico 2D visto de cima (matplotlib): os pontos dos objetos e as caixas dos dois métodos (bounding
+    box a tracejado cinzento, otimização com uma cor por caixa), no referencial da mesa."""
+    fig = Figure(figsize=(6, 6), dpi=120)        # sem pyplot: também funciona no processo das janelas
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot()
+    colors = np.asarray(colors)
+    colors = colors / 255.0 if colors.dtype == np.uint8 else colors
     sel = np.random.default_rng(0).choice(len(points), min(len(points), 15000), replace=False)
     ax.scatter(points[sel, 0], points[sel, 1], c=colors[sel], s=1)
     if params_bbox is not None:
-        _draw_rects(ax, params_bbox, {"color": "gray", "ls": "--"}, "bounding box")
-    _draw_rects(ax, params_opt, {}, "otimização")
+        draw_rects(ax, params_bbox, {"color": "gray", "ls": "--"}, "bounding box")
+    draw_rects(ax, params_opt, {}, "otimização")
     ax.set_aspect("equal")
     ax.set_xlabel("x mesa (m)")
     ax.set_ylabel("y mesa (m)")
     ax.set_title(title)
     ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
+    return fig
+
+
+def save_top_view(path, points, colors, params_opt, params_bbox=None, title=""):
+    """Grava o gráfico 2D visto de cima num PNG."""
+    top_view_figure(points, colors, params_opt, params_bbox, title).savefig(path, dpi=120)
+
+
+def top_view_image(points, colors, params_opt, params_bbox=None, title=""):
+    """O gráfico 2D visto de cima como imagem RGB (uint8), para mostrar numa janela (image_item)."""
+    fig = top_view_figure(points, colors, params_opt, params_bbox, title)
+    fig.canvas.draw()
+    return np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -1130,7 +1113,7 @@ def figure_data(r1, r2, r3):
     else:
         points, colors = seg.points, seg.colors
     snapshots = evolution_snapshots(r3["problem"].history) if "problem" in r3 else r3["snapshots"]
-    frames, steps = snapshot_frames(snapshots)
+    frames = snapshot_frames(snapshots)
     center = seg.points.mean(axis=0)
     view = camera_view(T_table_camera0 @ r1["T_cams"][0], center, np.array([0.0, 0.0, 1.0]), back=-0.3, above=0.1)
     return {"parte": "parte3_ajuste", "cena": Path(r2["scene_folder"]).name,
@@ -1138,7 +1121,7 @@ def figure_data(r1, r2, r3):
             "objects": seg.points.astype(np.float32), "object_colors": colors_uint8(seg.colors),
             "params_bbox": np.asarray(r3["params_bbox"]).reshape(-1, NUM_PARAMS),
             "params_opt": np.asarray(r3["params_opt"]).reshape(-1, NUM_PARAMS), "frames": frames,
-            "steps": steps, "total_steps": len(snapshots) - 1,
+            "total_steps": len(snapshots) - 1,
             **{f"view_{k}": v for k, v in view.items()}}
 
 
@@ -1152,11 +1135,11 @@ def top_view(points):
 
 def make_windows(data):
     """Vistas da Parte 3:
-    1. método base (bounding box) visto de cima, sobre os pontos dos objetos;
-    2. método principal (otimização) visto de cima;
-    3. a cena em 3D com as caixas da bounding box;
-    4. a cena em 3D com as caixas da otimização;
-    5. a evolução das caixas ao longo da otimização em 3D, sobre os pontos dos objetos (animação; a
+    1. gráfico 2D visto de cima (como o top_view.png): os pontos dos objetos com as caixas dos dois
+       métodos (bounding box a tracejado e otimização);
+    2. a cena em 3D com as caixas da bounding box;
+    3. a cena em 3D com as caixas da otimização;
+    4. a evolução das caixas ao longo da otimização em 3D, sobre os pontos dos objetos (animação; a
        figura gravada mostra o último passo)."""
     title = f"Parte 3 - {data['cena']}"
     view = data_view(data)
@@ -1165,11 +1148,12 @@ def make_windows(data):
                ("otimizacao", "params_opt", "método principal: otimização"))
     boxes = {key: [box_item(p, BOX_COLORS[j % len(BOX_COLORS)]) for j, p in enumerate(data[key])]
              for _, key, _ in methods}
-    windows = []
-    for name, key, method in methods:                     # vistas de cima
-        windows.append({"name": f"_{name}_vista_de_cima",
-                        "title": f"{title}: {method}, vista de cima ({len(data[key])} caixas)",
-                        "items": [objects] + boxes[key], "view": top_view(data["objects"])})
+    image = top_view_image(data["objects"], data["object_colors"], data["params_opt"], data["params_bbox"],
+                           title=str(data["cena"]))
+    windows = [{"name": "_vista_de_cima",                 # gráfico 2D dos dois métodos, visto de cima
+                "title": f"{title}: vista de cima 2D, bounding box ({len(data['params_bbox'])} caixas) e "
+                         f"otimização ({len(data['params_opt'])} caixas)",
+                "items": [image_item(image)], "view": None}]
     for name, key, method in methods:                     # na cena, em 3D
         windows.append({"name": f"_{name}_3d", "title": f"{title}: {method}, em 3D na cena ({len(data[key])} caixas)",
                         "items": [points_item(data["points"], data["colors"])] + boxes[key], "view": view})
@@ -1200,7 +1184,7 @@ def run_fit(r1, r2, use_color=True, verbose=True):
     camera_centers = np.array([(T_table_camera0 @ T)[:3, 3] for T, ok in zip(r1["T_cams"], r1["registered"]) if ok])
 
     # Método principal: estimativa inicial e otimização
-    init_params, _, box_labels, params_opt, problem, fit_points, fit_assoc = fit_from_initial_estimates(
+    init_params, box_labels, params_opt, problem, fit_points = fit_from_initial_estimates(
         seg, camera_centers, use_color=use_color, verbose=verbose)
 
     # Método base, para comparação: os conjuntos de pontos de cada caixa vêm da estimativa inicial
@@ -1209,7 +1193,7 @@ def run_fit(r1, r2, use_color=True, verbose=True):
         print(f"  tempo: {time.time() - t0:.1f} s")
 
     r3 = {"init_params": np.array(init_params), "box_labels": box_labels, "params_bbox": params_bbox,
-          "params_opt": params_opt, "problem": problem, "fit_points": fit_points, "fit_assoc": fit_assoc}
+          "params_opt": params_opt, "problem": problem, "fit_points": fit_points}
     save_fit(r1["folder"], r3)
     return r3
 

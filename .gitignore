@@ -1,4 +1,6 @@
 __pycache__/
 scenes_offline/
 test/*/
+results_test/*/partes/
+results_test/*/partes_gt/
 .professor/

@@ -6,7 +6,8 @@ enunciado. Cada parte tem duas funções próprias, que usam as funções deste 
     figure_data(...)   -> dicionário só com arrays (pode ser gravado num .npz e desenhado noutro processo:
                           é assim que o run_test.py abre as janelas sem parar o programa);
     make_windows(data) -> lista de janelas, cada uma um dicionário com o título, o que desenhar
-                          (points_item, lines_item, box_item, frame_item) e o ponto de vista.
+                          (points_item, lines_item, box_item, frame_item, ou uma imagem 2D:
+                          image_item) e o ponto de vista.
 SceneWindows abre as janelas (ou, sem janelas, só grava cada uma num PNG).
 """
 
@@ -53,6 +54,12 @@ def box_item(p, color, width=3.0):
     """As 12 arestas de uma caixa [x, y, yaw, length, width, height, z] (referencial da mesa)."""
     corners, edges = box_lines_3d(box_T_table(p[0], p[1], p[2], p[5], p[6]), p[3], p[4], p[5])
     return lines_item(corners, edges, color, width)
+
+
+def image_item(image):
+    """Uma imagem RGB (uint8) mostrada em 2D na janela, em vez de uma cena 3D (ex.: um gráfico do
+    matplotlib). Uma vista com uma imagem não tem ponto de vista ("view")."""
+    return {"type": "image", "image": np.ascontiguousarray(np.asarray(image, np.uint8)[..., :3])}
 
 
 def frame_item(size=0.1):
@@ -156,6 +163,8 @@ def _geometry(item):
                                         o3d.utility.Vector2iVector(item["lines"]))
         geometry.paint_uniform_color(item["color"])
         return geometry
+    if item["type"] == "image":
+        return o3d.geometry.Image(item["image"])
     return o3d.geometry.TriangleMesh.create_coordinate_frame(size=item["size"])
 
 
@@ -202,7 +211,8 @@ class SceneWindows:
     gravada num PNG (numa janela invisível). show=False: não abre janelas, só grava os PNG.
     Uma vista (dicionário) tem: "name" (sufixo do PNG), "title", "items" (o que desenhar), "view"
     ({"center", "eye", "up"}; sem view, a vista inicial do draw_geometries) e, para as animações,
-    "frames" (o que desenhar em cada passo, por cima dos items).
+    "frames" (o que desenhar em cada passo, por cima dos items). Uma vista pode também ser só uma imagem
+    2D (image_item), por exemplo um gráfico do matplotlib.
     """
 
     def __init__(self, show=True):
@@ -234,7 +244,11 @@ class SceneWindows:
         return shown
 
     def save(self, spec, png):
-        """Grava a imagem de uma vista num PNG (janela invisível; nas animações, o último passo)."""
+        """Grava a imagem de uma vista num PNG (janela invisível; nas animações, o último passo). Uma vista
+        que é só uma imagem 2D é gravada tal como está."""
+        if len(spec["items"]) == 1 and spec["items"][0]["type"] == "image":
+            save_png(spec["items"][0]["image"], png)
+            return
         vis = o3d.visualization.Visualizer()
         vis.create_window("png", *WINDOW_SIZE, visible=False)
         self._draw(vis, spec)

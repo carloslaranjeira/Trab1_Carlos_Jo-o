@@ -715,7 +715,7 @@ def register_scene(scene, loop_closure=True, verbose=True):
     1. Pré-processamento e features de cada imagem (prepare_cameras);
     2-3. Regista cada imagem com a seguinte (i -> i+1) e encadeia: T_0_(i+1) = T_0_i @ T_i_(i+1);
     (extra) pares sem confiança NÃO são usados; fecho de ciclo, câmaras isoladas e grafo de poses.
-    Saída: (T_camera0_camera de cada câmara, T_camera0_camera só por encadeamento, câmaras registadas).
+    Saída: (T_camera0_camera de cada câmara, câmaras registadas).
     """
     views = scene.views
     n = len(views)
@@ -734,24 +734,24 @@ def register_scene(scene, loop_closure=True, verbose=True):
     for i in range(n - 1):
         T, info, _, ok = pair(i, i + 1)
         edges.append((i, i + 1, T, info, ok, False))
-    T_chain = chain_poses(edges)                      # encadeamento simples (também para o relatório)
+    T_chain = chain_poses(edges)                      # encadeamento simples
 
     good = [e for e in edges if e[4]]                 # (extra) só as arestas de confiança
     if not loop_closure or n < 3:
         # Uma câmara ligada à 0 por um par falhado fica com a pose do encadeamento (o result.json
         # precisa de uma pose), mas NÃO entra na nuvem: com 2 imagens e o registo errado, a mesma
         # pilha aparecia duas vezes, em dois sítios da mesa (teste 16, cena 1)
-        return T_chain, T_chain, [p is not None for p in poses_from_edges(n, good)]
+        return T_chain, [p is not None for p in poses_from_edges(n, good)]
 
     good, poses = extra_edges(n, pair, good, views, verbose)
     # Câmaras ainda sem pose ficam com a pose do encadeamento (só para o result.json; não entram na nuvem)
     registered = [p is not None for p in poses]
     poses = [p if p is not None else T_chain[k] for k, p in enumerate(poses)]
-    return optimize_pose_graph(poses, good), T_chain, registered
+    return optimize_pose_graph(poses, good), registered
 
 
-def save_registration(folder, scene, T_cams, T_chain, registered):
-    """Grava o registo.json: a pose de cada câmara (grafo de poses e só encadeamento) e as câmaras que
+def save_registration(folder, scene, T_cams, registered):
+    """Grava o registo.json: a pose de cada câmara (grafo de poses) e as câmaras que
     entraram na nuvem agregada (False = registo falhado). É a entrada das outras partes.
     """
     folder = Path(folder)
@@ -760,7 +760,6 @@ def save_registration(folder, scene, T_cams, T_chain, registered):
         "cena": str(Path(scene.folder).resolve()),
         "imagens": [v.name for v in scene.views],
         "T_camera0_camera": [np.round(T, 9).tolist() for T in T_cams],
-        "T_camera0_camera_so_encadeamento": [np.round(T, 9).tolist() for T in T_chain],
         "camaras_registadas": [bool(ok) for ok in registered],
     }
     (folder / REGISTRATION_FILE).write_text(json.dumps(info, indent=2), encoding="utf-8")
@@ -769,13 +768,12 @@ def save_registration(folder, scene, T_cams, T_chain, registered):
 def load_registration(folder):
     """Lê o registo.json gravado por save_registration.
 
-    Saída: dicionário com a pasta da cena, os nomes das imagens, a pose de cada câmara (grafo de
-    poses e só encadeamento), as câmaras registadas e a pasta das partes. As nuvens não são lidas aqui.
+    Saída: dicionário com a pasta da cena, os nomes das imagens, a pose de cada câmara, as câmaras
+    registadas e a pasta das partes. As nuvens não são lidas aqui.
     """
     info = json.loads((Path(folder) / REGISTRATION_FILE).read_text(encoding="utf-8"))
     return {"scene_folder": Path(info["cena"]), "images": info["imagens"],
             "T_cams": [np.array(T) for T in info["T_camera0_camera"]],
-            "T_chain": [np.array(T) for T in info["T_camera0_camera_so_encadeamento"]],
             "registered": info["camaras_registadas"], "folder": Path(folder)}
 
 
@@ -792,19 +790,19 @@ def run_registration(scene_folder, output=None, loop_closure=True, verbose=True)
     if verbose:
         print(f"Cena {scene.folder.name}: {len(scene.views)} imagens")
 
-    T_cams, T_chain, registered = register_scene(scene, loop_closure=loop_closure, verbose=verbose)
+    T_cams, registered = register_scene(scene, loop_closure=loop_closure, verbose=verbose)
     if verbose and not all(registered):
         left_out = [v.name for v, ok in zip(scene.views, registered) if not ok]
         print(f"  câmaras sem registo de confiança, deixadas de fora da nuvem: {', '.join(left_out)}")
 
     exposures = []                       # (imagem, s, b) de cada câmara, preenchido pelo aggregate
     cloud, camera_index = aggregate(scene, T_cams, registered, exposures=exposures)
-    save_registration(output, scene, T_cams, T_chain, registered)
+    save_registration(output, scene, T_cams, registered)
     if verbose:
         print(f"  4. nuvem agregada com {len(cloud.points)} pontos; registo gravado em "
               f"{output / REGISTRATION_FILE} ({time.time() - t0:.1f} s)")
     return {"scene": scene, "scene_folder": scene.folder, "images": [v.name for v in scene.views],
-            "T_cams": T_cams, "T_chain": T_chain, "registered": registered, "cloud": cloud,
+            "T_cams": T_cams, "registered": registered, "cloud": cloud,
             "camera_index": camera_index, "exposures": exposures, "folder": output}
 
 

@@ -10,14 +10,15 @@ Utilização:
 
 Corre as cenas UMA DE CADA VEZ: em cada cena, os 4 ficheiros (savi/) um depois do outro e o avaliador,
 e no fim mostra a janela da cena; só depois passa à cena seguinte:
-    parte1_registo.py      -> test/<cena>/partes/registo.json   (pose de cada câmara)
-    extra_fotometria.py    -> test/<cena>/partes/fotometria.json (exposição de cada imagem)
-    parte2_segmentacao.py  -> test/<cena>/partes/objetos.ply, mesa.json, segmentacao.npz
+    parte1_registo.py      -> results_test/<cena>/partes/registo.json   (pose de cada câmara)
+    extra_fotometria.py    -> results_test/<cena>/partes/fotometria.json (exposição de cada imagem)
+    parte2_segmentacao.py  -> results_test/<cena>/partes/objetos.ply, mesa.json, segmentacao.npz
     parte3_ajuste.py       -> results_test/<cena>/result.json (e top_view.png)
     avaliador.py           -> número de caixas e, se a cena tiver ground truth, results_test/<cena>/avaliacao.md
 As 4 partes NÃO usam o número de caixas (a Parte 2 estima-o). O número real só é pedido no avaliador,
 no fim de cada cena, para o comparar com o número de caixas encontradas; o de uma cena que esteja em
-test/num_boxes.json não é perguntado.
+test/num_boxes.json não é perguntado. A pasta test/ só é lida: tudo o que o programa grava fica em
+results_test/<cena>/ (a pasta partes/ tem os resultados intermédios de cada parte e não vai para o git).
 
 Janelas: UMA janela 3D do Open3D por cena, com as vistas de todas as partes (como a figura da nuvem
 agregada do enunciado); as setas <- e -> do teclado mudam de vista e o título diz qual é. A janela
@@ -51,7 +52,8 @@ FOLDER = Path(__file__).resolve().parent         # pasta principal do trabalho
 # O código está na pasta savi/: junta-a aos sítios onde o Python procura módulos
 sys.path.insert(0, str(FOLDER / "savi"))
 
-WINDOWS_FOLDER = FOLDER / "test" / ".janelas"    # pedidos de janelas para o processo das janelas
+# Pedidos de janelas para o processo das janelas: na pasta temporária do sistema (não aparecem no trabalho)
+WINDOWS_FOLDER = Path(tempfile.gettempdir()) / "SAVIBoxes_janelas"
 
 
 def natural_key(path):
@@ -200,17 +202,19 @@ def run_scene(scene, output, views, show, known, push=False):
     import parte3_ajuste as parte3
 
     result_path = output / scene.name / "result.json"
-    # Parte 1: registo -> test/<cena>/partes/registo.json
-    r1 = parte1.run_registration(scene, scene / comum.OUTPUT_FOLDER)
+    # Parte 1: registo -> results_test/<cena>/partes/registo.json (as partes seguintes gravam na mesma
+    # pasta: r1["folder"]; a pasta da cena em test/ só é lida)
+    r1 = parte1.run_registration(scene, output / scene.name / comum.OUTPUT_FOLDER)
     collect(views, lambda: parte1.figure_data(r1), "parte1_registo")
-    # Extra: fotometria -> test/<cena>/partes/fotometria.json (um erro aqui não impede o resto)
+    # Extra: fotometria -> results_test/<cena>/partes/fotometria.json (um erro aqui não impede o resto; as vistas
+    # ficam para o fim, depois das da Parte 3)
+    rx = None
     try:
         rx = extra.run_photometry(r1)
-        collect(views, lambda: extra.figure_data(r1, rx), "extra_fotometria")
     except Exception:
         traceback.print_exc()
         print(f"  ERRO na fotometria da cena {scene.name} (não impede o resto)")
-    # Parte 2: segmentação -> test/<cena>/partes/objetos.ply, mesa.json, segmentacao.npz
+    # Parte 2: segmentação -> results_test/<cena>/partes/objetos.ply, mesa.json, segmentacao.npz
     r2 = parte2.run_segmentation(r1)            # estima o número de caixas
     collect(views, lambda: parte2.figure_data(r1, r2), "parte2_segmentacao")
     # Parte 3: ajuste -> results_test/<cena>/result.json
@@ -224,6 +228,8 @@ def run_scene(scene, output, views, show, known, push=False):
     except Exception as error:
         print(f"  (figura não gravada: {error})")
     collect(views, lambda: parte3.figure_data(r1, r2, r3), "parte3_ajuste")
+    if rx is not None:
+        collect(views, lambda: extra.figure_data(r1, rx), "extra_fotometria")
     if push:
         git_push(output, f"Resultado da cena {scene.name}")
     show()                                      # janela da cena (as 4 partes já acabaram)

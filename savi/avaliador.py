@@ -42,25 +42,26 @@ import argparse
 import json
 from pathlib import Path
 
-import cv2                                   # OpenCV: interseção de retângulos (IoU 3D)
 import matplotlib.pyplot as plt              # figura PNG vista de cima
 import numpy as np
 from scipy.optimize import linear_sum_assignment   # emparelhar caixas / conjuntos com o ground truth
 from scipy.spatial.transform import Rotation       # ângulo de uma rotação (Parte 08)
 
 from comum import (  # geometria e leitura da cena (comuns a todas as partes)
-    box_corners_2d, boxes_to_camera0, load_scene, OUTPUT_FOLDER, transform_points,
+    boxes_to_camera0, load_scene, OUTPUT_FOLDER, transform_points,
     wrap_angle, yaw_of,
 )
 from extra_fotometria import PHOTOMETRY_FILE
 from parte1_registo import aggregate, load_registration, save_registration
 from parte2_segmentacao import load_objects, run_segmentation
-from parte3_ajuste import BOX_COLORS, load_fit, run_fit, top_view
+from parte3_ajuste import (  # IoU 3D (overlap_area, height_overlap) e figuras da Parte 3
+    BOX_COLORS, draw_rects, height_overlap, load_fit, overlap_area, run_fit, top_view,
+)
 from visualizacao import box_item, camera_view, close_view, colors_uint8, data_view, points_item, SceneWindows
 
 
 GROUND_TRUTH_FILE = "ground_truth.json"
-GT_FOLDER = "partes_gt"        # 3. Parte 2 e conjuntos de pontos com as poses verdadeiras (dentro da cena)
+GT_FOLDER = "partes_gt"        # 3. Parte 2 e conjuntos de pontos com as poses verdadeiras (ao lado do result.json)
 REPORT_FILE = "avaliacao.md"   # 6. relatório (ao lado do result.json)
 FIGURE_NAME = "avaliador"      # 6. as figuras chamam-se avaliador_<vista>.png (ao lado do result.json)
 INSIDE_MARGIN = 0.005          # 3. m: margem à volta das caixas verdadeiras (ruído), como no enunciado
@@ -154,7 +155,8 @@ def registration_clouds(scene, result, ground_truth, registered=None):
 # #####################################################################################################
 # Para avaliar só a segmentação, sem os erros do registo (como pede o enunciado), as nuvens são juntadas
 # com as poses VERDADEIRAS e as Partes 2 e 3 (que dá os conjuntos de pontos de cada caixa) correm sobre
-# essa nuvem, numa pasta à parte (<cena>/partes_gt/: os resultados do sistema não são tocados). Os pontos
+# essa nuvem, numa pasta à parte (partes_gt/, ao lado do result.json: os resultados do sistema não são
+# tocados). Os pontos
 # de cada caixa verdadeira são os que ficam dentro dela, com uma margem de 5 mm (ruído).
 # O que não está nas aulas: o teste "dentro da caixa" (pontos no referencial da caixa, como a nuvem no
 # referencial da mesa na Parte 08, Ex. 4.3, e |p| <= dimensões / 2 + margem), o emparelhamento pelo
@@ -163,16 +165,16 @@ def segmentation_with_true_poses(scene, ground_truth, folder):
     """Corre as Partes 2 e 3 sobre a nuvem junta com as poses verdadeiras (em vez das do registo).
 
     O resultado da 'Parte 1' tem o mesmo formato que o de run_registration, mas com as poses do ground
-    truth e todas as câmaras na nuvem. Grava tudo em folder (<cena>/partes_gt/).
+    truth e todas as câmaras na nuvem. Grava tudo em folder (partes_gt/, ao lado do result.json).
     Saída: (r1, r2, r3) como os das partes.
     """
     T_true = true_camera_poses(scene, ground_truth)
     registered = [True] * len(T_true)
     exposures = []
     cloud, camera_index = aggregate(scene, T_true, registered, exposures=exposures)
-    save_registration(folder, scene, T_true, T_true, registered)
+    save_registration(folder, scene, T_true, registered)
     r1 = {"scene": scene, "scene_folder": scene.folder, "images": [v.name for v in scene.views],
-          "T_cams": T_true, "T_chain": T_true, "registered": registered, "cloud": cloud,
+          "T_cams": T_true, "registered": registered, "cloud": cloud,
           "camera_index": camera_index, "exposures": exposures, "folder": Path(folder)}
     r2 = run_segmentation(r1, verbose=False)
     r3 = run_fit(r1, r2, verbose=False)
@@ -232,7 +234,7 @@ def evaluate_segmentation(points_table, labels, T_camera0_table, all_points_came
 # Compara-se no referencial do MUNDO (origem no centro do tampo, z exatamente para cima): as caixas
 # estimadas (referencial da câmara 000) passam para o mundo com a pose verdadeira da câmara 000.
 # Do enunciado (não está nas aulas): o IoU 3D (cv2.rotatedRectangleIntersection + cv2.contourArea,
-# multiplicado pela sobreposição das alturas), as simetrias da caixa e a associação pelo IoU
+# multiplicado pela sobreposição das alturas: overlap_area e height_overlap da Parte 3), as simetrias da caixa e a associação pelo IoU
 # (algoritmo húngaro, scipy.optimize.linear_sum_assignment).
 def box_in_world(T_world_box, length, width, height):
     """Caixa no referencial do mundo (z para cima): centro, yaw e dimensões."""
@@ -253,16 +255,8 @@ def iou_3d(a, b):
     Volume da interseção = área da interseção dos retângulos vistos de cima
                            x sobreposição dos intervalos de altura (de z a z + height).
     """
-    r1 = (tuple(a["center"][:2]), tuple(a["dims"][:2]), np.degrees(a["yaw"]))
-    r2 = (tuple(b["center"][:2]), tuple(b["dims"][:2]), np.degrees(b["yaw"]))
-    status, region = cv2.rotatedRectangleIntersection(r1, r2)
-    area = 0.0
-    if status != cv2.INTERSECT_NONE and region is not None and len(region) >= 3:
-        area = cv2.contourArea(cv2.convexHull(region.reshape(-1, 2).astype(np.float32)))
-    z1 = (a["center"][2] - a["dims"][2] / 2, a["center"][2] + a["dims"][2] / 2)
-    z2 = (b["center"][2] - b["dims"][2] / 2, b["center"][2] + b["dims"][2] / 2)
-    dz = max(0.0, min(z1[1], z2[1]) - max(z1[0], z2[0]))
-    inter = area * dz
+    p, q = world_params(a), world_params(b)             # [x, y, yaw, l, w, h, z], z = base
+    inter = overlap_area(p, q) * height_overlap(p, q)
     union = np.prod(a["dims"]) + np.prod(b["dims"]) - inter
     return float(inter / union) if union > 0 else 0.0
 
@@ -443,11 +437,7 @@ def save_top_view(path, data, title=""):
     for key, params in (("gt", data["gt_params"]), ("bounding_box", data["params_bounding_box"]),
                         ("otimizacao", data["params_otimizacao"])):
         style, label = styles[key]
-        for j, p in enumerate(params):
-            c = box_corners_2d(p[0], p[1], p[2], p[3], p[4])
-            c = np.vstack([c, c[:1]])
-            ax.plot(c[:, 0], c[:, 1], color=style.get("color") or BOX_COLORS[j % len(BOX_COLORS)],
-                    lw=style.get("lw", 1.5), ls=style.get("ls", "-"), label=label if j == 0 else None)
+        draw_rects(ax, params, style, label)
     ax.set_aspect("equal")
     ax.set_xlabel("x mundo (m)")
     ax.set_ylabel("y mundo (m)")
@@ -542,7 +532,8 @@ def evaluate_scene(scene_folder, result_path=None, num_boxes=None, verbose=True)
     scene_folder = Path(scene_folder)
     result_path = Path(result_path) if result_path else scene_folder / "result.json"
     result = json.loads(result_path.read_text(encoding="utf-8"))
-    parts = scene_folder / OUTPUT_FOLDER
+    out = result_path.parent                 # pasta do result.json (no run_test.py: results_test/<cena>/)
+    parts = out / OUTPUT_FOLDER              # resultados das partes, gravados ao lado do result.json
 
     # 1. Número de caixas
     found = len(result["boxes"])
@@ -567,7 +558,7 @@ def evaluate_scene(scene_folder, result_path=None, num_boxes=None, verbose=True)
     if verbose:
         print("  a correr as Partes 2 e 3 com as poses verdadeiras (só para avaliar a segmentação)...")
     try:
-        _, r2, r3 = segmentation_with_true_poses(scene, ground_truth, scene_folder / GT_FOLDER)
+        _, r2, r3 = segmentation_with_true_poses(scene, ground_truth, out / GT_FOLDER)
         n_sets, num_gt, seg_rows = evaluate_segmentation(r2["seg"].points, r3["box_labels"],
                                                          r2["table"].T_camera0_table,
                                                          np.asarray(r2["cloud"].points), ground_truth)
@@ -589,7 +580,6 @@ def evaluate_scene(scene_folder, result_path=None, num_boxes=None, verbose=True)
     data = figure_data(scene_folder.name, est_cloud, gt_cloud, T_world_camera0,
                        {k: boxes_in_world(v, ground_truth) if v is not None else None for k, v in est.items()},
                        gt_params)
-    out = result_path.parent
     save_top_view(out / f"{FIGURE_NAME}_vista_de_cima.png", data, title=scene_folder.name)
     write_report(out / REPORT_FILE, scene_folder.name, (found, real, len(ground_truth["boxes"])), cams, seg,
                  boxes, photometry)

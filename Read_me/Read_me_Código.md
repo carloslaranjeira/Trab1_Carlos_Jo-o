@@ -50,7 +50,7 @@ Opções de cada parte (todas têm `--scene`, a pasta da cena):
 | `parte3_ajuste.py` | `--output` | onde escrever o `result.json` (por omissão: dentro da pasta da cena) |
 | | `--method bbox` | usa a bounding box no `result.json`, em vez da otimização |
 | | `--no_color` | não usa a cor na otimização |
-| | `--visualize` | 5 vistas: bounding box vista de cima; otimização vista de cima; bounding box em 3D na cena; otimização em 3D na cena; evolução da otimização em 3D (animação) |
+| | `--visualize` | 4 vistas: gráfico 2D visto de cima com as caixas dos dois métodos (como o `top_view.png`); bounding box em 3D na cena; otimização em 3D na cena; evolução da otimização em 3D (animação) |
 | | `--open3d` | janela do Open3D com a evolução da otimização (como nas aulas) |
 | `avaliador.py` | `--scene` | cena já corrida: pergunta o n.º real de caixas e, se houver `ground_truth.json`, escreve `avaliacao.md` |
 | | `--result` | o `result.json` a avaliar (por omissão: `<cena>/result.json`); o relatório fica ao lado dele |
@@ -63,7 +63,8 @@ no Windows o OpenCV não escreve ficheiros em caminhos com acentos (como "Trabal
 ## Estrutura do código
 
 O código está dividido em **4 ficheiros, um por parte do enunciado** (mais o avaliador), em `savi/`. Cada parte grava
-o seu resultado em `<cena>/partes/`, que é a entrada da parte seguinte:
+o seu resultado numa pasta `partes/` ao lado do `result.json` (quando cada parte corre sozinha: `<cena>/partes/`; no
+`run_test.py`: `results_test/<cena>/partes/`, para a pasta `test/` só ser lida), que é a entrada da parte seguinte:
 
 1. **`parte1_registo.py` — Parte 1.** Regista as imagens e junta as nuvens. Grava `registo.json` (pose de cada
    câmara em relação à câmara 000 e as câmaras que entraram na nuvem). Não precisa do número de caixas.
@@ -81,8 +82,10 @@ o seu resultado em `<cena>/partes/`, que é a entrada da parte seguinte:
    nunca o leem.
 
 O `run_test.py` (na pasta principal) corre os 4 ficheiros e o avaliador em todas as cenas de `test/` e escreve
-`results_test/<cena>/`. As cenas correm **uma de cada vez**: em cada cena correm seguidas a Parte 1, o extra, a Parte 2 e a Parte 3 (sem perguntas), abre a janela 3D (Open3D) dessa cena, com as vistas de todas as partes (setas ← e → para mudar de vista), e por fim o avaliador pede o número real de caixas (se a cena não estiver em `test/num_boxes.json`) e compara; só depois passa à cena seguinte. As janelas **não param o programa** (são desenhadas por um segundo processo): pode ver-se a cena 3 sem fechar as
-janelas das cenas 1 e 2. Com `--sem_janelas` só são gravadas as figuras. Cada função tem um comentário que diz o
+`results_test/<cena>/`. As cenas correm **uma de cada vez**: em cada cena correm seguidas a Parte 1, o extra, a Parte 2 e a Parte 3 (sem perguntas), abre a janela 3D (Open3D) dessa cena, com as vistas de todas as partes, por esta ordem: Parte 1, Parte 2, Parte 3 e, no fim, as do extra de fotometria (setas ← e → para mudar de vista), e por fim o avaliador pede o número real de caixas (se a cena não estiver em `test/num_boxes.json`) e compara; só depois passa à cena seguinte. As janelas **não param o programa** (são desenhadas por um segundo processo): pode ver-se a cena 3 sem fechar as
+janelas das cenas 1 e 2 (os pedidos ao segundo processo ficam na pasta temporária do sistema, `SAVIBoxes_janelas`).
+A pasta `test/` só é lida: os resultados intermédios de cada parte ficam em `results_test/<cena>/partes/`, que não
+vai para o git (`.gitignore`). Com `--sem_janelas` só são gravadas as figuras. Cada função tem um comentário que diz o
 que faz, o que recebe, o que devolve e porque foi feita assim.
 
 | Ficheiro | Secção | Funções principais | Para que serve |
@@ -109,9 +112,9 @@ que faz, o que recebe, o que devolve e porque foi feita assim.
 | parte 3 | 2.3 Otimização | `fit_boxes` | `least_squares(partial(objective_function, data=...))`, associações recalculadas em cada avaliação |
 | parte 3 | 2.4 Estimativa inicial | `initial_boxes`, `split_geometric`, `split_profile`, `place_on_supports`, `fit_from_initial_estimates` | Caixas iniciais a partir da segmentação; duas estimativas iniciais quando é incerta |
 | parte 3 | 2.5 Pontos errados | `soft_l1_cost` | Perda robusta `soft_l1` (Parte 06, Ex. 5) |
-| parte 3 | 2.6 Visualização | `evolution_snapshots`, `save_evolution`, `animate_optimization` | Evolução das caixas ao longo da otimização |
+| parte 3 | 2.6 Visualização | `evolution_snapshots`, `snapshot_frames`, `animate_optimization` | Evolução das caixas ao longo da otimização |
 | parte 3 | 3. Extra | `color_distances`, `setup_color` | Cor na otimização (Nível 4) |
-| parte 3 | 4–6. Saída, figuras, principal | `write_scene_result`, `save_fit`, `make_windows`, `save_top_view`, `run_fit` | `result.json` e `ajuste.npz`; 5 vistas 3D (bounding box e otimização de cima e na cena, evolução) |
+| parte 3 | 4–6. Saída, figuras, principal | `write_scene_result`, `save_fit`, `make_windows`, `save_top_view`, `run_fit` | `result.json` e `ajuste.npz`; 4 vistas: gráfico 2D visto de cima com os dois métodos, bounding box e otimização em 3D na cena, evolução |
 | avaliador | 1. Número de caixas | `ask_num_boxes`, `box_count_verdict` | Pergunta o n.º real de caixas e compara com o do `result.json` |
 | avaliador | 2. Parte 1 | `transform_error`, `camera_errors`, `registration_clouds` | Erro de translação e de rotação de cada câmara; nuvem estimada sobre a verdadeira |
 | avaliador | 3. Parte 2 | `segmentation_with_true_poses`, `inside_gt_boxes`, `evaluate_segmentation` | Partes 2 e 3 com as poses verdadeiras; n.º de caixas, precisão e recall |
@@ -409,7 +412,7 @@ porque depende da divisão inicial dos pontos entre as caixas, que é apenas apr
      arccos dava 0°. Figura: a nuvem agregada com as poses estimadas (vermelho) sobre a nuvem com as poses
      verdadeiras (verde).
    - **Parte 2:** para avaliar só a segmentação, as nuvens são juntadas com as poses verdadeiras e as Partes 2 e 3
-     (que dá os conjuntos de pontos de cada caixa) correm sobre essa nuvem, em `<cena>/partes_gt/` (os resultados do
+     (que dá os conjuntos de pontos de cada caixa) correm sobre essa nuvem, em `partes_gt/` ao lado do `result.json` (os resultados do
      sistema não são tocados). Os pontos de cada caixa verdadeira são os que ficam dentro dela, com 5 mm de margem.
      Relatório: caixas encontradas / reais, e a precisão e o recall de cada conjunto.
    - **Parte 3:** os dois métodos. A otimização vem do `result.json` e a bounding box do `partes/ajuste.npz`.
