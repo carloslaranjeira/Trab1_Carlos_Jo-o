@@ -8,21 +8,23 @@ Utilização:
     python run_test.py --redo       # volta a correr cenas que já têm resultado
     python run_test.py --sem_janelas   # não abre janelas (só grava as figuras em results_test/<cena>/)
 
-Corre os 4 ficheiros (savi/) um depois do outro e, no fim de cada cena, o avaliador, em duas fases:
-    FASE 1. em TODAS as cenas (não precisa do número de caixas, corre sem interrupções):
-            parte1_registo.py      -> test/<cena>/partes/registo.json   (pose de cada câmara)
-            extra_fotometria.py    -> test/<cena>/partes/fotometria.json (exposição de cada imagem)
-    FASE 2. só depois de a fase 1 acabar, cena a cena. É aqui que é pedido o número de caixas:
-            parte2_segmentacao.py  -> test/<cena>/partes/objetos.ply, mesa.json, segmentacao.npz
-            parte3_ajuste.py       -> results_test/<cena>/result.json (e top_view.png)
-            avaliador.py           -> erros em relação ao ground truth (só se a cena o tiver)
-O número de caixas de uma cena que esteja em test/num_boxes.json não é perguntado.
+Corre as cenas UMA DE CADA VEZ: em cada cena, os 4 ficheiros (savi/) um depois do outro e o avaliador,
+e no fim mostra a janela da cena; só depois passa à cena seguinte:
+    parte1_registo.py      -> test/<cena>/partes/registo.json   (pose de cada câmara)
+    extra_fotometria.py    -> test/<cena>/partes/fotometria.json (exposição de cada imagem)
+    parte2_segmentacao.py  -> test/<cena>/partes/objetos.ply, mesa.json, segmentacao.npz
+    parte3_ajuste.py       -> results_test/<cena>/result.json (e top_view.png)
+    avaliador.py           -> número de caixas e erros em relação ao ground truth (se a cena o tiver)
+As 4 partes NÃO usam o número de caixas (a Parte 2 estima-o). O número real só é pedido no avaliador,
+no fim de cada cena, para o comparar com o número de caixas encontradas; o de uma cena que esteja em
+test/num_boxes.json não é perguntado.
 
-Janelas: cada parte abre a sua janela (com subplots) logo que acaba, sem parar o programa: as janelas
-são desenhadas por um segundo processo (python run_test.py --janelas ...), por isso pode ver-se, por
-exemplo, a cena 3 sem fechar as janelas das cenas 1 e 2, e o programa continua enquanto estão abertas.
-As figuras são gravadas também em results_test/<cena>/ (parte1_registo.png, extra_fotometria.png,
-parte2_segmentacao.png, parte3_ajuste.png, parte3_ajuste_otimizacao.png).
+Janelas: UMA janela 3D do Open3D por cena, com as vistas de todas as partes (como a figura da nuvem
+agregada do enunciado); as setas <- e -> do teclado mudam de vista e o título diz qual é. A janela
+de uma cena abre quando as 4 partes acabam (antes da pergunta do avaliador), sem parar o programa: as janelas são abertas por um
+segundo processo (python run_test.py --janelas ...), por isso pode ver-se, por exemplo, a cena 3 sem
+fechar as janelas das cenas 1 e 2, e o programa continua enquanto estão abertas. Cada vista é gravada
+também em PNG em results_test/<cena>/ (parte1_registo_cor_pixeis.png, parte1_registo_cor_camaras.png, ...).
 
 Pensado para não perder resultados:
     - um erro numa cena não pára as outras (fica registado e passa-se à seguinte);
@@ -67,15 +69,6 @@ def read_num_boxes(path):
         return {}
     data = json.loads(path.read_text(encoding="utf-8"))
     return {k: int(v) for k, v in data.items() if not k.startswith("_")}
-
-
-def ask_num_boxes(name):
-    """Pergunta no terminal o número de caixas de uma cena que não está no num_boxes.json."""
-    while True:
-        answer = input(f"Número de caixas da cena '{name}': ").strip()
-        if answer.isdigit() and int(answer) > 0:
-            return int(answer)
-        print("  escreve um número inteiro positivo")
 
 
 def download_scenes(url, scenes_dir):
@@ -125,11 +118,11 @@ def git_push(output, message):
 # #####################################################################################################
 # JANELAS QUE NÃO PARAM O PROGRAMA
 # #####################################################################################################
-# O matplotlib só desenha janelas enquanto o programa está parado à espera delas (plt.show). Para o
-# programa continuar (e poder perguntar o n.º de caixas) com as janelas abertas, as janelas são
-# desenhadas por um SEGUNDO processo: este programa grava os dados de cada janela (figure_data de cada
-# parte, só arrays) num .npz e um pedido .json; o segundo processo lê os pedidos, desenha as janelas
-# (make_figures da parte) e mantém-nas abertas e a responder ao rato.
+# As janelas 3D do Open3D só respondem ao rato enquanto o programa está a tratar delas. Para o programa
+# continuar (e poder perguntar o n.º de caixas) com as janelas abertas, as janelas são abertas por um
+# SEGUNDO processo: este programa grava os dados das janelas de cada parte (figure_data, só arrays) num
+# .npz e um pedido .json; o segundo processo lê os pedidos, abre as janelas (make_windows da parte) e
+# mantém-nas abertas e a responder ao rato.
 def process_alive(pid):
     """True se o processo pid ainda está a correr."""
     if os.name == "nt":
@@ -185,26 +178,81 @@ class Windows:
         self.log.close()
 
 
-def add_window(windows, make_data, scene, part, output):
-    """Pede a janela de uma parte de uma cena. Um erro aqui é mostrado mas não interrompe o script."""
+def collect(views, make_data, part):
+    """Guarda os dados das vistas de uma parte (figure_data) para mostrar no fim da cena. Um erro aqui é
+    mostrado mas não interrompe a cena."""
     try:
-        windows.add(make_data(), f"{scene.name} - {part}", Path(output) / scene.name / f"{part}.png")
+        views.append((make_data(), part))
     except Exception as error:
-        print(f"  (janela de {part} não criada: {error})")
+        print(f"  (vistas de {part} não criadas: {error})")
+
+
+def run_scene(scene, output, views, show, known, push=False):
+    """Corre uma cena do princípio ao fim: as 4 partes (savi/) e o avaliador.
+
+    As vistas de cada parte são juntadas a views; show() abre a janela da cena quando as 4 partes
+    acabam. Só depois o avaliador pede o número real de caixas (known: os do num_boxes.json)."""
+    import avaliador
+    import comum
+    import extra_fotometria as extra
+    import parte1_registo as parte1
+    import parte2_segmentacao as parte2
+    import parte3_ajuste as parte3
+
+    result_path = output / scene.name / "result.json"
+    # Parte 1: registo -> test/<cena>/partes/registo.json
+    r1 = parte1.run_registration(scene, scene / comum.OUTPUT_FOLDER)
+    collect(views, lambda: parte1.figure_data(r1), "parte1_registo")
+    # Extra: fotometria -> test/<cena>/partes/fotometria.json (um erro aqui não impede o resto)
+    try:
+        rx = extra.run_photometry(r1)
+        collect(views, lambda: extra.figure_data(r1, rx), "extra_fotometria")
+    except Exception:
+        traceback.print_exc()
+        print(f"  ERRO na fotometria da cena {scene.name} (não impede o resto)")
+    # Parte 2: segmentação -> test/<cena>/partes/objetos.ply, mesa.json, segmentacao.npz
+    r2 = parte2.run_segmentation(r1)            # estima o número de caixas
+    collect(views, lambda: parte2.figure_data(r1, r2), "parte2_segmentacao")
+    # Parte 3: ajuste -> results_test/<cena>/result.json
+    r3 = parte3.run_fit(r1, r2)
+    parte3.write_scene_result(result_path, r1, r2, r3)
+    print(f"  -> {result_path}")
+    try:
+        # Figura da vista de cima (se falhar, o result.json já está escrito)
+        parte3.save_top_view(result_path.parent / "top_view.png", r2["seg"].points,
+                             r2["seg"].colors, r3["params_opt"], r3["params_bbox"], title=scene.name)
+    except Exception as error:
+        print(f"  (figura não gravada: {error})")
+    # Caixas verdadeiras (só se a cena tiver ground truth): só para desenhar e avaliar
+    gt = comum.load_ground_truth(scene)
+    gt_params = parte3.gt_params_in_table(gt, r2["table"].T_camera0_table) if gt else None
+    collect(views, lambda: parte3.figure_data(r1, r2, r3, gt_params), "parte3_ajuste")
+    if push:
+        git_push(output, f"Resultado da cena {scene.name}")
+    show()                                      # janela da cena (as 4 partes já acabaram)
+    # Avaliador: SÓ AGORA é pedido o número real de caixas (as 4 partes não o usaram)
+    real = known[scene.name] if scene.name in known else avaliador.ask_num_boxes(scene.name)
+    avaliador.print_box_count(avaliador.found_boxes(r2), real)
+    if gt is None:
+        print("  avaliador: a cena não tem ground_truth.json, não há mais nada a comparar")
+    else:
+        try:
+            avaliador.print_evaluation({**r1, **r2, **r3, "ground_truth": gt})
+        except Exception:
+            traceback.print_exc()
+            print(f"  ERRO no avaliador da cena {scene.name}")
 
 
 def open_windows(folder, show, parent_pid):
-    """Lado do processo das janelas: desenha cada pedido que aparece na pasta e grava a figura em PNG.
+    """Lado do processo das janelas: abre as janelas de cada pedido que aparece na pasta e grava cada uma
+    em PNG.
 
     Termina quando o programa principal acabou (ou foi interrompido) e todas as janelas foram fechadas.
     """
+    import visualizacao                              # janelas 3D do Open3D (SceneWindows)
     folder = Path(folder)
-    import matplotlib
-    if not show:
-        matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    plt.rcParams["figure.raise_window"] = False     # uma janela nova não salta para a frente das outras
-    seen, animations, finished = set(), [], False
+    windows = visualizacao.SceneWindows(show)
+    seen, finished = set(), False
     while True:
         for path in sorted(folder.glob("*.json")):
             if path.name in seen:
@@ -214,32 +262,24 @@ def open_windows(folder, show, parent_pid):
                 request = json.loads(path.read_text(encoding="utf-8"))
                 with np.load(folder / request["dados"]) as npz:
                     data = {k: (npz[k].item() if npz[k].ndim == 0 else npz[k]) for k in npz.files}
-                figures = importlib.import_module(request["parte"]).make_figures(data)
                 png = Path(request["png"])
-                for f in figures:
-                    f["fig"].savefig(png.with_name(png.stem + f["name"] + ".png"), dpi=110)
-                    if show:
-                        f["fig"].canvas.manager.set_window_title(request["titulo"] + f["name"])
-                        f["fig"].show()
-                        if f.get("start"):
-                            animations.append(f["start"]())     # guardadas, senão param
-                    else:
-                        plt.close(f["fig"])
+                for spec in importlib.import_module(request["parte"]).make_windows(data):
+                    windows.add(spec, png.with_name(png.stem + spec["name"] + ".png"), group=str(data["cena"]))
                 print(f"{request['titulo']}: {png}", flush=True)
             except Exception:
                 traceback.print_exc()
                 sys.stdout.flush()
         if (folder / "fim").exists() or not process_alive(parent_pid):
             finished = True
-        figures_open = plt.get_fignums()
-        if finished and (not show or not figures_open) and not set(p.name for p in folder.glob("*.json")) - seen:
+        if finished and not windows.windows and not set(p.name for p in folder.glob("*.json")) - seen:
             break
-        if show and figures_open:
-            # Deixa as janelas responder ao rato (e as animações correr) durante 0.3 s.
-            # (plt.pause traria todas as janelas para a frente de cada vez)
-            plt.figure(figures_open[0]).canvas.start_event_loop(0.3)
+        if windows.windows:
+            windows.tick()                           # as janelas respondem ao rato e as animações avançam
+            time.sleep(0.01)
         else:
             time.sleep(0.3)
+    sys.stdout.flush()
+    os._exit(0)          # sai já (o Open3D às vezes falha ao fechar e o erro não interessa)
 
 
 # #####################################################################################################
@@ -261,13 +301,6 @@ def main_test():
         open_windows(args.janelas, not args.sem_janelas, args.pid)
         return
 
-    # As 4 partes e o avaliador (só agora: o processo das janelas não precisa deles)
-    import avaliador
-    import extra_fotometria as extra
-    import parte1_registo as parte1
-    import parte2_segmentacao as parte2
-    import parte3_ajuste as parte3
-
     scenes_dir, output = Path(args.scenes), Path(args.output)
     if args.download:
         download_scenes(args.download, scenes_dir)
@@ -286,77 +319,32 @@ def main_test():
     if not todo:
         return
     start = time.time()
-    failed = []
+    failed, done = [], []
     windows = Windows(show=not args.sem_janelas)
 
-    # ---------------- FASE 1: Parte 1 (registo) e extra (fotometria) em todas as cenas ----------------
-    # Não precisam do número de caixas, por isso correm sem interrupções.
-    print(f"\n===== FASE 1: registo (parte1_registo.py) e fotometria (extra_fotometria.py) em {len(todo)} cenas =====")
-    registered = []
+    def show(scene, views):
+        """Abre a janela da cena com as vistas juntadas até aqui (e esvazia a lista)."""
+        for data, part in views:
+            try:
+                windows.add(data, f"{scene.name} - {part}", Path(output) / scene.name / f"{part}.png")
+            except Exception as error:
+                print(f"  (vistas de {part} não mostradas: {error})")
+        views.clear()
+
+    # Uma cena de cada vez: as 4 partes, a janela da cena com as vistas todas e o avaliador.
     for k, scene in enumerate(todo, 1):
-        print(f"\n[{k}/{len(todo)}] {scene.name} - {(time.time() - start) / 60:.1f} min desde o início")
+        print(f"\n===== [{k}/{len(todo)}] {scene.name} - {(time.time() - start) / 60:.1f} min desde o início =====")
+        views = []                         # vistas da cena: só são mostradas quando as 4 partes acabam
         try:
-            # Pose de cada câmara em test/<cena>/partes/registo.json
-            r1 = parte1.run_registration(scene, scene / parte1.OUTPUT_FOLDER)
-            add_window(windows, lambda: parte1.figure_data(r1), scene, "parte1_registo", output)
-            registered.append(scene)
+            run_scene(scene, output, views, lambda: show(scene, views), known, args.git)
+            done.append(scene.name)
         except Exception:
             # Não deixa uma cena com problemas impedir as restantes
             traceback.print_exc()
-            print(f"  ERRO no registo da cena {scene.name}: passa à seguinte")
+            print(f"  ERRO na cena {scene.name}: passa à seguinte")
             failed.append(scene.name)
-            continue
-        try:
-            rx = extra.run_photometry(r1)
-            add_window(windows, lambda: extra.figure_data(r1, rx), scene, "extra_fotometria", output)
-        except Exception:
-            traceback.print_exc()
-            print(f"  ERRO na fotometria da cena {scene.name} (não impede o resto)")
-        del r1                                  # liberta a nuvem agregada antes da cena seguinte
-
-    # ---------------- FASE 2: Partes 2 e 3 e avaliador, cena a cena ----------------
-    # Só agora, com a fase 1 feita em todas as cenas, é pedido o número de caixas de cada cena.
-    print(f"\n===== FASE 2: segmentação (parte2_segmentacao.py), ajuste (parte3_ajuste.py) "
-          f"e avaliador em {len(registered)} cenas =====")
-    done = []
-    for k, scene in enumerate(registered, 1):
-        result_path = output / scene.name / "result.json"
-        print(f"\n[{k}/{len(registered)}] {scene.name}")
-        n = known[scene.name] if scene.name in known else ask_num_boxes(scene.name)
-        try:
-            r1 = parte1.load_registration(scene / parte1.OUTPUT_FOLDER)
-            r2 = parte2.run_segmentation(r1, n)
-            add_window(windows, lambda: parte2.figure_data(r2), scene, "parte2_segmentacao", output)
-            r3 = parte3.run_fit(r1, r2)
-            parte3.write_scene_result(result_path, r1, r2, r3)
-            print(f"  -> {result_path}")
-            try:
-                # Figura da vista de cima (se falhar, o result.json já está escrito)
-                parte3.save_top_view(result_path.parent / "top_view.png", r2["seg"].points,
-                                     r2["seg"].colors, r3["params_opt"], r3["params_bbox"], title=scene.name)
-            except Exception as error:
-                print(f"  (figura não gravada: {error})")
-            # Caixas verdadeiras (só se a cena tiver ground truth): só para desenhar e avaliar
-            gt = parte1.load_ground_truth(scene)
-            gt_params = parte3.gt_params_in_table(gt, r2["table"].T_camera0_table) if gt else None
-            add_window(windows, lambda: parte3.figure_data(r2, r3, gt_params), scene, "parte3_ajuste", output)
-            done.append(scene.name)
-            if args.git:
-                git_push(output, f"Resultado da cena {scene.name}")
-        except Exception:
-            traceback.print_exc()
-            print(f"  ERRO na segmentação / ajuste da cena {scene.name}: passa à seguinte")
-            failed.append(scene.name)
-            continue
-        # Avaliador: erros em relação ao ground truth
-        if gt is None:
-            print("  avaliador: a cena não tem ground_truth.json, não há nada a comparar")
-        else:
-            try:
-                avaliador.print_evaluation({**r1, **r2, **r3, "ground_truth": gt})
-            except Exception:
-                traceback.print_exc()
-                print(f"  ERRO no avaliador da cena {scene.name}")
+        finally:
+            show(scene, views)             # com erro: mostra o que ficou feito
 
     print(f"\nTerminado em {(time.time() - start) / 60:.1f} min. "
           f"Feitas: {len(done)}  Com erro: {failed if failed else 'nenhuma'}")

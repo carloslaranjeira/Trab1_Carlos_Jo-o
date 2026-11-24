@@ -6,7 +6,7 @@ COMO CORRER
 =====================================================================================================
     (a partir da pasta principal do trabalho, DEPOIS da Parte 1: python savi/parte1_registo.py --scene ...)
     python savi/extra_fotometria.py --scene test/cena_1
-    python savi/extra_fotometria.py --scene test/cena_1 --visualize   # janela: nuvem sem | com correção
+    python savi/extra_fotometria.py --scene test/cena_1 --visualize   # janelas 3D: nuvem sem / com correção
 
 Com a opção "Exposure changes" do simulador, cada imagem tem o seu ganho s e o seu desvio b, como numa
 câmara com exposição automática (cor da imagem = s * cor + b): a mesma superfície aparece mais clara
@@ -23,16 +23,16 @@ Grava <cena>/partes/fotometria.json com s e b de cada imagem (estimados e, se ho
 Ordem das partes (o run_test.py corre-as todas, cena a cena):
     parte1_registo.py      -> <cena>/partes/registo.json   (pose de cada câmara)
     extra_fotometria.py    -> <cena>/partes/fotometria.json (ganho e desvio de cada imagem)
-    parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (precisa do n.º de caixas)
+    parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (estima o n.º de caixas)
     parte3_ajuste.py       -> result.json e <cena>/partes/ajuste.npz
-    avaliador.py           -> erros em relação ao ground truth (só nas cenas que o têm)
+    avaliador.py           -> pede o n.º real de caixas e compara com o ground truth (se a cena o tiver)
 
 =====================================================================================================
 ORGANIZAÇÃO DESTE FICHEIRO
 =====================================================================================================
-    1. Modelo da exposição  estimar s e b (exposure_fit) e corrigir cores (exposure_corrected)
+    1. Modelo da exposição  estimar s e b (exposure_fit, match_exposure) e corrigir cores (exposure_corrected)
     2. Correção das imagens s e b de cada imagem, valores verdadeiros, imagens corrigidas
-    3. Visualização         janela com 2 subplots: nuvem agregada sem correção | com correção
+    3. Visualização         janelas 3D: nuvem agregada sem correção e com correção
     4. Programa principal   run_photometry() e main()
 """
 
@@ -41,10 +41,13 @@ import json
 from pathlib import Path
 
 import cv2                                   # OpenCV: gravar as imagens corrigidas
-import matplotlib.pyplot as plt              # janela (secção 3)
 import numpy as np
+from scipy.spatial import cKDTree            # procura rápida do vizinho mais próximo
 
-# A Parte 1 importa este ficheiro (exposure_fit, exposure_corrected); por isso, aqui, a Parte 1 só é
+from comum import OUTPUT_FOLDER, load_scene
+from visualizacao import colors_uint8, data_view, points_item, scene_view, show_windows
+
+# A Parte 1 importa este ficheiro (exposure_corrected, match_exposure); por isso, aqui, a Parte 1 só é
 # importada dentro das funções que precisam dela (import parte1_registo as p1).
 
 
@@ -80,6 +83,19 @@ def exposure_corrected(colors, colors_target, close):
     """
     s, b = exposure_fit(colors, colors_target, close)
     return np.clip(s * colors + b, 0.0, 1.0)
+
+
+def match_exposure(cloud, reference, distance=0.01):
+    """Ganho s e desvio b que levam a exposição de uma nuvem à de outra nuvem já no mesmo referencial.
+
+    Usado pela Parte 1 ao juntar as nuvens (aggregate): cada nuvem passa a ter a exposição das anteriores.
+    Os pares de pontos são os vizinhos mais próximos a menos de 'distance' metros (nuvens reduzidas a
+    1 cm). A cromaticidade (chroma_features da Parte 2) cancela o ganho s mas não o desvio b, e com cores
+    de exposições diferentes duas caixas de cores parecidas (laranja e castanho) deixavam de se separar.
+    """
+    small, ref = cloud.voxel_down_sample(0.01), reference.voxel_down_sample(0.01)
+    dist, idx = cKDTree(np.asarray(ref.points)).query(np.asarray(small.points), k=1)
+    return exposure_fit(np.asarray(small.colors), np.asarray(ref.colors)[idx], dist < distance)
 
 
 # #####################################################################################################
@@ -120,55 +136,42 @@ def correct_images(scene, exposures, folder):
 # 3. VISUALIZAÇÃO
 # #####################################################################################################
 def figure_data(r1, rx):
-    """Dados da janela do extra (r1 = Parte 1, rx = run_photometry): uma amostra da nuvem agregada com as
-    cores sem correção e com correção, e o s e o b de cada imagem."""
+    """Dados das janelas do extra (r1 = Parte 1, rx = run_photometry): a nuvem agregada inteira com as cores
+    sem correção e com correção, e o s e o b de cada imagem."""
     import parte1_registo as p1
-    scene = r1["scene"] if r1.get("scene") is not None else p1.load_scene(r1["scene_folder"])
-    raw, camera = p1.aggregate(scene, r1["T_cams"], r1["registered"], photometric=False)
+    scene = r1["scene"] if r1.get("scene") is not None else load_scene(r1["scene_folder"])
+    raw, _ = p1.aggregate(scene, r1["T_cams"], r1["registered"], photometric=False)
     corrected = r1.get("cloud")
-    if corrected is None:
+    if corrected is None or len(corrected.points) != len(raw.points):
         corrected, _ = p1.aggregate(scene, r1["T_cams"], r1["registered"])
-    points = np.asarray(raw.points)
-    registered = np.array(r1["registered"], bool)
-    centers = np.array([T[:3, 3] for T in r1["T_cams"]])
-    near = np.nonzero(np.linalg.norm(points - centers[registered].mean(axis=0), axis=1) < p1.DISPLAY_RADIUS)[0]
-    idx = near[p1.sample_indices(len(near), p1.DISPLAY_POINTS)]
     rows = rx["photometry"]
     nan = float("nan")
-    return {"parte": "extra_fotometria", "cena": Path(r1["scene_folder"]).name, "points": points[idx],
-            "colors_raw": np.asarray(raw.colors)[idx], "colors_corrected": np.asarray(corrected.colors)[idx],
+    view = scene_view(r1["T_cams"], r1["registered"])
+    return {"parte": "extra_fotometria", "cena": Path(r1["scene_folder"]).name,
+            "points": np.asarray(raw.points, np.float32), "colors_raw": colors_uint8(raw.colors),
+            "colors_corrected": colors_uint8(corrected.colors),
             "images": np.array([row["imagem"] for row in rows]), "s": np.array([row["s"] for row in rows]),
             "b": np.array([row["b"] for row in rows]),
             "s_true": np.array([nan if row["s_verdadeiro"] is None else row["s_verdadeiro"] for row in rows]),
-            "b_true": np.array([nan if row["b_verdadeiro"] is None else row["b_verdadeiro"] for row in rows])}
+            "b_true": np.array([nan if row["b_verdadeiro"] is None else row["b_verdadeiro"] for row in rows]),
+            **{f"view_{k}": v for k, v in view.items()}}
 
 
-def make_figures(data):
-    """Janela do extra: a mesma nuvem agregada com as cores originais de cada imagem (esquerda) e com a
-    exposição de todas as imagens corrigida para a da imagem 000 (direita); em baixo, s e b de cada imagem."""
-    import parte1_registo as p1
-    points = p1.camera_to_display(data["points"])
-    fig = plt.figure(figsize=(14, 7.5))
-    fig.suptitle(f"Extra - correção fotométrica ({data['cena']}): cor_000 = s * cor + b")
-    axes = [fig.add_subplot(1, 2, k, projection="3d") for k in (1, 2)]
-    p1.scatter_3d(axes[0], points, data["colors_raw"])
-    axes[0].set_title("sem correção (cada imagem com a sua exposição)")
-    p1.scatter_3d(axes[1], points, data["colors_corrected"])
-    axes[1].set_title("com correção (exposição da imagem 000)")
-    for ax in axes:
-        p1.set_equal_3d(ax, points)
-        ax.view_init(elev=30, azim=-60)
-        ax.set_axis_off()
-    lines = []
+def make_windows(data):
+    """Janelas do extra: a nuvem agregada com as cores originais de cada imagem e com a exposição de todas
+    as imagens corrigida para a da imagem 000 (cada uma na sua janela; s e b de cada imagem no título)."""
+    values = []
     for name, s, b, st, bt in zip(data["images"], data["s"], data["b"], data["s_true"], data["b_true"]):
-        line = f"imagem {name}: s = {s:.3f}, b = {b:+.3f}"
+        value = f"{name}: s={s:.3f} b={b:+.3f}"
         if not np.isnan(st):
-            line += f"  (verdadeiros: s = {st:.3f}, b = {bt:+.3f})"
-        lines.append(line)
-    fig.text(0.5, 0.02, "\n".join(lines), ha="center", va="bottom", family="monospace", fontsize=9)
-    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.04 + 0.025 * len(lines), top=0.92, wspace=0.02)
-    p1.link_views(fig, axes)
-    return [{"name": "", "fig": fig}]
+            value += f" (verd. {st:.3f} {bt:+.3f})"
+        values.append(value)
+    title = f"Extra - {data['cena']}: correção fotométrica, cor_000 = s * cor + b"
+    view = data_view(data)
+    return [{"name": "_sem_correcao", "title": f"{title} - SEM correção (cada imagem com a sua exposição)",
+             "items": [points_item(data["points"], data["colors_raw"])], "view": view},
+            {"name": "_com_correcao", "title": f"{title} - COM correção: {'; '.join(values)}",
+             "items": [points_item(data["points"], data["colors_corrected"])], "view": view}]
 
 
 # #####################################################################################################
@@ -183,7 +186,7 @@ def run_photometry(r1, verbose=True):
     Saída: dicionário com a lista de {imagem, s, b, s_verdadeiro, b_verdadeiro}.
     """
     import parte1_registo as p1
-    scene = r1["scene"] if r1.get("scene") is not None else p1.load_scene(r1["scene_folder"])
+    scene = r1["scene"] if r1.get("scene") is not None else load_scene(r1["scene_folder"])
     exposures = r1.get("exposures")
     if exposures is None:
         exposures = []
@@ -217,13 +220,13 @@ def main():
     import parte1_registo as p1
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scene", required=True, help="pasta da cena (já com a Parte 1 feita)")
-    parser.add_argument("--visualize", action="store_true", help="janela: nuvem sem | com correção (2 subplots)")
+    parser.add_argument("--visualize", action="store_true", help="janelas 3D: nuvem agregada sem e com correção")
     args = parser.parse_args()
 
-    r1 = p1.load_registration(Path(args.scene) / p1.OUTPUT_FOLDER)
+    r1 = p1.load_registration(Path(args.scene) / OUTPUT_FOLDER)
     rx = run_photometry(r1)
     if args.visualize:
-        p1.show_figures(make_figures(figure_data(r1, rx)))
+        show_windows(make_windows(figure_data(r1, rx)))
 
 
 if __name__ == "__main__":

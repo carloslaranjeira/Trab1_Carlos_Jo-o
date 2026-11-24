@@ -6,8 +6,8 @@ COMO CORRER
 =====================================================================================================
     (a partir da pasta principal do trabalho, DEPOIS das Partes 1 e 2)
     python savi/parte3_ajuste.py --scene test/cena_1
-    python savi/parte3_ajuste.py --scene test/cena_1 --visualize   # janelas: bounding box | otimização
-                                                                   # e evolução da otimização em 3D
+    python savi/parte3_ajuste.py --scene test/cena_1 --visualize   # janelas 3D: bounding box, otimização
+                                                                   # e evolução da otimização (animação)
 
 Lê <cena>/partes/ (registo.json da Parte 1; objetos.ply, mesa.json e segmentacao.npz da Parte 2),
 ajusta as caixas pelos dois métodos do enunciado e escreve o result.json (por omissão, na pasta da cena)
@@ -17,9 +17,9 @@ Grava também <cena>/partes/ajuste.npz (para o avaliador.py).
 Ordem das partes (o run_test.py corre-as todas, cena a cena):
     parte1_registo.py      -> <cena>/partes/registo.json   (pose de cada câmara)
     extra_fotometria.py    -> <cena>/partes/fotometria.json (ganho e desvio de cada imagem)
-    parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (precisa do n.º de caixas)
+    parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (estima o n.º de caixas)
     parte3_ajuste.py       -> result.json e <cena>/partes/ajuste.npz
-    avaliador.py           -> erros em relação ao ground truth (só nas cenas que o têm)
+    avaliador.py           -> pede o n.º real de caixas e compara com o ground truth (se a cena o tiver)
 
 =====================================================================================================
 ORGANIZAÇÃO DESTE FICHEIRO
@@ -27,9 +27,9 @@ ORGANIZAÇÃO DESTE FICHEIRO
     1. Otimização         estimativa inicial + modelo da caixa + função objetivo + least_squares
     2. Método base        bounding box orientada (só para comparar com a otimização)
     3. Saída              gravar e ler o ajuste.npz e escrever o result.json
-    4. Visualização       janela com 2 subplots (bounding box | otimização) e evolução 3D da otimização
+    4. Visualização       janelas 3D: cena com as caixas da bounding box, com as da otimização e evolução
     5. Programa principal run_fit() e main()
-(Convenções: caixa = [x, y, yaw, length, width, height, z] no referencial da mesa; ver parte1_registo.py.)
+(Convenções: caixa = [x, y, yaw, length, width, height, z] no referencial da mesa; ver comum.py.)
 """
 
 import argparse
@@ -38,17 +38,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2                                   # OpenCV: k-means, retângulos
-import matplotlib.pyplot as plt              # janelas (secção 4)
+import matplotlib.pyplot as plt              # figuras PNG vistas de cima (secção 4)
 import numpy as np
 import open3d as o3d                         # nuvens de pontos: bounding boxes, janelas 3D
-from matplotlib.animation import FuncAnimation   # evolução da otimização em 3D
 from scipy.optimize import least_squares     # otimização (Parte 05/06)
 from scipy.spatial import cKDTree            # procura rápida do vizinho mais próximo
 
+from comum import (  # geometria e leitura da cena (comuns a todas as partes)
+    box_corners_2d, box_lines_3d, box_signed_distance, box_T_table, boxes_to_camera0, load_ground_truth,
+    load_scene, OUTPUT_FOLDER, transform_points, wrap_angle, write_result, yaw_of,
+)
 from parte1_registo import (  # funções da Parte 1 usadas aqui
-    DISPLAY_POINTS, OUTPUT_FOLDER, box_corners_2d, box_lines_3d, box_signed_distance, box_T_table,
-    boxes_to_camera0, load_ground_truth, load_registration, sample_indices, scatter_3d, set_equal_3d,
-    show_figures, wrap_angle, write_result, yaw_of,
+    aggregate, load_registration,
+)
+from visualizacao import (  # janelas 3D (comuns a todas as partes)
+    box_item, camera_view, close_view, colors_uint8, data_view, points_item, show_windows,
 )
 from parte2_segmentacao import (  # funções da Parte 2 usadas aqui
     allocate_boxes, chroma_features, components_with, large_components, largest_component, load_objects,
@@ -806,7 +810,7 @@ def gt_params_in_table(ground_truth, T_camera0_table):
 
 
 # ----------------------------------------------------------------------------------------------------
-# Janelas (matplotlib): bounding box | otimização, e evolução da otimização em 3D
+# Desenho das caixas vistas de cima (figuras PNG)
 # ----------------------------------------------------------------------------------------------------
 def _draw_rects(ax, params, style, label=None):
     for j, p in enumerate(params):
@@ -815,101 +819,6 @@ def _draw_rects(ax, params, style, label=None):
         color = style.get("color") or BOX_COLORS[j % len(BOX_COLORS)]
         ax.plot(c[:, 0], c[:, 1], color=color, lw=style.get("lw", 1.5), ls=style.get("ls", "-"),
                 label=label if j == 0 else None)
-
-
-MAX_FRAMES = 60             # passos da otimização mostrados na animação 3D
-
-
-def snapshot_frames(snapshots, max_frames=MAX_FRAMES):
-    """Até max_frames passos da otimização, igualmente espaçados (com o primeiro e o último), cada um como
-    uma lista de caixas [x, y, yaw, l, w, h, z]. Saída: (caixas de cada passo, número de cada passo)."""
-    snapshots = np.asarray(snapshots)
-    picks = np.unique(np.linspace(0, len(snapshots) - 1, min(max_frames, len(snapshots))).astype(int))
-    frames = np.array([[normalize_box(p) for p in snapshots[k].reshape(-1, NUM_PARAMS)] for k in picks])
-    return frames, picks
-
-
-def figure_data(r2, r3, gt_params=None):
-    """Dados das janelas da Parte 3 (r2 = Parte 2, r3 = resultado de run_fit ou load_fit): uma amostra dos
-    pontos dos objetos, as caixas dos dois métodos, as caixas ao longo da otimização e, se houver ground
-    truth, as caixas verdadeiras (só para desenhar)."""
-    seg = r2["seg"]
-    s = sample_indices(len(seg.points), DISPLAY_POINTS)
-    snapshots = evolution_snapshots(r3["problem"].history) if "problem" in r3 else r3["snapshots"]
-    frames, steps = snapshot_frames(snapshots)
-    return {"parte": "parte3_ajuste", "cena": Path(r2["scene_folder"]).name, "points": seg.points[s],
-            "colors": seg.colors[s], "params_bbox": np.asarray(r3["params_bbox"]).reshape(-1, NUM_PARAMS),
-            "params_opt": np.asarray(r3["params_opt"]).reshape(-1, NUM_PARAMS), "frames": frames,
-            "steps": steps, "total_steps": len(snapshots) - 1,
-            "gt_params": np.zeros((0, NUM_PARAMS)) if gt_params is None else np.asarray(gt_params)}
-
-
-def box_edges_3d(p):
-    """As 12 arestas de uma caixa [x, y, yaw, l, w, h, z] (referencial da mesa), cada uma 2 x 3."""
-    corners, edges = box_lines_3d(box_T_table(p[0], p[1], p[2], p[5], p[6]), p[3], p[4], p[5])
-    return [corners[list(e)] for e in edges]
-
-
-def _top_view(ax, data, params, title):
-    """Um subplot da vista de cima: pontos dos objetos, caixas de um método e (se houver) as verdadeiras."""
-    ax.scatter(data["points"][:, 0], data["points"][:, 1], c=data["colors"], s=1)
-    if len(data["gt_params"]):
-        _draw_rects(ax, data["gt_params"], {"color": "k", "lw": 2.5}, "verdadeira")
-    _draw_rects(ax, params, {"lw": 2}, "estimada")
-    ax.set_aspect("equal")
-    ax.set_xlabel("x mesa (m)")
-    ax.set_ylabel("y mesa (m)")
-    ax.set_title(f"{title} ({len(params)} caixas)")
-    ax.legend(loc="upper right", fontsize=8)
-
-
-def make_figures(data):
-    """Janelas da Parte 3:
-    1. dois subplots (vista de cima): método base (bounding box) | método principal (otimização);
-    2. a evolução das caixas ao longo da otimização, em 3D, sobre a nuvem de pontos (animação; a figura
-       gravada mostra o estado final)."""
-    figures = []
-    fig, axes = plt.subplots(1, 2, figsize=(13, 6.5), sharex=True, sharey=True)
-    fig.suptitle(f"Parte 3 - ajuste das caixas ({data['cena']})")
-    _top_view(axes[0], data, data["params_bbox"], "Método base: bounding box")
-    _top_view(axes[1], data, data["params_opt"], "Método principal: otimização")
-    fig.tight_layout()
-    figures.append({"name": "", "fig": fig})
-
-    fig3 = plt.figure(figsize=(9, 8))
-    ax = fig3.add_subplot(projection="3d")
-    sel = sample_indices(len(data["points"]), 8000)
-    scatter_3d(ax, data["points"][sel], data["colors"][sel], 1.0)
-    for p in data["gt_params"]:                           # caixas verdadeiras (se houver), a preto
-        for e in box_edges_3d(p):
-            ax.plot(*e.T, color="k", lw=1, ls="--")
-    corners = [np.vstack(box_edges_3d(p)) for frame in data["frames"] for p in frame]
-    set_equal_3d(ax, np.vstack(corners + [data["points"]]))
-    ax.set_xlabel("x mesa (m)")
-    ax.set_ylabel("y mesa (m)")
-    ax.set_zlabel("z mesa (m)")
-    lines = []
-
-    def draw(i):
-        """Desenha as caixas do passo i da otimização."""
-        for line in lines:
-            line.remove()
-        lines.clear()
-        for j, p in enumerate(data["frames"][i]):
-            for e in box_edges_3d(p):
-                lines.extend(ax.plot(*e.T, color=BOX_COLORS[j % len(BOX_COLORS)], lw=2))
-        ax.set_title(f"Parte 3 - evolução da otimização ({data['cena']}): "
-                     f"passo {int(data['steps'][i])} de {int(data['total_steps'])}")
-        return lines
-
-    draw(len(data["frames"]) - 1)                         # estado final (é o que fica na figura gravada)
-
-    def start():
-        """Começa a animação (do primeiro ao último passo, e repete)."""
-        return FuncAnimation(fig3, draw, frames=len(data["frames"]), interval=150, repeat=True, repeat_delay=2000)
-
-    figures.append({"name": "_otimizacao", "fig": fig3, "start": start})
-    return figures
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -956,7 +865,89 @@ def save_evolution(path, points, problem, num_frames=6):
 
 
 # ----------------------------------------------------------------------------------------------------
-# Janelas 3D do Open3D (opção --open3d)
+# Janelas 3D do Open3D: a cena com as caixas da bounding box, com as caixas da otimização e a evolução
+# da otimização (animação)
+# ----------------------------------------------------------------------------------------------------
+MAX_FRAMES = 60             # passos da otimização mostrados na animação
+GT_COLOR = (0.0, 0.0, 0.0)  # caixas verdadeiras (se houver ground truth): a preto
+
+
+def snapshot_frames(snapshots, max_frames=MAX_FRAMES):
+    """Até max_frames passos da otimização, igualmente espaçados (com o primeiro e o último), cada um como
+    uma lista de caixas [x, y, yaw, l, w, h, z]. Saída: (caixas de cada passo, número de cada passo)."""
+    snapshots = np.asarray(snapshots)
+    picks = np.unique(np.linspace(0, len(snapshots) - 1, min(max_frames, len(snapshots))).astype(int))
+    frames = np.array([[normalize_box(p) for p in snapshots[k].reshape(-1, NUM_PARAMS)] for k in picks])
+    return frames, picks
+
+
+def figure_data(r1, r2, r3, gt_params=None):
+    """Dados das janelas da Parte 3 (r1, r2 = Partes 1 e 2, r3 = run_fit ou load_fit), no referencial da
+    mesa: a nuvem agregada (se existir; senão só os pontos dos objetos), os pontos dos objetos, as caixas
+    dos dois métodos, as caixas ao longo da otimização e, se houver ground truth, as verdadeiras."""
+    table, seg = r2["table"], r2["seg"]
+    T_table_camera0 = np.linalg.inv(table.T_camera0_table)
+    if r2.get("cloud") is not None:
+        points = transform_points(T_table_camera0, np.asarray(r2["cloud"].points))
+        colors = r2["cloud"].colors
+    else:
+        points, colors = seg.points, seg.colors
+    snapshots = evolution_snapshots(r3["problem"].history) if "problem" in r3 else r3["snapshots"]
+    frames, steps = snapshot_frames(snapshots)
+    center = seg.points.mean(axis=0)
+    view = camera_view(T_table_camera0 @ r1["T_cams"][0], center, np.array([0.0, 0.0, 1.0]), back=-0.3, above=0.1)
+    return {"parte": "parte3_ajuste", "cena": Path(r2["scene_folder"]).name,
+            "points": points.astype(np.float32), "colors": colors_uint8(colors),
+            "objects": seg.points.astype(np.float32), "object_colors": colors_uint8(seg.colors),
+            "params_bbox": np.asarray(r3["params_bbox"]).reshape(-1, NUM_PARAMS),
+            "params_opt": np.asarray(r3["params_opt"]).reshape(-1, NUM_PARAMS), "frames": frames,
+            "steps": steps, "total_steps": len(snapshots) - 1,
+            "gt_params": np.zeros((0, NUM_PARAMS)) if gt_params is None else np.asarray(gt_params),
+            **{f"view_{k}": v for k, v in view.items()}}
+
+
+def top_view(points):
+    """Ponto de vista de cima (referencial da mesa): por cima do centro dos pontos dos objetos, a olhar para
+    baixo, com x para a direita e y para cima (como uma figura vista de cima)."""
+    center = (points.min(axis=0) + points.max(axis=0)) / 2       # centro da caixa que envolve os pontos
+    height = max(0.25, 1.3 * float(np.ptp(points[:, :2], axis=0).max()))
+    return {"center": center, "eye": center + np.array([0.0, 0.0, height]), "up": np.array([0.0, 1.0, 0.0])}
+
+
+def make_windows(data):
+    """Vistas da Parte 3 (caixas verdadeiras a preto, se houver ground truth):
+    1. método base (bounding box) visto de cima, sobre os pontos dos objetos;
+    2. método principal (otimização) visto de cima;
+    3. a cena em 3D com as caixas da bounding box;
+    4. a cena em 3D com as caixas da otimização;
+    5. a evolução das caixas ao longo da otimização em 3D, sobre os pontos dos objetos (animação; a
+       figura gravada mostra o último passo)."""
+    gt = [box_item(p, GT_COLOR, 2.0) for p in data["gt_params"]]
+    note = " (verdadeiras a preto)" if len(data["gt_params"]) else ""
+    title = f"Parte 3 - {data['cena']}"
+    view = data_view(data)
+    objects = points_item(data["objects"], data["object_colors"], 3.0)
+    methods = (("bounding_box", "params_bbox", "método base: bounding box"),
+               ("otimizacao", "params_opt", "método principal: otimização"))
+    boxes = {key: [box_item(p, BOX_COLORS[j % len(BOX_COLORS)]) for j, p in enumerate(data[key])]
+             for _, key, _ in methods}
+    windows = []
+    for name, key, method in methods:                     # vistas de cima
+        windows.append({"name": f"_{name}_vista_de_cima",
+                        "title": f"{title}: {method}, vista de cima ({len(data[key])} caixas){note}",
+                        "items": [objects] + gt + boxes[key], "view": top_view(data["objects"])})
+    for name, key, method in methods:                     # na cena, em 3D
+        windows.append({"name": f"_{name}_3d", "title": f"{title}: {method}, em 3D na cena ({len(data[key])} caixas){note}",
+                        "items": [points_item(data["points"], data["colors"])] + gt + boxes[key], "view": view})
+    frames = [[box_item(p, BOX_COLORS[j % len(BOX_COLORS)]) for j, p in enumerate(frame)] for frame in data["frames"]]
+    windows.append({"name": "_evolucao",
+                    "title": f"{title}: evolução da otimização em 3D ({int(data['total_steps'])} passos, animação){note}",
+                    "items": [objects] + gt, "view": close_view(view, data["objects"]), "frames": frames})
+    return windows
+
+
+# ----------------------------------------------------------------------------------------------------
+# Janelas antigas do Open3D (opção --open3d)
 # ----------------------------------------------------------------------------------------------------
 def box_lineset(T, length, width, height, color):
     """LineSet com as 12 arestas de uma caixa com pose T."""
@@ -1068,8 +1059,8 @@ def main():
                         help="método usado no result.json: otimização (opt) ou bounding box (bbox)")
     parser.add_argument("--no_color", action="store_true", help="não usar a cor na otimização")
     parser.add_argument("--visualize", action="store_true",
-                        help="janelas: bounding box | otimização (2 subplots) e evolução da otimização em 3D")
-    parser.add_argument("--open3d", action="store_true", help="janelas 3D do Open3D (segmentação, evolução, final)")
+                        help="janelas 3D: bounding box, otimização e evolução da otimização (animação)")
+    parser.add_argument("--open3d", action="store_true", help="janelas antigas do Open3D (segmentação, evolução, final)")
     args = parser.parse_args()
 
     folder = Path(args.scene) / OUTPUT_FOLDER
@@ -1087,7 +1078,9 @@ def main():
     gt = load_ground_truth(r1["scene_folder"])
     gt_params = gt_params_in_table(gt, table.T_camera0_table) if gt else None
     if args.visualize:
-        show_figures(make_figures(figure_data(r2, r3, gt_params)))
+        # a nuvem agregada (só para desenhar a cena à volta das caixas)
+        r2["cloud"], _ = aggregate(load_scene(r1["scene_folder"]), r1["T_cams"], r1["registered"])
+        show_windows(make_windows(figure_data(r1, r2, r3, gt_params)))
     if args.open3d:
         seg = r2["seg"]
         show_segmentation(seg, r3["box_labels"])

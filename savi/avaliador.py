@@ -9,18 +9,20 @@ COMO CORRER
     python savi/avaliador.py --evaluate_scenes scenes_offline/level_* scenes_offline/stack_*
     python savi/avaliador.py --evaluate_scenes scenes_offline/level_* --gt_registration
 
-Precisa do ground_truth.json da cena (as cenas do dia da apresentação não o têm). O run_test.py chama-o
-depois das 4 partes de cada cena.
---evaluate_scenes corre as 4 partes em várias cenas (o n.º de caixas vem do config.json) e escreve as
+O número REAL de caixas só é pedido aqui (--num_boxes, ou no terminal): as 4 partes não o usam (a
+Parte 2 estima-o) e o avaliador compara-o com o número de caixas encontradas. Os erros precisam do
+ground_truth.json da cena (as cenas do dia da apresentação não o têm). O run_test.py chama-o depois das
+4 partes de cada cena.
+--evaluate_scenes corre as 4 partes em várias cenas (o n.º real de caixas vem do ground truth) e escreve as
 tabelas em results_offline/results.md; com --gt_registration usa as poses verdadeiras das câmaras
 (avalia só a segmentação e o ajuste).
 
 Ordem das partes (o run_test.py corre-as todas, cena a cena):
     parte1_registo.py      -> <cena>/partes/registo.json   (pose de cada câmara)
     extra_fotometria.py    -> <cena>/partes/fotometria.json (ganho e desvio de cada imagem)
-    parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (precisa do n.º de caixas)
+    parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (estima o n.º de caixas)
     parte3_ajuste.py       -> result.json e <cena>/partes/ajuste.npz
-    avaliador.py           -> erros em relação ao ground truth (só nas cenas que o têm)
+    avaliador.py           -> pede o n.º real de caixas e compara com o ground truth (se a cena o tiver)
 
 =====================================================================================================
 ORGANIZAÇÃO DESTE FICHEIRO
@@ -36,7 +38,6 @@ ORGANIZAÇÃO DESTE FICHEIRO
 
 import argparse
 import glob
-import json
 from pathlib import Path
 
 import cv2                                   # OpenCV: interseção de retângulos (IoU 3D)
@@ -45,9 +46,12 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment   # emparelhar caixas / conjuntos com o ground truth
 
 from extra_fotometria import run_photometry
-from parte1_registo import (
-    OUTPUT_FOLDER, aggregate, boxes_to_camera0, load_ground_truth, load_registration, load_scene,
-    rotation_angle_deg, run_registration, transform_points, wrap_angle, yaw_of,
+from comum import (  # geometria e leitura da cena (comuns a todas as partes)
+    boxes_to_camera0, load_ground_truth, load_scene, OUTPUT_FOLDER, rotation_angle_deg, transform_points,
+    wrap_angle, yaw_of,
+)
+from parte1_registo import (  # funções da Parte 1 usadas aqui
+    aggregate, load_registration, run_registration,
 )
 from parte2_segmentacao import load_objects, load_segmentation, run_segmentation
 from parte3_ajuste import gt_params_in_table, load_fit, run_fit, save_evolution, save_top_view
@@ -210,6 +214,27 @@ def full_cloud_points(r):
     return np.asarray(cloud.points)
 
 
+def ask_num_boxes(name=None):
+    """Pergunta no terminal o número REAL de caixas da cena. Só o avaliador o pede: as 4 partes não o
+    usam (a Parte 2 estima-o); aqui serve para comparar com o número de caixas encontradas."""
+    while True:
+        answer = input(f"Número real de caixas{f' da cena {name!r}' if name else ''}: ").strip()
+        if answer.isdigit() and int(answer) > 0:
+            return int(answer)
+        print("  escreve um número inteiro positivo")
+
+
+def found_boxes(r):
+    """Número de caixas que a segmentação encontrou (estimado na Parte 2)."""
+    return int(sum(r["seg"].boxes_per_cluster.values()))
+
+
+def print_box_count(found, real):
+    """Compara o número de caixas encontradas (Parte 2) com o número real (dado ao avaliador)."""
+    verdict = "certo" if found == real else (f"{real - found} a menos" if found < real else f"{found - real} a mais")
+    print(f"\nNúmero de caixas: encontradas {found}, reais {real} ({verdict})")
+
+
 def print_evaluation(r):
     """Mostra no terminal as tabelas de erros de uma cena (r = resultado de run())."""
     gt = r["ground_truth"]
@@ -247,11 +272,11 @@ def fmt(v, d=1):
     return "-" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:.{d}f}"
 
 
-def run_all(scene_folder, num_boxes, gt_registration=False, use_color=True, verbose=True):
+def run_all(scene_folder, gt_registration=False, use_color=True, verbose=True):
     """Corre as 4 partes numa cena, uma a seguir à outra, e junta os resultados num só dicionário."""
     r1 = run_registration(scene_folder, gt_registration=gt_registration, verbose=verbose)   # Parte 1
     rx = run_photometry(r1, verbose=verbose)                                                # extra
-    r2 = run_segmentation(r1, num_boxes, use_color=use_color, verbose=verbose)              # Parte 2
+    r2 = run_segmentation(r1, use_color=use_color, verbose=verbose)                         # Parte 2
     r3 = run_fit(r1, r2, use_color=use_color, verbose=verbose)                              # Parte 3
     r = {**r1, **rx, **r2, **r3}
     r["ground_truth"] = load_ground_truth(r1["scene_folder"])
@@ -261,8 +286,8 @@ def run_all(scene_folder, num_boxes, gt_registration=False, use_color=True, verb
 def evaluate_scenes(patterns, gt_registration=False, use_color=True, output=None):
     """Corre VÁRIAS cenas com ground truth e escreve as tabelas de erros dos dois métodos (para o Read_me).
 
-    patterns: pastas das cenas (aceita wildcards, por exemplo scenes_offline/level_*). O número de
-    caixas é lido do config.json da cena, o que é permitido porque isto só serve para avaliar.
+    patterns: pastas das cenas (aceita wildcards, por exemplo scenes_offline/level_*). As partes estimam
+    o número de caixas; o número real vem do ground_truth.json (só para comparar).
     gt_registration=True usa as poses verdadeiras das câmaras (avalia só a segmentação e o ajuste).
     Escreve <output>/results.md (tabelas em Markdown) e duas figuras por cena. As cenas são
     processadas uma de cada vez.
@@ -277,15 +302,15 @@ def evaluate_scenes(patterns, gt_registration=False, use_color=True, output=None
 
     reg_lines = ["| cena | erro transl. médio (mm) | máx (mm) | erro rot. médio (°) | máx (°) | só encadeamento: transl. máx (mm) |",
                  "|---|---|---|---|---|---|"]
-    seg_lines = ["| cena | conjuntos / caixas | precisão média | recall médio |", "|---|---|---|---|"]
+    seg_lines = ["| cena | caixas encontradas / reais | conjuntos | precisão média | recall médio |",
+                 "|---|---|---|---|---|"]
     box_lines = ["| cena | caixa | método | pos (mm) | yaw (°) | dL (mm) | dW (mm) | dH (mm) | dz (mm) | IoU |",
                  "|---|---|---|---|---|---|---|---|---|---|"]
     summary = ["| cena | IoU médio bounding box | IoU médio otimização |", "|---|---|---|"]
 
     for folder in folders:
-        num_boxes = len(json.loads(Path(folder, "config.json").read_text(encoding="utf-8"))["boxes"])
         name = Path(folder).name
-        r = run_all(folder, num_boxes, gt_registration=gt_registration, use_color=use_color)   # 4 partes
+        r = run_all(folder, gt_registration=gt_registration, use_color=use_color)   # 4 partes
         gt = r["ground_truth"]
 
         if not gt_registration:
@@ -297,7 +322,8 @@ def evaluate_scenes(patterns, gt_registration=False, use_color=True, output=None
 
         n_sets, n_gt, seg_rows = evaluate_segmentation(
             r["seg"].points, r["box_labels"], r["table"].T_camera0_table, full_cloud_points(r), gt)
-        seg_lines.append(f"| {name} | {n_sets} / {n_gt} | {np.mean([s['precision'] for s in seg_rows]):.3f} | "
+        seg_lines.append(f"| {name} | {found_boxes(r)} / {n_gt} | {n_sets} | "
+                         f"{np.mean([s['precision'] for s in seg_rows]):.3f} | "
                          f"{np.mean([s['recall'] for s in seg_rows]):.3f} |")
 
         ious = {}
@@ -344,6 +370,7 @@ def main():
     """Lê os argumentos da linha de comandos e mostra os erros de uma cena (ou de várias)."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scene", help="pasta de uma cena já corrida (com <cena>/partes/)")
+    parser.add_argument("--num_boxes", type=int, help="com --scene: número real de caixas (se faltar, é perguntado)")
     parser.add_argument("--evaluate_scenes", nargs="+", metavar="CENA",
                         help="corre as 4 partes em várias cenas com ground truth (aceita wildcards) e escreve as tabelas")
     parser.add_argument("--gt_registration", action="store_true",
@@ -359,6 +386,8 @@ def main():
     if args.scene is None:
         parser.error("indica --scene (uma cena já corrida) ou --evaluate_scenes")
     r = load_scene_results(args.scene)
+    # O número real de caixas só é pedido aqui, no avaliador (as 4 partes estimam-no)
+    print_box_count(found_boxes(r), args.num_boxes if args.num_boxes else ask_num_boxes(Path(args.scene).name))
     if r["ground_truth"] is None:
         print("A cena não tem ground_truth.json: não há nada a comparar.")
         return

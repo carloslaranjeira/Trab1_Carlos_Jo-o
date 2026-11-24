@@ -5,15 +5,15 @@
 COMO CORRER
 =====================================================================================================
     (a partir da pasta principal do trabalho, DEPOIS da Parte 1: python savi/parte1_registo.py --scene ...)
-    python savi/parte2_segmentacao.py --scene test/cena_1 --num_boxes 2
-    python savi/parte2_segmentacao.py --scene test/cena_1                  # pergunta o n.º de caixas
-    python savi/parte2_segmentacao.py --scene test/cena_1 --num_boxes 2 --visualize   # janela (2 subplots)
+    python savi/parte2_segmentacao.py --scene test/cena_1
+    python savi/parte2_segmentacao.py --scene test/cena_1 --visualize   # janelas 3D
 
 A segmentação é feita sobre a nuvem AGREGADA (as nuvens são juntadas com as poses do registo.json):
     1. detetar o plano da mesa com RANSAC e definir o referencial da mesa;
     2. retirar a mesa e o fundo: ficam os pontos acima da mesa e dentro dos seus limites;
-    3. separar os objetos com clustering euclidiano e decidir quantas caixas tem cada cluster
-       (é aqui que entra o número de caixas);
+    3. separar os objetos com clustering euclidiano e ESTIMAR quantas caixas tem cada cluster (pelos
+       topos a alturas diferentes e pelas cores): o número de caixas NÃO é dado, só o avaliador o
+       conhece (extra "número de caixas desconhecido");
     4. usar a cor para separar caixas em contacto (Nível 4).
 Grava em <cena>/partes/: objetos.ply (nuvem de pontos SÓ DOS OBJETOS, com cor, no referencial da mesa),
 mesa.json (pose e dimensões da mesa) e segmentacao.npz (cluster e grupo de cor de cada ponto).
@@ -21,9 +21,9 @@ mesa.json (pose e dimensões da mesa) e segmentacao.npz (cluster e grupo de cor 
 Ordem das partes (o run_test.py corre-as todas, cena a cena):
     parte1_registo.py      -> <cena>/partes/registo.json   (pose de cada câmara)
     extra_fotometria.py    -> <cena>/partes/fotometria.json (ganho e desvio de cada imagem)
-    parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (precisa do n.º de caixas)
+    parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (estima o n.º de caixas)
     parte3_ajuste.py       -> result.json e <cena>/partes/ajuste.npz
-    avaliador.py           -> erros em relação ao ground truth (só nas cenas que o têm)
+    avaliador.py           -> pede o n.º real de caixas e compara com o ground truth (se a cena o tiver)
 
 =====================================================================================================
 ORGANIZAÇÃO DESTE FICHEIRO
@@ -31,9 +31,9 @@ ORGANIZAÇÃO DESTE FICHEIRO
     1. Mesa e objetos     plano da mesa (RANSAC), referencial da mesa, retirar a mesa e o fundo
     2. Separar as caixas  clusters euclidianos (DBSCAN), n.º de caixas por cluster e cor
     3. Saída              gravar e ler objetos.ply, mesa.json e segmentacao.npz
-    4. Visualização       janela com 2 subplots: objetos isolados do resto da nuvem | conjuntos da segmentação
+    4. Visualização       janelas 3D: objetos isolados do resto da nuvem e nuvem só das caixas
     5. Programa principal run_segmentation() e main()
-(As convenções - T_A_B, referencial da mesa - estão na Parte 1, parte1_registo.py.)
+(As convenções - T_A_B, referencial da mesa - estão em comum.py.)
 """
 
 import argparse
@@ -43,14 +43,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cv2                                   # OpenCV: k-means, retângulos
-import matplotlib.pyplot as plt              # janela com subplots (secção 4)
 import numpy as np
 import open3d as o3d                         # nuvens de pontos: RANSAC de planos, DBSCAN
 from scipy.spatial import cKDTree            # procura rápida do vizinho mais próximo
 
+from comum import (  # geometria e leitura da cena (comuns a todas as partes)
+    box_corners_2d, load_scene, make_T, OUTPUT_FOLDER, transform_points,
+)
 from parte1_registo import (  # funções da Parte 1 usadas aqui
-    DISPLAY_POINTS, OUTPUT_FOLDER, aggregate, box_corners_2d, link_views, load_registration, load_scene,
-    make_T, sample_indices, scatter_3d, set_equal_3d, show_figures, transform_points,
+    aggregate, load_registration,
+)
+from visualizacao import (  # janelas 3D (comuns a todas as partes)
+    camera_view, close_view, colors_uint8, data_view, frame_item, lines_item, points_item, show_windows,
 )
 
 
@@ -324,8 +328,8 @@ def extract_objects(cloud, table, voxel=OBJECT_VOXEL):
 # 2. PARTE 2 - SEGMENTAÇÃO (2.ª etapa): SEPARAR AS CAIXAS
 # #####################################################################################################
 # Sobre os pontos dos objetos (referencial da mesa; a mesa e o fundo já saíram):
-#   3. separar os objetos com clustering euclidiano (DBSCAN) e decidir quantas caixas tem cada cluster
-#      (é aqui que entra o número de caixas);
+#   3. separar os objetos com clustering euclidiano (DBSCAN) e estimar quantas caixas tem cada cluster
+#      (o número de caixas não é dado: topos a alturas diferentes e cores);
 #   4. dentro de um cluster com várias caixas, tentar separá-las pela cor (Nível 4).
 # A divisão final de cada conjunto em caixas é feita na estimativa inicial da Parte 3 (initial_boxes).
 @dataclass
@@ -441,21 +445,44 @@ def count_top_levels(points, min_points=30):
     return 1 + int(np.sum(np.diff(heights) > 0.015))
 
 
-def allocate_boxes(points, clusters, num_boxes):
-    """Decide quantas caixas há em cada cluster (o número total de caixas é dado).
+def estimate_boxes(points, colors, clusters, use_color=True):
+    """ESTIMA quantas caixas há em cada cluster (o número de caixas não é dado).
 
-    - Tantos clusters como caixas: uma caixa por cluster (Níveis 1 e 2);
-    - Menos clusters do que caixas: algumas caixas tocam-se e formam um só cluster (Níveis 3 e 4,
-      e caixas empilhadas). As caixas extra vão primeiro para os clusters com mais TOPOS do que
-      caixas (uma pilha tem pouca área vista de cima, mas tem vários topos). As que sobram vão,
-      uma a uma, para o cluster com maior área por caixa;
-    - Mais clusters do que caixas: ficam os maiores (os outros são ruído ou outros objetos).
+    Em cada cluster euclidiano, o número de caixas é o maior destes dois:
+    - o número de TOPOS a alturas diferentes (count_top_levels): caixas empilhadas, ou encostadas
+      com alturas diferentes (Nível 3);
+    - o número de CORES diferentes (count_colors): caixas encostadas de cores diferentes (Nível 4).
+    Limitação: caixas da mesma cor e da mesma altura encostadas umas às outras ficam contadas como
+    uma só (vistas de cima são uma única superfície plana; com caixas iguais e alinhadas é mesmo
+    impossível saber quantas são, como diz o enunciado no Nível 3).
+    Todos os clusters contam (os pontos soltos já ficaram de fora no euclidean_clusters).
     Saída: dicionário cluster -> número de caixas.
     """
-    labels = list(range(clusters.max() + 1))[:num_boxes]
+    counts = {}
+    for k in range(clusters.max() + 1):
+        mine = clusters == k
+        n = count_top_levels(points[mine])
+        if use_color:
+            n = max(n, count_colors(colors[mine]))
+        counts[k] = n
+    return counts
+
+
+def allocate_boxes(points, groups, num_boxes):
+    """Reparte num_boxes caixas pelos grupos de pontos (usado pela Parte 3 dentro de um cluster:
+    quantas das caixas estimadas desse cluster ficam em cada grupo de cor).
+
+    - Tantos grupos como caixas: uma caixa por grupo;
+    - Menos grupos do que caixas: há caixas da mesma cor. As caixas extra vão primeiro para os grupos
+      com mais TOPOS do que caixas (uma pilha tem pouca área vista de cima, mas tem vários topos). As
+      que sobram vão, uma a uma, para o grupo com maior área por caixa;
+    - Mais grupos do que caixas: ficam os maiores.
+    Saída: dicionário grupo -> número de caixas.
+    """
+    labels = list(range(groups.max() + 1))[:num_boxes]
     counts = {k: 1 for k in labels}
-    areas = {k: footprint_area(points[clusters == k, :2]) for k in labels}
-    tops = {k: count_top_levels(points[clusters == k]) for k in labels} if num_boxes > len(labels) else {}
+    areas = {k: footprint_area(points[groups == k, :2]) for k in labels}
+    tops = {k: count_top_levels(points[groups == k]) for k in labels} if num_boxes > len(labels) else {}
     for _ in range(num_boxes - len(labels)):
         missing = [c for c in labels if tops[c] > counts[c]]
         if missing:
@@ -464,6 +491,20 @@ def allocate_boxes(points, clusters, num_boxes):
             k = max(labels, key=lambda c: areas[c] / counts[c])
         counts[k] += 1
     return counts
+
+
+def count_colors(colors, max_k=4, min_fraction=0.10):
+    """Número de cores diferentes num cluster (1 a max_k): o maior k em que color_split separa as cores.
+
+    Para CONTAR caixas, cada cor tem de ter pelo menos 10% dos pontos (mais exigente do que os 5% de
+    color_split): numa caixa sozinha, um pequeno grupo de pontos de outra tonalidade (reflexos, bordas
+    misturadas com o fundo) não pode passar a contar como mais uma caixa.
+    """
+    for k in range(max_k, 1, -1):
+        labels = color_split(colors, k)
+        if labels is not None and np.bincount(labels, minlength=k).min() / len(labels) >= min_fraction:
+            return k
+    return 1
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -506,17 +547,17 @@ def color_split(colors, k, min_separation=4.0):
     return labels
 
 
-def segment(points, colors, num_boxes, use_color=True, verbose=True):
-    """Segmentação das caixas: clusters -> caixas por cluster -> cor.
+def segment(points, colors, use_color=True, verbose=True):
+    """Segmentação das caixas: clusters -> caixas por cluster (estimadas) -> cor.
 
     Entrada: os pontos das caixas (objetos.ply, no referencial da mesa, já sem a
-    mesa e o fundo), as suas cores e o número de caixas.
+    mesa e o fundo) e as suas cores. O número de caixas NÃO é dado: é estimado (estimate_boxes).
     Saída: objeto Segmentation (tudo no referencial da mesa).
     """
     clusters = euclidean_clusters(points)
-    counts = allocate_boxes(points, clusters, num_boxes)
+    counts = estimate_boxes(points, colors, clusters, use_color=use_color)
 
-    # Pontos de clusters que não foram usados (ruído) ficam de fora
+    # Pontos soltos (fora dos clusters) ficam de fora
     keep = np.isin(clusters, list(counts.keys()))
     points, colors, clusters = points[keep], colors[keep], clusters[keep]
 
@@ -534,7 +575,7 @@ def segment(points, colors, num_boxes, use_color=True, verbose=True):
                     for k, n in counts.items()}
     if verbose:
         print(f"  {len(points)} pontos de objetos, {len(counts)} clusters euclidianos; "
-              f"caixas por cluster: {counts}; "
+              f"caixas estimadas por cluster: {counts} ({sum(counts.values())} caixas); "
               f"clusters separados por cor: {[k for k, g in color_groups.items() if g is not None]}")
     return Segmentation(points, colors, clusters, counts, color_groups)
 
@@ -596,76 +637,55 @@ def load_segmentation(folder):
 # #####################################################################################################
 # 4. VISUALIZAÇÃO
 # #####################################################################################################
-SET_COLORS = plt.cm.tab10(np.arange(10))[:, :3]      # uma cor por conjunto da segmentação
-
-
-def segment_sets(seg):
-    """Conjunto de cada ponto: um por cluster euclidiano ou, se a cor separou o cluster, um por grupo de cor."""
-    sets = np.full(len(seg.points), -1)
-    next_id = 0
-    for k in sorted(seg.boxes_per_cluster):
-        mask = seg.clusters == k
-        groups = seg.color_groups.get(k)
-        if groups is None:
-            sets[mask] = next_id
-            next_id += 1
-        else:
-            sets[mask] = next_id + groups
-            next_id += int(groups.max()) + 1
-    return sets
-
-
 def table_outline(table):
     """Contorno do tampo (referencial da mesa, z = 0), para desenhar."""
     c = box_corners_2d(0.0, 0.0, 0.0, table.length, table.width)
-    c = np.vstack([c, c[:1]])
-    return np.column_stack([c, np.zeros(len(c))])
+    return np.column_stack([c, np.zeros(len(c))]), [[0, 1], [1, 2], [2, 3], [3, 0]]
 
 
-def figure_data(r2):
-    """Dados da janela da Parte 2 (r2 = resultado de run_segmentation): uma amostra da nuvem agregada à
-    volta da mesa, os pontos dos objetos com a sua cor e os pontos da segmentação com o conjunto de cada
-    um (tudo no referencial da mesa)."""
-    table, seg = r2["table"], r2["seg"]
+def table_view(T_camera0_camera0, table):
+    """Ponto de vista das janelas no referencial da mesa (z para cima, como no simulador): atrás da câmara
+    000, a olhar para o centro da mesa."""
+    T_table_camera0 = np.linalg.inv(table.T_camera0_table)
+    return camera_view(T_table_camera0 @ T_camera0_camera0, np.zeros(3), np.array([0.0, 0.0, 1.0]))
+
+
+def figure_data(r1, r2):
+    """Dados das janelas da Parte 2 (r1 = Parte 1, r2 = resultado de run_segmentation), no referencial da
+    mesa: a nuvem agregada inteira (com a cor real e marcando os pontos que são dos objetos) e os pontos
+    dos objetos gravados em objetos.ply."""
+    table = r2["table"]
     cloud = transform_points(np.linalg.inv(table.T_camera0_table), np.asarray(r2["cloud"].points))
-    near = np.nonzero((np.abs(cloud[:, 0]) < table.length / 2 + 0.3) & (np.abs(cloud[:, 1]) < table.width / 2 + 0.3)
-                      & (cloud[:, 2] > -0.2) & (cloud[:, 2] < 0.7))[0]
-    near = near[sample_indices(len(near), DISPLAY_POINTS)]
-    obj = sample_indices(len(r2["object_points"]), DISPLAY_POINTS)
-    s = sample_indices(len(seg.points), DISPLAY_POINTS)
-    return {"parte": "parte2_segmentacao", "cena": Path(r2["scene_folder"]).name, "background": cloud[near],
-            "objects": r2["object_points"][obj], "object_colors": r2["object_colors"][obj],
-            "seg_points": seg.points[s], "seg_sets": segment_sets(seg)[s], "table_outline": table_outline(table),
-            "num_boxes": r2["num_boxes"],
-            "boxes_per_cluster": np.array([[k, n] for k, n in sorted(seg.boxes_per_cluster.items())]).reshape(-1, 2)}
+    # pontos da nuvem agregada que são dos objetos (a nuvem dos objetos tem menos pontos: voxel)
+    distance, _ = cKDTree(r2["object_points"]).query(cloud, k=1, distance_upper_bound=2 * OBJECT_VOXEL)
+    view = table_view(r1["T_cams"][0], table)
+    corners, _ = table_outline(table)
+    return {"parte": "parte2_segmentacao", "cena": Path(r2["scene_folder"]).name,
+            "points": cloud.astype(np.float32), "colors": colors_uint8(r2["cloud"].colors),
+            "is_object": np.isfinite(distance), "objects": r2["object_points"].astype(np.float32),
+            "object_colors": colors_uint8(r2["object_colors"]), "table_corners": corners,
+            "num_boxes": r2["num_boxes"], **{f"view_{k}": v for k, v in view.items()}}
 
 
-def make_figures(data):
-    """Janela da Parte 2. Esquerda, como a figura do enunciado: os pontos dos objetos, com a sua cor,
-    isolados do resto da nuvem agregada (a cinzento). Direita: os pontos da segmentação em 3D, com uma
-    cor por conjunto (cluster euclidiano ou, se a cor os separou, grupo de cor)."""
-    fig = plt.figure(figsize=(14, 7))
-    fig.suptitle(f"Parte 2 - segmentação ({data['cena']}, {int(data['num_boxes'])} caixas)")
-    axes = [fig.add_subplot(1, 2, k, projection="3d") for k in (1, 2)]
-    scatter_3d(axes[0], data["background"], "0.72", 0.3)
-    scatter_3d(axes[0], data["objects"], data["object_colors"], 1.5)
-    axes[0].set_title("pontos dos objetos isolados (resto da nuvem agregada a cinzento)")
-    sets = data["seg_sets"]
-    scatter_3d(axes[1], data["seg_points"], SET_COLORS[sets % 10], 1.5)
-    per_cluster = ", ".join(f"cluster {k}: {n}" for k, n in data["boxes_per_cluster"])
-    axes[1].set_title(f"{len(set(sets[sets >= 0]))} conjuntos (cluster euclidiano + cor)\n"
-                      f"caixas por cluster - {per_cluster}")
-    axes[0].plot(*data["table_outline"].T, color="k", lw=1)     # contorno do tampo
-    for ax in axes:
-        ax.view_init(elev=35, azim=-60)
-        ax.set_xlabel("x mesa (m)")
-        ax.set_ylabel("y mesa (m)")
-        ax.set_zlabel("z mesa (m)")
-    set_equal_3d(axes[0], np.vstack([data["background"], data["table_outline"]]))
-    set_equal_3d(axes[1], data["seg_points"])
-    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.03, top=0.9, wspace=0.02)
-    link_views(fig, axes)
-    return [{"name": "", "fig": fig}]
+def make_windows(data):
+    """Janelas da Parte 2:
+    1. como a figura do enunciado: na nuvem agregada, os pontos dos objetos com a sua cor e o resto
+       (mesa, chão, sala) a cinzento;
+    2. como antes (show_boxes_cloud): a nuvem de pontos só das caixas, com os eixos do referencial da mesa;
+    3. a nuvem de pontos só das caixas (todas juntas, sem cenário) em 3D, vista do lado da câmara 000."""
+    colors = np.full((len(data["points"]), 3), 200, np.uint8)            # resto da cena a cinzento
+    colors[data["is_object"]] = data["colors"][data["is_object"]]
+    outline = lines_item(data["table_corners"], [[0, 1], [1, 2], [2, 3], [3, 0]], (0.2, 0.2, 0.2), 2.0)
+    title = f"Parte 2 - {data['cena']}"
+    return [{"name": "_objetos", "title": f"{title}: pontos dos objetos isolados (resto da cena a cinzento)",
+             "items": [points_item(data["points"], colors), outline], "view": data_view(data)},
+            {"name": "_nuvem_caixas",
+             "title": f"{title}: nuvem de pontos só das caixas ({int(data['num_boxes'])} caixas, referencial da mesa)",
+             "items": [points_item(data["objects"], data["object_colors"], 3.0), frame_item(0.1)]},
+            {"name": "_nuvem_caixas_3d",
+             "title": f"{title}: nuvem de pontos só das caixas em 3D ({int(data['num_boxes'])} caixas, sem cenário)",
+             "items": [points_item(data["objects"], data["object_colors"], 3.0)],
+             "view": close_view(data_view(data), data["objects"])}]
 
 
 # Janela 3D do Open3D (opção --open3d)
@@ -680,20 +700,11 @@ def show_boxes_cloud(points, colors):
 # #####################################################################################################
 # 5. PROGRAMA PRINCIPAL
 # #####################################################################################################
-def ask_num_boxes():
-    """Pergunta no terminal o número de caixas da cena."""
-    while True:
-        answer = input("Número de caixas na mesa: ").strip()
-        if answer.isdigit() and int(answer) > 0:
-            return int(answer)
-        print("  escreve um número inteiro positivo")
+def run_segmentation(r1, cloud=None, use_color=True, verbose=True):
+    """Parte 2 numa cena: mesa, pontos dos objetos e separação das caixas (o número de caixas é estimado).
 
-
-def run_segmentation(r1, num_boxes, cloud=None, use_color=True, verbose=True):
-    """Parte 2 numa cena: mesa, pontos dos objetos e separação das caixas.
-
-    Entrada: o resultado da Parte 1 (run_registration ou load_registration), o número de caixas e, se
-    já existir, a nuvem agregada (senão as nuvens voltam a ser juntadas com as poses do registo).
+    Entrada: o resultado da Parte 1 (run_registration ou load_registration) e, se já existir, a nuvem
+    agregada (senão as nuvens voltam a ser juntadas com as poses do registo).
     Grava objetos.ply, mesa.json e segmentacao.npz na pasta das partes.
     Saída: dicionário com a mesa, os pontos dos objetos, a segmentação e a nuvem agregada.
     """
@@ -715,10 +726,11 @@ def run_segmentation(r1, num_boxes, cloud=None, use_color=True, verbose=True):
     save_objects(folder, table, points, colors)
     table, points, colors = load_objects(folder)
     if verbose:
-        print(f"  {len(points)} pontos dos objetos gravados em {folder / OBJECTS_CLOUD}; {num_boxes} caixas")
+        print(f"  {len(points)} pontos dos objetos gravados em {folder / OBJECTS_CLOUD}")
 
-    # 3. e 4. Separar as caixas (clusters e cor)
-    seg = segment(points, colors, num_boxes, use_color=use_color, verbose=verbose)
+    # 3. e 4. Separar as caixas (clusters e cor); o número de caixas é o que a segmentação encontrou
+    seg = segment(points, colors, use_color=use_color, verbose=verbose)
+    num_boxes = sum(seg.boxes_per_cluster.values())
     save_segmentation(folder, seg)
     if verbose:
         print(f"  segmentação gravada em {folder / SEGMENTATION_FILE} ({time.time() - t0:.1f} s)")
@@ -730,19 +742,17 @@ def main():
     """Lê os argumentos da linha de comandos e corre a Parte 2."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scene", required=True, help="pasta da cena (já com a Parte 1 feita)")
-    parser.add_argument("--num_boxes", type=int, help="número de caixas na mesa (se faltar, é perguntado)")
     parser.add_argument("--no_color", action="store_true", help="não usar a cor para separar as caixas")
-    parser.add_argument("--visualize", action="store_true", help="janela com a segmentação (2 subplots)")
-    parser.add_argument("--open3d", action="store_true", help="janela 3D do Open3D com a nuvem dos objetos")
+    parser.add_argument("--visualize", action="store_true", help="janelas 3D: objetos isolados e nuvem só das caixas")
+    parser.add_argument("--open3d", action="store_true", help="janela antiga do Open3D com a nuvem dos objetos")
     args = parser.parse_args()
 
     r1 = load_registration(Path(args.scene) / OUTPUT_FOLDER)
-    num_boxes = args.num_boxes if args.num_boxes else ask_num_boxes()
-    r2 = run_segmentation(r1, num_boxes, use_color=not args.no_color)
+    r2 = run_segmentation(r1, use_color=not args.no_color)
     print(f"\nSegmentação gravada em {r1['folder']}. A seguir:\n"
           f"    python savi/parte3_ajuste.py --scene {args.scene}")
     if args.visualize:
-        show_figures(make_figures(figure_data(r2)))
+        show_windows(make_windows(figure_data(r1, r2)))
     if args.open3d:
         show_boxes_cloud(r2["object_points"], r2["object_colors"])
 

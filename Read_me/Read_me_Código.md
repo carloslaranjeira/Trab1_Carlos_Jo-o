@@ -14,23 +14,24 @@ pip install -r Read_me/requirements.txt
 python simulator/savi_box_simulator.py --batch simulator/configs/level_*.json simulator/configs/stack_*.json --output scenes_offline
 python savi/parte1_registo.py --scene scenes_offline/level_4 --visualize                     # Parte 1: registo
 python savi/extra_fotometria.py --scene scenes_offline/level_4 --visualize                   # extra: fotometria
-python savi/parte2_segmentacao.py --scene scenes_offline/level_4 --num_boxes 3 --visualize   # Parte 2: segmentação
+python savi/parte2_segmentacao.py --scene scenes_offline/level_4 --visualize                 # Parte 2: segmentação
 python savi/parte3_ajuste.py --scene scenes_offline/level_4 --visualize                      # Parte 3: result.json
-python savi/avaliador.py --scene scenes_offline/level_4                                      # erros (ground truth)
+python savi/avaliador.py --scene scenes_offline/level_4 --num_boxes 3                        # n.º de caixas e erros
 python savi/avaliador.py --evaluate_scenes scenes_offline/level_* scenes_offline/stack_*     # tabelas em results_offline/
 python savi/avaliador.py --evaluate_scenes scenes_offline/level_* --gt_registration          # isola segmentação + ajuste
 python run_test.py --download <link do GitHub>                                               # dia do teste: todas as cenas
 ```
 
 Cada parte lê o que a anterior gravou em `<cena>/partes/`, por isso têm de ser corridas por esta ordem.
-Sem `--num_boxes`, a Parte 2 pergunta o número de caixas no terminal. `--visualize` abre a janela da parte (com
-subplots); `--open3d` abre as janelas 3D do Open3D.
+As 4 partes **não usam o número de caixas**: a Parte 2 estima-o e só o avaliador pede o número real (`--num_boxes`, ou no terminal), para o comparar. `--visualize` abre uma janela 3D (Open3D)
+com as vistas da parte, como a figura da nuvem agregada do enunciado: as setas ← e → mudam de vista e o título
+diz qual é; `--open3d` abre as janelas antigas.
 
 Pastas:
 
 | pasta | o que tem |
 |---|---|
-| `savi/` | o código: um ficheiro por parte (`parte1_registo.py`, `parte2_segmentacao.py`, `parte3_ajuste.py`), o extra (`extra_fotometria.py`) e o `avaliador.py` |
+| `savi/` | o código: um ficheiro por parte (`parte1_registo.py`, `parte2_segmentacao.py`, `parte3_ajuste.py`), o extra (`extra_fotometria.py`), o `avaliador.py` e o código comum a todas as partes (`comum.py`, `visualizacao.py`) |
 | `simulator/` | simulador do professor e configurações das cenas (`configs/`, incluindo `stack_*.json`) |
 | `scenes_offline/` | cenas de desenvolvimento geradas pelo simulador (com `ground_truth.json`; não vão para o git) |
 | `results_offline/` | tabelas (`results.md`) e figuras da opção `--evaluate_scenes` |
@@ -44,18 +45,17 @@ Opções de cada parte (todas têm `--scene`, a pasta da cena):
 |---|---|---|
 | `parte1_registo.py` | `--no_loop_closure` | registo só por encadeamento, sem fecho de ciclo |
 | | `--gt_registration` | usa as poses verdadeiras das câmaras (só para avaliar o resto do sistema) |
-| | `--visualize` | janela: nuvem agregada com a cor dos píxeis \| com uma cor por câmara |
-| | `--open3d` | janelas 3D do Open3D (com ground truth: nuvem estimada sobre a verdadeira) |
-| `extra_fotometria.py` | `--visualize` | janela: nuvem agregada sem \| com correção da exposição, e s e b de cada imagem |
-| `parte2_segmentacao.py` | `--num_boxes` | número de caixas na mesa (se faltar, é perguntado no terminal) |
-| | `--no_color` | não usa a cor para separar as caixas |
-| | `--visualize` | janela: objetos isolados do resto da nuvem \| conjuntos da segmentação em 3D |
-| | `--open3d` | janela 3D do Open3D com a nuvem dos objetos |
+| | `--visualize` | 2 vistas: nuvem agregada com a cor dos píxeis; com uma cor por câmara |
+| | `--open3d` | janelas antigas do Open3D (com ground truth: nuvem estimada sobre a verdadeira) |
+| `extra_fotometria.py` | `--visualize` | 2 vistas: nuvem agregada sem e com correção da exposição (s e b de cada imagem no título) |
+| `parte2_segmentacao.py` | `--no_color` | não usa a cor para separar as caixas |
+| | `--visualize` | 3 vistas: objetos isolados (resto da cena a cinzento); nuvem só das caixas (como antes, de cima, com os eixos da mesa); nuvem só das caixas em 3D, sem cenário |
+| | `--open3d` | janela antiga do Open3D com a nuvem dos objetos |
 | `parte3_ajuste.py` | `--output` | onde escrever o `result.json` (por omissão: dentro da pasta da cena) |
 | | `--method bbox` | usa a bounding box no `result.json`, em vez da otimização |
 | | `--no_color` | não usa a cor na otimização |
-| | `--visualize` | janelas: bounding box \| otimização (vista de cima) e evolução da otimização em 3D (animação) |
-| | `--open3d` | janelas 3D do Open3D (segmentação, evolução, resultado final) |
+| | `--visualize` | 5 vistas: bounding box vista de cima; otimização vista de cima; bounding box em 3D na cena; otimização em 3D na cena; evolução da otimização em 3D (animação) |
+| | `--open3d` | janelas antigas do Open3D (segmentação, evolução, resultado final) |
 | `avaliador.py` | `--scene` | tabelas de erros de uma cena já corrida (precisa do `ground_truth.json`) |
 | | `--evaluate_scenes CENA...` | corre as 4 partes em várias cenas com ground truth e escreve as tabelas |
 | | `--gt_registration` | com `--evaluate_scenes`: usa as poses verdadeiras (avalia só segmentação e ajuste) |
@@ -73,59 +73,86 @@ o seu resultado em `<cena>/partes/`, que é a entrada da parte seguinte:
 2. **`extra_fotometria.py` — extra.** Estima o ganho s e o desvio b de cada imagem em relação à 000, corrige as
    imagens a cores (`fotometria/NNN.png`) e compara com o campo `photometry` do ground truth. Grava `fotometria.json`.
 3. **`parte2_segmentacao.py` — Parte 2.** Deteta a mesa (RANSAC), retira a mesa e o fundo e separa as caixas
-   (clusters e cor); recebe o **número de caixas**. Grava `objetos.ply` (nuvem **só dos objetos**, com cor, no
+   (clusters e cor); **estima o número de caixas** (em cada cluster, o maior entre o n.º de topos a alturas
+   diferentes e o n.º de cores; caixas da mesma cor e da mesma altura encostadas contam como uma). Grava `objetos.ply` (nuvem **só dos objetos**, com cor, no
    referencial da mesa), `mesa.json` e `segmentacao.npz`.
 4. **`parte3_ajuste.py` — Parte 3.** Estimativa inicial, ajuste por otimização e bounding box. Escreve o
    `result.json` e grava `ajuste.npz`.
-5. **`avaliador.py`** — compara com o ground truth (registo, segmentação e caixas) e corre várias cenas.
+5. **`avaliador.py`** — pede o número real de caixas (o único sítio onde é dado) e compara-o com o número
+   encontrado; compara com o ground truth (registo, segmentação e caixas) e corre várias cenas.
 
 O `run_test.py` (na pasta principal) corre os 4 ficheiros e o avaliador em todas as cenas de `test/` e escreve
-`results_test/<cena>/`. Fase 1 (sem perguntas): Parte 1 e extra em todas as cenas; fase 2: o número de caixas é
-pedido cena a cena e correm a Parte 2, a Parte 3 e o avaliador. As janelas de cada parte abrem logo que a parte
-acaba e **não param o programa** (são desenhadas por um segundo processo): pode ver-se a cena 3 sem fechar as
+`results_test/<cena>/`. As cenas correm **uma de cada vez**: em cada cena correm seguidas a Parte 1, o extra, a Parte 2 e a Parte 3 (sem perguntas), abre a janela 3D (Open3D) dessa cena, com as vistas de todas as partes (setas ← e → para mudar de vista), e por fim o avaliador pede o número real de caixas (se a cena não estiver em `test/num_boxes.json`) e compara; só depois passa à cena seguinte. As janelas **não param o programa** (são desenhadas por um segundo processo): pode ver-se a cena 3 sem fechar as
 janelas das cenas 1 e 2. Com `--sem_janelas` só são gravadas as figuras. Cada função tem um comentário que diz o
 que faz, o que recebe, o que devolve e porque foi feita assim.
 
 | Ficheiro | Secção | Funções principais | Para que serve |
 |---|---|---|---|
-| parte 1 | 0. Geometria | `make_T`, `transform_points`, `kabsch`, `rotation_angle_deg`, `box_signed_distance` | Matrizes 4x4, rotações, distância de um ponto a uma caixa (usadas também pelas outras partes) |
-| parte 1 | 1. Leitura da cena | `load_scene`, `cloud_to_xyz_image`, `boxes_to_camera0`, `write_result` | Ler as imagens e nuvens; ponto 3D de cada pixel; escrever o `result.json` |
-| parte 1 | 2. Registo | `detect_features`, `match_3d_pairs`, `ransac_hypotheses`, `multiscale_icp`, `alignment_score`, `free_space_violation`, `table_hypotheses`, `register_pair`, `register_scene`, `aggregate` | Pose de cada câmara em relação à câmara 000 e nuvem agregada |
-| parte 1 | 3–5. Saída, visualização, principal | `save_registration`, `make_figures`, `run_registration` | Grava `registo.json`; janela com 2 subplots |
-| extra | 1–4 | `exposure_fit`, `exposure_corrected`, `true_exposures`, `correct_images`, `run_photometry` | s e b de cada imagem, imagens corrigidas, comparação com o ground truth |
+| comum | 1. Geometria | `make_T`, `transform_points`, `rotation_angle_deg`, `box_signed_distance` | Matrizes 4x4, rotações, distância de um ponto a uma caixa (usadas por todas as partes) |
+| comum | 2. Leitura da cena | `load_scene`, `cloud_to_xyz_image`, `boxes_to_camera0`, `write_result` | Ler as imagens e nuvens; ponto 3D de cada pixel; escrever o `result.json` |
+| visualizacao | 1–2 | `points_item`, `box_item`, `scene_view`, `SceneWindows`, `show_windows` | Janelas 3D sem parar o programa, uma por cena (usadas por todas as partes) |
+| parte 1 | 1. Pré-processamento | `preprocess`, `preprocess_view` | Downsampling, remoção de outliers e normais, para cada escala do ICP |
+| parte 1 | 2. Estimativa inicial | `detect_features`, `match_3d_pairs`, `ransac_hypotheses` | SIFT + FLANN + teste de Lowe → pares 3D → RANSAC do Open3D |
+| parte 1 | 3. ICP | `multiscale_icp`, `chain_poses` | ICP ponto-a-plano do grosseiro para o fino; encadeamento das poses |
+| parte 1 | 4. Agregação | `aggregate`, `figure_data`, `make_windows` | Nuvem agregada na resolução original e as suas figuras |
+| parte 1 | 5. Extras de robustez | `alignment_score`, `free_space_violation`, `choose_candidate`, `table_hypotheses`, `extra_edges`, `optimize_pose_graph` | Escolher entre hipóteses, hipóteses da mesa, fecho de ciclo e grafo de poses (não fazem parte das 4 subpartes) |
+| parte 1 | 6. Programa principal | `register_pair`, `register_scene`, `save_registration`, `run_registration`, `main` | Junta as subpartes por ordem; grava `registo.json` |
+| extra | 1–4 | `exposure_fit`, `exposure_corrected`, `match_exposure`, `true_exposures`, `correct_images`, `run_photometry` | s e b de cada imagem, imagens corrigidas, comparação com o ground truth |
 | parte 2 | 1. Mesa e objetos | `table_plane_guess`, `detect_table`, `extract_objects` | Mesa e referencial da mesa; pontos dos objetos |
-| parte 2 | 2. Separar as caixas | `euclidean_clusters`, `allocate_boxes`, `count_top_levels`, `chroma_features`, `color_split`, `segment` | Clusters; caixas por cluster; cor |
-| parte 2 | 3–5. Saída, visualização, principal | `save_objects`, `save_segmentation`, `make_figures`, `run_segmentation` | Grava `objetos.ply`, `mesa.json`, `segmentacao.npz`; janela com 2 subplots |
+| parte 2 | 2. Separar as caixas | `euclidean_clusters`, `estimate_boxes`, `count_top_levels`, `count_colors`, `allocate_boxes`, `chroma_features`, `color_split`, `segment` | Clusters; n.º de caixas estimado por cluster; cor |
+| parte 2 | 3–5. Saída, visualização, principal | `save_objects`, `save_segmentation`, `make_windows`, `run_segmentation` | Grava `objetos.ply`, `mesa.json`, `segmentacao.npz`; 3 vistas 3D |
 | parte 3 | 1. Otimização | `initial_boxes`, `split_geometric`, `split_profile`, `place_on_supports`, `distances_to_boxes`, `FitProblem.residuals`, `fit_boxes` | Estimativa inicial e otimização com `least_squares` |
 | parte 3 | 2. Método base | `bbox_box`, `bbox_method` | Bounding box orientada, para comparar |
-| parte 3 | 3–5. Saída, visualização, principal | `write_scene_result`, `save_fit`, `make_figures`, `save_top_view`, `run_fit` | `result.json` e `ajuste.npz`; janelas bounding box \| otimização e evolução 3D |
+| parte 3 | 3–5. Saída, visualização, principal | `write_scene_result`, `save_fit`, `make_windows`, `save_top_view`, `run_fit` | `result.json` e `ajuste.npz`; 5 vistas 3D (bounding box e otimização de cima e na cena, evolução) |
 | avaliador | 1–3. Avaliação | `camera_errors`, `evaluate_segmentation`, `evaluate_boxes`, `iou_3d`, `print_evaluation` | Erros em relação ao ground truth |
 | avaliador | 5. Várias cenas | `run_all`, `evaluate_scenes` | Corre as 4 partes em várias cenas e escreve as tabelas em `results_offline/results.md` |
 
 ## Parte 1 — Registo
 
-1. **Pré-processamento:** downsampling por voxel, remoção estatística de outliers (retira os *flying pixels*) e normais.
+O código da Parte 1 (`savi/parte1_registo.py`) está organizado pelas 4 subpartes do enunciado, seguidas dos extras
+de robustez (secção 5, que não fazem parte das 4 subpartes) e do programa principal, que as junta por ordem.
+
+1. **Pré-processamento** (Parte 07, Ex. 4 e 5): filtro por profundidade, downsampling por voxel, remoção estatística de
+   outliers (retira os *flying pixels*; tutorial "Point cloud outlier removal" do Open3D) e normais. Faz-se uma vez por
+   imagem e por escala do ICP.
+   - O filtro ignora os pontos a mais de 3 m da câmara: o ruído cresce com z² (a 4 m já são ~2.5 cm). Sem ele, o erro do
+     registo foi até 24 vezes maior (level_2 com 5 câmaras: 1.3 mm com o filtro, 30 mm sem ele). A mesa, as caixas e o
+     fundo próximo continuam na nuvem.
 2. **Estimativa inicial:** cada ponto da nuvem vem de um pixel, por isso projetando a nuvem com K obtém-se o ponto 3D
-   de cada pixel. As features das imagens dão então pares de pontos 3D, e um RANSAC com Kabsch estima a transformação.
-   - O **SIFT** normal deu muito poucas associações corretas entre câmaras a 45° (2 a 13 em centenas).
-     O **ASIFT** (`cv2.AffineFeature`), que simula inclinações da imagem, dá 3 a 10 vezes mais.
+   de cada pixel. As features das imagens dão então pares de pontos 3D (nota da Parte 08, Ex. 3).
+   - Features **SIFT** + **FLANN** + teste de rácio de Lowe, como na Parte 04 (Ex. 2 a 4).
+   - O SIFT dá poucas associações corretas entre câmaras a 45° (2 a 13 em centenas). Quando o par não fica de confiança,
+     tenta-se outra vez com **ASIFT** (`cv2.AffineFeature`, que simula inclinações da imagem e dá 3 a 10 vezes mais).
    - O **FPFH** (features 3D) falhou em todos os pares: a cena está cheia de planos com descritores iguais.
-   - O RANSAC usa **amostragem guiada por consistência** (um movimento rígido preserva distâncias entre pontos),
-     o que torna possível encontrar o modelo com apenas ~4% de inliers.
-   - Texturas repetidas (tábuas do chão, livros) criam modelos errados com mais inliers que o correto. Por isso o RANSAC
-     devolve **várias hipóteses**; cada uma é refinada com ICP e escolhe-se a que melhor alinha as nuvens completas
-     (pontos a < 2 cm **e** com cor parecida).
-3. **ICP** ponto-a-plano em 4 escalas (4 cm → 5 mm), com kernel robusto de Tukey, sobre a nuvem completa (mesa, caixas e fundo).
-   Os pontos a mais de 3 m são ignorados: o ruído cresce com z² (a 4 m já são ~2.5 cm).
-4. **Validação de cada par:** se o melhor alinhamento tiver um score baixo (< 0.18; os pares corretos dão 0.26–0.48),
-   todas as hipóteses estavam erradas. Tenta-se outra vez com mais esforço (teste de Lowe 0.9, 10 000 iterações,
+   - A transformação estima-se com o **RANSAC do Open3D** (`registration_ransac_based_on_correspondence`, do tutorial de
+     registo global para o qual a Parte 08 remete), com os *checkers* de comprimento das arestas (um movimento rígido
+     preserva distâncias entre pontos) e de distância.
+   - Texturas repetidas (tábuas do chão, livros) criam modelos errados com mais inliers que o correto. Por isso, como na
+     deteção sucessiva de planos da Parte 07 (Ex. 3), o RANSAC corre várias vezes, sem os inliers das hipóteses
+     anteriores, e devolve **várias hipóteses**; cada uma é refinada com ICP e escolhe-se a que melhor alinha as nuvens
+     completas (pontos a < 2 cm **e** com cor parecida).
+3. **ICP** ponto-a-plano (`registration_icp`, Parte 08, Ex. 2) em 4 escalas (4 cm → 5 mm), do limiar grosseiro para o
+   fino, com kernel robusto de Tukey, sobre a nuvem completa (mesa, caixas e fundo). As transformações dos pares
+   vizinhos são encadeadas: T_0_(i+1) = T_0_i · T_i_(i+1).
+4. **Agregação** das nuvens na resolução original, no referencial da câmara 000.
+
+**Extras de robustez** (não fazem parte das 4 subpartes):
+
+- **Validação de cada par:** se o melhor alinhamento tiver um score baixo (< 0.18; os pares corretos dão 0.26–0.48),
+   todas as hipóteses estavam erradas. Tenta-se outra vez com mais esforço (ASIFT, teste de Lowe 0.9,
    10 hipóteses). Se continuar baixo, **essa aresta não é usada**: como as câmaras formam um anel, as câmaras seguintes
    são posicionadas pelo outro lado, através do fecho de ciclo. Se uma câmara ficar isolada, é registada com uma câmara
    a duas posições de distância.
    Num teste, um único par falhado punha uma câmara com 840 mm de erro e todas as seguintes também. Com a validação,
    o erro máximo ficou em 1.2 mm.
-5. **Grafo de poses** com fecho de ciclo (imagem 7 → imagem 0) e só com as arestas válidas, otimizado com o Open3D.
-6. **Agregação** das nuvens na resolução original, no referencial da câmara 000.
+- **Câmara acima da mesa:** uma hipótese só é aceite se cada câmara ficar pelo menos 10 cm acima do tampo da mesa visto
+  pela outra. As hipóteses erradas que vêm de texturas repetidas do chão ou das paredes punham a outra câmara 2.2 m
+  abaixo da mesa e passavam nos outros testes (cenas com 2 e 3 câmaras opostas); as câmaras verdadeiras estão sempre
+  0.65–0.76 m acima do tampo.
+- **Grafo de poses** com fecho de ciclo (imagem 7 → imagem 0) e só com as arestas válidas, otimizado com o Open3D
+  (tutorial "Multiway registration").
+- **Hipóteses da mesa:** cada câmara deteta sozinha o tampo da mesa (função da Parte 2); duas câmaras que veem a mesma
+  mesa dão hipóteses a ~1 cm da solução (rodadas 0° ou 180°), que entram na mesma escolha que as das features.
 
 Resultado no nível 1: erro máximo de **1.9 mm / 0.07°** com grafo de poses, contra 2.0 mm / 0.10° só com encadeamento.
 No nível 4: erros entre 0.4 e 2.4 mm e abaixo de 0.05°.
