@@ -12,93 +12,95 @@ Todos os comandos são corridos a partir da pasta principal do trabalho.
 ```
 pip install -r Read_me/requirements.txt
 python simulator/savi_box_simulator.py --batch simulator/configs/level_*.json simulator/configs/stack_*.json --output scenes_offline
-python savi/detecao_caixas.py --scene scenes_offline/level_4                                   # script 1: nuvem só das caixas
-python savi/detecao_caixas.py --scene scenes_offline/level_4 --visualize                       #   + janelas 3D
-python savi/avaliador_caixas.py --detection scenes_offline/level_4/detecao --num_boxes 3       # script 2: escreve result.json
-python savi/avaliador_caixas.py --detection scenes_offline/level_4/detecao --num_boxes 3 --evaluate    # + tabelas de erros
-python savi/avaliador_caixas.py --detection scenes_offline/level_4/detecao --num_boxes 3 --visualize   # + janelas 3D
-python savi/avaliador_caixas.py --evaluate_scenes scenes_offline/level_* scenes_offline/stack_*  # tabelas em results_offline/
-python savi/avaliador_caixas.py --evaluate_scenes scenes_offline/level_* --gt_registration       # isola segmentação + ajuste
-python run_test.py --download <link do GitHub>                                                 # dia do teste: todas as cenas
+python savi/parte1_registo.py --scene scenes_offline/level_4 --visualize                     # Parte 1: registo
+python savi/extra_fotometria.py --scene scenes_offline/level_4 --visualize                   # extra: fotometria
+python savi/parte2_segmentacao.py --scene scenes_offline/level_4 --num_boxes 3 --visualize   # Parte 2: segmentação
+python savi/parte3_ajuste.py --scene scenes_offline/level_4 --visualize                      # Parte 3: result.json
+python savi/avaliador.py --scene scenes_offline/level_4                                      # erros (ground truth)
+python savi/avaliador.py --evaluate_scenes scenes_offline/level_* scenes_offline/stack_*     # tabelas em results_offline/
+python savi/avaliador.py --evaluate_scenes scenes_offline/level_* --gt_registration          # isola segmentação + ajuste
+python run_test.py --download <link do GitHub>                                               # dia do teste: todas as cenas
 ```
 
-Sem `--num_boxes`, o script 2 pergunta o número de caixas no terminal.
+Cada parte lê o que a anterior gravou em `<cena>/partes/`, por isso têm de ser corridas por esta ordem.
+Sem `--num_boxes`, a Parte 2 pergunta o número de caixas no terminal. `--visualize` abre a janela da parte (com
+subplots); `--open3d` abre as janelas 3D do Open3D.
 
 Pastas:
 
 | pasta | o que tem |
 |---|---|
-| `savi/` | o código, em 2 scripts: `detecao_caixas.py` (script 1) e `avaliador_caixas.py` (script 2) |
+| `savi/` | o código: um ficheiro por parte (`parte1_registo.py`, `parte2_segmentacao.py`, `parte3_ajuste.py`), o extra (`extra_fotometria.py`) e o `avaliador.py` |
 | `simulator/` | simulador do professor e configurações das cenas (`configs/`, incluindo `stack_*.json`) |
 | `scenes_offline/` | cenas de desenvolvimento geradas pelo simulador (com `ground_truth.json`; não vão para o git) |
 | `results_offline/` | tabelas (`results.md`) e figuras da opção `--evaluate_scenes` |
 | `test/` | cenas do dia do teste (copiadas do GitHub pelo `run_test.py`; não vão para o git) |
-| `results_test/` | um `result.json` (e `top_view.png`) por cena do teste, escritos pelo `run_test.py` |
+| `results_test/` | por cena do teste: `result.json`, `top_view.png` e a figura de cada parte, escritos pelo `run_test.py` |
 | `Read_me/` | este relatório, o enunciado e o `requirements.txt` |
 
-Opções do **script 1**, `detecao_caixas.py`:
+Opções de cada parte (todas têm `--scene`, a pasta da cena):
 
-| opção | o que faz |
-|---|---|
-| `--scene` | pasta da cena (obrigatória; o número de caixas NÃO é preciso) |
-| `--output` | pasta onde gravar a deteção (por omissão: `<cena>/detecao`) |
-| `--no_loop_closure` | registo só por encadeamento, sem fecho de ciclo |
-| `--gt_registration` | usa as poses verdadeiras das câmaras (só para avaliar o resto do sistema) |
-| `--visualize` | abre janelas 3D: nuvem agregada (cores reais e cor por câmara) e nuvem só das caixas |
-
-Opções do **script 2**, `avaliador_caixas.py`:
-
-| opção | o que faz |
-|---|---|
-| `--detection` | pasta escrita pelo script 1 (ex.: `test/cena_1/detecao`) |
-| `--num_boxes` | número de caixas na mesa (se faltar, é perguntado no terminal) |
-| `--output` | onde escrever o `result.json` (por omissão: dentro da pasta da cena) |
-| `--method bbox` | usa a bounding box no `result.json`, em vez da otimização |
-| `--no_color` | não usa a cor (nem na segmentação nem na otimização) |
-| `--evaluate` | compara com o `ground_truth.json` (se existir) e mostra as tabelas de erros |
-| `--visualize` | abre janelas 3D com cada etapa (segmentação, otimização, resultado) |
-| `--figures` | grava `top_view.png` (caixas vistas de cima) e `optimization.png` (evolução da otimização) |
-| `--evaluate_scenes CENA...` | corre os 2 scripts em várias cenas com ground truth e escreve as tabelas |
-| `--gt_registration` | com `--evaluate_scenes`: usa as poses verdadeiras (avalia só segmentação e ajuste) |
+| ficheiro | opção | o que faz |
+|---|---|---|
+| `parte1_registo.py` | `--no_loop_closure` | registo só por encadeamento, sem fecho de ciclo |
+| | `--gt_registration` | usa as poses verdadeiras das câmaras (só para avaliar o resto do sistema) |
+| | `--visualize` | janela: nuvem agregada com a cor dos píxeis \| com uma cor por câmara |
+| | `--open3d` | janelas 3D do Open3D (com ground truth: nuvem estimada sobre a verdadeira) |
+| `extra_fotometria.py` | `--visualize` | janela: nuvem agregada sem \| com correção da exposição, e s e b de cada imagem |
+| `parte2_segmentacao.py` | `--num_boxes` | número de caixas na mesa (se faltar, é perguntado no terminal) |
+| | `--no_color` | não usa a cor para separar as caixas |
+| | `--visualize` | janela: objetos isolados do resto da nuvem \| conjuntos da segmentação em 3D |
+| | `--open3d` | janela 3D do Open3D com a nuvem dos objetos |
+| `parte3_ajuste.py` | `--output` | onde escrever o `result.json` (por omissão: dentro da pasta da cena) |
+| | `--method bbox` | usa a bounding box no `result.json`, em vez da otimização |
+| | `--no_color` | não usa a cor na otimização |
+| | `--visualize` | janelas: bounding box \| otimização (vista de cima) e evolução da otimização em 3D (animação) |
+| | `--open3d` | janelas 3D do Open3D (segmentação, evolução, resultado final) |
+| `avaliador.py` | `--scene` | tabelas de erros de uma cena já corrida (precisa do `ground_truth.json`) |
+| | `--evaluate_scenes CENA...` | corre as 4 partes em várias cenas com ground truth e escreve as tabelas |
+| | `--gt_registration` | com `--evaluate_scenes`: usa as poses verdadeiras (avalia só segmentação e ajuste) |
 
 **Nota:** foi feita uma alteração de uma linha no simulador (`cv2.imwrite` → `cv2.imencode(...).tofile(...)`), porque
 no Windows o OpenCV não escreve ficheiros em caminhos com acentos (como "Trabalho prático") e as imagens RGB não eram gravadas.
 
 ## Estrutura do código
 
-O código está dividido em **2 scripts**, em `savi/`:
+O código está dividido em **4 ficheiros, um por parte do enunciado** (mais o avaliador), em `savi/`. Cada parte grava
+o seu resultado em `<cena>/partes/`, que é a entrada da parte seguinte:
 
-1. **`detecao_caixas.py` — deteção.** Regista as imagens (Parte 1), junta as nuvens, deteta a mesa e fica só com os
-   pontos acima do tampo (1.ª metade da Parte 2). Grava em `<cena>/detecao/`:
-   - `caixas.ply`: a nuvem de pontos **só das caixas** (sem a mesa, o chão nem o resto da sala), com cor, no
-     referencial da mesa (z = altura acima do tampo);
-   - `detecao.json`: a pose de cada câmara, a pose e as dimensões da mesa e a pasta da cena.
+1. **`parte1_registo.py` — Parte 1.** Regista as imagens e junta as nuvens. Grava `registo.json` (pose de cada
+   câmara em relação à câmara 000 e as câmaras que entraram na nuvem). Não precisa do número de caixas.
+2. **`extra_fotometria.py` — extra.** Estima o ganho s e o desvio b de cada imagem em relação à 000, corrige as
+   imagens a cores (`fotometria/NNN.png`) e compara com o campo `photometry` do ground truth. Grava `fotometria.json`.
+3. **`parte2_segmentacao.py` — Parte 2.** Deteta a mesa (RANSAC), retira a mesa e o fundo e separa as caixas
+   (clusters e cor); recebe o **número de caixas**. Grava `objetos.ply` (nuvem **só dos objetos**, com cor, no
+   referencial da mesa), `mesa.json` e `segmentacao.npz`.
+4. **`parte3_ajuste.py` — Parte 3.** Estimativa inicial, ajuste por otimização e bounding box. Escreve o
+   `result.json` e grava `ajuste.npz`.
+5. **`avaliador.py`** — compara com o ground truth (registo, segmentação e caixas) e corre várias cenas.
 
-   Não precisa do número de caixas.
-2. **`avaliador_caixas.py` — avaliador.** Lê a pasta do script 1 e recebe o **número de caixas**. Separa as caixas
-   (clusters e cor, 2.ª metade da Parte 2), ajusta-as por otimização (Parte 3) e escreve o `result.json`. Tem também
-   a avaliação com o ground truth, a visualização e o modo de várias cenas.
+O `run_test.py` (na pasta principal) corre os 4 ficheiros e o avaliador em todas as cenas de `test/` e escreve
+`results_test/<cena>/`. Fase 1 (sem perguntas): Parte 1 e extra em todas as cenas; fase 2: o número de caixas é
+pedido cena a cena e correm a Parte 2, a Parte 3 e o avaliador. As janelas de cada parte abrem logo que a parte
+acaba e **não param o programa** (são desenhadas por um segundo processo): pode ver-se a cena 3 sem fechar as
+janelas das cenas 1 e 2. Com `--sem_janelas` só são gravadas as figuras. Cada função tem um comentário que diz o
+que faz, o que recebe, o que devolve e porque foi feita assim.
 
-O `run_test.py` (na pasta principal) corre os 2 scripts em todas as cenas de `test/` e escreve
-`results_test/<cena>/result.json`. Cada função tem um comentário que diz o que faz, o que recebe, o que devolve e
-porque foi feita assim.
-
-| Script | Secção | Funções principais | Para que serve |
+| Ficheiro | Secção | Funções principais | Para que serve |
 |---|---|---|---|
-| 1 | 0. Geometria | `make_T`, `transform_points`, `kabsch`, `rotation_angle_deg`, `box_signed_distance` | Matrizes 4x4, rotações, distância de um ponto a uma caixa (usadas também pelo script 2) |
-| 1 | 1. Leitura da cena | `load_scene`, `cloud_to_xyz_image`, `boxes_to_camera0`, `write_result` | Ler as imagens e nuvens; ponto 3D de cada pixel; escrever o `result.json` |
-| 1 | 2. Parte 1 — Registo | `detect_features`, `match_3d_pairs`, `ransac_hypotheses`, `multiscale_icp`, `alignment_score`, `exposure_fit`, `free_space_violation`, `table_hypotheses`, `register_pair`, `register_scene`, `aggregate` | Pose de cada câmara em relação à câmara 000 e nuvem agregada |
-| 1 | 3. Parte 2 — Mesa | `table_plane_guess`, `detect_table`, `extract_objects` | Mesa e referencial da mesa; pontos das caixas |
-| 1 | 4. Saída | `save_detection` | Grava `caixas.ply` e `detecao.json` |
-| 1 | 5. Visualização | `show_registration`, `show_boxes_cloud` | Janelas 3D (só `--visualize`) |
-| 1 | 6. Programa principal | `run_detection`, `main` | Junta tudo e grava a deteção |
-| 2 | 3. Parte 2 — Separar as caixas | `euclidean_clusters`, `allocate_boxes`, `count_top_levels`, `chroma_features`, `color_split`, `segment` | Clusters; caixas por cluster; cor |
-| 2 | 4. Parte 3 — Ajuste | `initial_boxes`, `split_geometric`, `split_profile`, `place_on_supports`, `distances_to_boxes`, `FitProblem.residuals`, `fit_boxes` | Estimativa inicial e otimização com `least_squares` |
-| 2 | 5. Método base | `bbox_box`, `bbox_method` | Bounding box orientada, para comparar |
-| 2 | 6. Avaliação | `camera_errors`, `evaluate_segmentation`, `evaluate_boxes`, `iou_3d`, `print_evaluation` | Erros em relação ao ground truth (só `--evaluate` / `--evaluate_scenes`) |
-| 2 | 7. Visualização | `show_segmentation`, `animate_optimization`, `show_final`, `save_top_view`, `save_evolution` | Janelas 3D e figuras PNG (só `--visualize` / `--figures`) |
-| 2 | 8. Várias cenas | `evaluate_scenes` | Corre os 2 scripts em várias cenas e escreve as tabelas em `results_offline/results.md` |
-| 2 | 9. Programa principal | `load_detection`, `run`, `main` | Lê a deteção, pede o n.º de caixas e escreve o `result.json` |
+| parte 1 | 0. Geometria | `make_T`, `transform_points`, `kabsch`, `rotation_angle_deg`, `box_signed_distance` | Matrizes 4x4, rotações, distância de um ponto a uma caixa (usadas também pelas outras partes) |
+| parte 1 | 1. Leitura da cena | `load_scene`, `cloud_to_xyz_image`, `boxes_to_camera0`, `write_result` | Ler as imagens e nuvens; ponto 3D de cada pixel; escrever o `result.json` |
+| parte 1 | 2. Registo | `detect_features`, `match_3d_pairs`, `ransac_hypotheses`, `multiscale_icp`, `alignment_score`, `free_space_violation`, `table_hypotheses`, `register_pair`, `register_scene`, `aggregate` | Pose de cada câmara em relação à câmara 000 e nuvem agregada |
+| parte 1 | 3–5. Saída, visualização, principal | `save_registration`, `make_figures`, `run_registration` | Grava `registo.json`; janela com 2 subplots |
+| extra | 1–4 | `exposure_fit`, `exposure_corrected`, `true_exposures`, `correct_images`, `run_photometry` | s e b de cada imagem, imagens corrigidas, comparação com o ground truth |
+| parte 2 | 1. Mesa e objetos | `table_plane_guess`, `detect_table`, `extract_objects` | Mesa e referencial da mesa; pontos dos objetos |
+| parte 2 | 2. Separar as caixas | `euclidean_clusters`, `allocate_boxes`, `count_top_levels`, `chroma_features`, `color_split`, `segment` | Clusters; caixas por cluster; cor |
+| parte 2 | 3–5. Saída, visualização, principal | `save_objects`, `save_segmentation`, `make_figures`, `run_segmentation` | Grava `objetos.ply`, `mesa.json`, `segmentacao.npz`; janela com 2 subplots |
+| parte 3 | 1. Otimização | `initial_boxes`, `split_geometric`, `split_profile`, `place_on_supports`, `distances_to_boxes`, `FitProblem.residuals`, `fit_boxes` | Estimativa inicial e otimização com `least_squares` |
+| parte 3 | 2. Método base | `bbox_box`, `bbox_method` | Bounding box orientada, para comparar |
+| parte 3 | 3–5. Saída, visualização, principal | `write_scene_result`, `save_fit`, `make_figures`, `save_top_view`, `run_fit` | `result.json` e `ajuste.npz`; janelas bounding box \| otimização e evolução 3D |
+| avaliador | 1–3. Avaliação | `camera_errors`, `evaluate_segmentation`, `evaluate_boxes`, `iou_3d`, `print_evaluation` | Erros em relação ao ground truth |
+| avaliador | 5. Várias cenas | `run_all`, `evaluate_scenes` | Corre as 4 partes em várias cenas e escreve as tabelas em `results_offline/results.md` |
 
 ## Parte 1 — Registo
 
@@ -151,7 +153,7 @@ No nível 4: erros entre 0.4 e 2.4 mm e abaixo de 0.05°.
   que sobrou num par estava rodada 180° e tinha score 0.054.
 - **Mudanças de exposição:** com exposição automática, a cor de cada imagem é `s · cor + b` (no teste 10, uma
   imagem tinha s = 0.66, b = −0.06). `exposure_fit` estima s e b por mínimos quadrados com os pontos que
-  coincidem em geometria (2 passagens, sem os 30% de maior resíduo). Usa-se em dois sítios:
+  coincidem em geometria (2 passagens, sem os 30% de maior resíduo); está no `extra_fotometria.py`. Usa-se em dois sítios:
   (1) no `alignment_score`, antes de comparar cores: sem isto todas as hipóteses tinham score ~0.003 e a mesa
   rodada 180° ganhou (erro de 2.35 m numa câmara); (2) no `aggregate`, cada imagem fica com a exposição das
   anteriores: a cromaticidade cancela s mas não b, e o laranja e o castanho de uma torre deixavam de se
@@ -286,7 +288,7 @@ otimização ficou presa num mínimo local (IoU 0.21–0.60, custo 4810). A part
 
 Resultados do sistema completo (registo estimado) nas cenas fornecidas, com ruído.
 Tabelas completas (erro por câmara, por caixa, precisão/recall) em `results_offline/results.md`
-(geradas com `python savi/avaliador_caixas.py --evaluate_scenes ...`), figuras em `results_offline/` (`*_top_view.png` e `*_optimization.png`).
+(geradas com `python savi/avaliador.py --evaluate_scenes ...`), figuras em `results_offline/` (`*_top_view.png` e `*_optimization.png`).
 
 | cena | IoU bounding box | IoU otimização | erro máx. de posição (otimização) |
 |---|---|---|---|

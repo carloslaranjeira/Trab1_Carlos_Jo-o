@@ -1,0 +1,751 @@
+#!/usr/bin/env python3
+"""SAVIBoxes - Trabalho 1 de SAVI. PARTE 2: SEGMENTAÇÃO (mesa, pontos dos objetos e separação das caixas).
+
+=====================================================================================================
+COMO CORRER
+=====================================================================================================
+    (a partir da pasta principal do trabalho, DEPOIS da Parte 1: python savi/parte1_registo.py --scene ...)
+    python savi/parte2_segmentacao.py --scene test/cena_1 --num_boxes 2
+    python savi/parte2_segmentacao.py --scene test/cena_1                  # pergunta o n.º de caixas
+    python savi/parte2_segmentacao.py --scene test/cena_1 --num_boxes 2 --visualize   # janela (2 subplots)
+
+A segmentação é feita sobre a nuvem AGREGADA (as nuvens são juntadas com as poses do registo.json):
+    1. detetar o plano da mesa com RANSAC e definir o referencial da mesa;
+    2. retirar a mesa e o fundo: ficam os pontos acima da mesa e dentro dos seus limites;
+    3. separar os objetos com clustering euclidiano e decidir quantas caixas tem cada cluster
+       (é aqui que entra o número de caixas);
+    4. usar a cor para separar caixas em contacto (Nível 4).
+Grava em <cena>/partes/: objetos.ply (nuvem de pontos SÓ DOS OBJETOS, com cor, no referencial da mesa),
+mesa.json (pose e dimensões da mesa) e segmentacao.npz (cluster e grupo de cor de cada ponto).
+
+Ordem das partes (o run_test.py corre-as todas, cena a cena):
+    parte1_registo.py      -> <cena>/partes/registo.json   (pose de cada câmara)
+    extra_fotometria.py    -> <cena>/partes/fotometria.json (ganho e desvio de cada imagem)
+    parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (precisa do n.º de caixas)
+    parte3_ajuste.py       -> result.json e <cena>/partes/ajuste.npz
+    avaliador.py           -> erros em relação ao ground truth (só nas cenas que o têm)
+
+=====================================================================================================
+ORGANIZAÇÃO DESTE FICHEIRO
+=====================================================================================================
+    1. Mesa e objetos     plano da mesa (RANSAC), referencial da mesa, retirar a mesa e o fundo
+    2. Separar as caixas  clusters euclidianos (DBSCAN), n.º de caixas por cluster e cor
+    3. Saída              gravar e ler objetos.ply, mesa.json e segmentacao.npz
+    4. Visualização       janela com 2 subplots: objetos isolados do resto da nuvem | conjuntos da segmentação
+    5. Programa principal run_segmentation() e main()
+(As convenções - T_A_B, referencial da mesa - estão na Parte 1, parte1_registo.py.)
+"""
+
+import argparse
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import cv2                                   # OpenCV: k-means, retângulos
+import matplotlib.pyplot as plt              # janela com subplots (secção 4)
+import numpy as np
+import open3d as o3d                         # nuvens de pontos: RANSAC de planos, DBSCAN
+from scipy.spatial import cKDTree            # procura rápida do vizinho mais próximo
+
+from parte1_registo import (  # funções da Parte 1 usadas aqui
+    DISPLAY_POINTS, OUTPUT_FOLDER, aggregate, box_corners_2d, link_views, load_registration, load_scene,
+    make_T, sample_indices, scatter_3d, set_equal_3d, show_figures, transform_points,
+)
+
+
+# #####################################################################################################
+# 1. PARTE 2 - SEGMENTAÇÃO (1.ª etapa): MESA E PONTOS DOS OBJETOS
+# #####################################################################################################
+# Sobre a nuvem AGREGADA (Parte 1):
+#   1. detetar o plano da mesa (RANSAC, Parte 07) e definir o referencial da mesa;
+#   2. retirar a mesa e o fundo: ficam só os pontos acima da mesa e dentro dos seus limites, ou seja,
+#      os pontos dos objetos (a nuvem gravada em objetos.ply).
+# A deteção da mesa também é usada no registo (Parte 1, table_hypotheses): cada câmara vê a mesa inteira.
+PLANE_DISTANCE = 0.008       # m: distância máxima ao plano para um ponto ser do plano (RANSAC)
+ABOVE_TABLE_MIN = 0.008      # m: pontos abaixo disto (ruído do tampo) são retirados
+ABOVE_TABLE_MAX = 0.60       # m: pontos acima disto já não são objetos sobre a mesa
+TABLE_MARGIN = 0.01          # m: margem para dentro dos limites do tampo
+CLUSTER_EPS = 0.015          # m: no DBSCAN, pontos a menos de 1.5 cm ficam no mesmo cluster (secção 2)
+OBJECT_VOXEL = 0.004         # m: voxel usado nos pontos dos objetos
+
+
+@dataclass
+class Table:
+    """Mesa detetada."""
+    T_camera0_table: np.ndarray   # pose do referencial da mesa no referencial da câmara 0
+    length: float                 # comprimento do tampo (lado maior), m
+    width: float                  # largura do tampo, m
+    normal: np.ndarray            # normal do tampo (para cima), no referencial da câmara 0
+
+
+# ----------------------------------------------------------------------------------------------------
+# 1.1 Plano da mesa e referencial da mesa
+# ----------------------------------------------------------------------------------------------------
+def central_points(views, T_camera0_cameras, fraction=0.4):
+    """Pontos 3D (referencial da câmara 0) da zona central de cada imagem.
+
+    Cada câmara aponta para a mesa (é para isso que lá está), por isso os pixels do centro da imagem
+    são quase todos do tampo ou das caixas. Assim não é preciso saber quantas câmaras há nem como
+    estão dispostas (volta completa, arco, ou uma só). 'fraction' = lado da zona central (40%).
+    """
+    pts = []
+    for view, T in zip(views, T_camera0_cameras):
+        h, w = view.xyz_image.shape[:2]
+        r0, r1 = int(h * (0.5 - fraction / 2)), int(h * (0.5 + fraction / 2))
+        c0, c1 = int(w * (0.5 - fraction / 2)), int(w * (0.5 + fraction / 2))
+        p = view.xyz_image[r0:r1, c0:c1].reshape(-1, 3)
+        p = p[p[:, 2] > 0]                                # só pixels com medição
+        pts.append(transform_points(T, p))
+    return np.concatenate(pts)
+
+
+def table_plane_guess(views, T_camera0_cameras):
+    """Primeira estimativa do plano da mesa: RANSAC sobre os pontos centrais das imagens.
+
+    1. Encontra até 3 planos nos pontos centrais (RANSAC repetido, como na Parte 07 Ex. 3: cada
+       plano encontrado é retirado e procura-se o seguinte nos pontos que sobram);
+    2. A normal de cada plano é orientada para o lado das câmaras ('cima' = de onde a mesa é vista);
+    3. Altura de referência: o pixel MESMO no centro de cada imagem (tampo ou topo de uma caixa);
+    4. Dos planos paralelos ao maior, com pelo menos 25% dos seus pontos e não mais de 35 cm abaixo
+       da referência, fica o MAIS BAIXO: os topos das caixas também são horizontais mas estão acima
+       da mesa; o chão também pode aparecer, mas está ~75 cm abaixo.
+    Saída: (normal para cima, um ponto do tampo).
+    """
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(central_points(views, T_camera0_cameras)))
+    rest = pc.voxel_down_sample(0.01)
+    centers = np.array([T[:3, 3] for T in T_camera0_cameras])     # posição de cada câmara
+    planes = []
+    for _ in range(3):
+        if len(rest.points) < 300:
+            break
+        model, inliers = rest.segment_plane(distance_threshold=PLANE_DISTANCE, ransac_n=3, num_iterations=2000)
+        normal = np.array(model[:3]) / np.linalg.norm(model[:3])
+        point = np.asarray(rest.points)[inliers].mean(axis=0)
+        if np.mean((centers - point) @ normal) < 0:               # orienta a normal para as câmaras
+            normal = -normal
+        planes.append((len(inliers), normal, point))
+        rest = rest.select_by_index(inliers, invert=True)         # retira o plano e continua
+    if not planes:
+        raise RuntimeError("Não foi encontrado nenhum plano no centro das imagens")
+    biggest_count, up, _ = max(planes, key=lambda p: p[0])
+
+    # Altura (ao longo de 'up') dos pixels do centro de cada imagem
+    center_heights = []
+    for v, T in zip(views, T_camera0_cameras):
+        h, w = v.xyz_image.shape[:2]
+        patch = v.xyz_image[h // 2 - 5:h // 2 + 5, w // 2 - 5:w // 2 + 5].reshape(-1, 3)
+        patch = patch[patch[:, 2] > 0]
+        center_heights.append(transform_points(T, patch) @ up)
+    center_heights = np.concatenate(center_heights)
+    reference = np.median(center_heights) if len(center_heights) else -np.inf
+
+    parallel = [p for p in planes if p[0] >= 0.25 * biggest_count and abs(p[1] @ up) > np.cos(np.radians(10))
+                and p[2] @ up > reference - 0.35]
+    if not parallel:
+        parallel = planes
+    _, _, point = min(parallel, key=lambda p: p[2] @ up)          # o mais baixo
+    return up, point
+
+
+HORIZONTAL_MAX_ANGLE = 10    # graus: normal a menos disto da vertical -> ponto de uma superfície horizontal
+TABLE_HEIGHT_MIN = 0.5       # m: o tampo está entre 0.5 m e 1.0 m acima do chão (Parte 08, Ex. 4)
+TABLE_HEIGHT_MAX = 1.0
+MIN_PLANE_POINTS = 300       # n.º mínimo de pontos (voxel de 1 cm) para aceitar um plano do chão ou da mesa
+
+
+def horizontal_points(pc, up):
+    """Pontos de superfícies HORIZONTAIS, escolhidos pela normal (Parte 07, Ex. 5 e 6).
+
+    1. Calcula a normal de cada ponto (plano ajustado aos vizinhos, raio 3 cm);
+    2. Ângulo entre a normal n e a vertical 'up':  theta = arccos(|n . up|)  (|.| porque a normal pode
+       apontar para cima ou para baixo, as duas são a mesma superfície);
+    3. Fica com os pontos com theta < 10°.
+    Saída: nova nuvem só com esses pontos.
+    """
+    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.03, max_nn=30))
+    cos_angle = np.abs(np.asarray(pc.normals) @ up)
+    keep = np.where(cos_angle > np.cos(np.radians(HORIZONTAL_MAX_ANGLE)))[0]
+    return pc.select_by_index(keep)
+
+
+def table_points_from_floor(cloud, up, central, verbose=True):
+    """Pontos do tampo, pela lógica das aulas: primeiro o CHÃO, depois a mesa (Parte 08, Ex. 4).
+
+    O RANSAC é guiado pelas normais (Parte 07, Ex. 8): só corre sobre pontos de superfícies
+    horizontais, para não encontrar 'planos' que cortam paredes, móveis ou caixas na diagonal.
+      1. Nuvem agregada (voxel de 1 cm) -> só os pontos com normal vertical (horizontal_points);
+      2. Chão = o MAIOR plano desses pontos (segment_plane). A altura de cada ponto acima do chão é
+         a distância ao plano, com a normal orientada para cima (para o lado das câmaras);
+      3. RANSAC outra vez, só nos pontos horizontais com altura entre 0.5 e 1.0 m -> plano da mesa;
+      4. No mesmo plano podem aparecer outras superfícies à mesma altura (um aparador, uma cómoda).
+         Clustering euclidiano (DBSCAN) dos pontos do plano e fica o MAIOR grupo, como na aula; mas só
+         entre os grupos que aparecem no centro das imagens (as câmaras estão a olhar para a mesa).
+    Saída: pontos do tampo (N x 3) ou None se não houver chão ou mesa visíveis (por exemplo, com
+    poucas câmaras muito perto da mesa o chão quase não aparece); nesse caso usa-se o outro método.
+    """
+    pc = horizontal_points(cloud.voxel_down_sample(0.01), up)
+    if len(pc.points) < MIN_PLANE_POINTS:
+        return None
+
+    # 2. Chão: o maior plano horizontal
+    model, inliers = pc.segment_plane(distance_threshold=PLANE_DISTANCE, ransac_n=3, num_iterations=2000)
+    if len(inliers) < MIN_PLANE_POINTS:
+        return None
+    floor_normal = np.array(model[:3]) / np.linalg.norm(model[:3])
+    if floor_normal @ up < 0:                                     # normal do chão a apontar para cima
+        floor_normal = -floor_normal
+    floor_point = np.asarray(pc.points)[inliers].mean(axis=0)
+    points = np.asarray(pc.points)
+    height = (points - floor_point) @ floor_normal                # altura acima do chão
+
+    # 3. Plano da mesa: RANSAC só nos pontos entre 0.5 e 1.0 m acima do chão
+    band = np.where((height > TABLE_HEIGHT_MIN) & (height < TABLE_HEIGHT_MAX))[0]
+    if len(band) < MIN_PLANE_POINTS:
+        return None
+    band_pc = pc.select_by_index(band)
+    _, inliers = band_pc.segment_plane(distance_threshold=PLANE_DISTANCE, ransac_n=3, num_iterations=2000)
+    plane_points = np.asarray(band_pc.points)[inliers]
+
+    # 4. Maior grupo do plano, entre os que aparecem no centro das imagens
+    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(plane_points))
+                      .cluster_dbscan(eps=0.025, min_points=3))
+    near_center = cKDTree(central).query(plane_points, distance_upper_bound=0.02)[0] < np.inf
+    candidates = [k for k in range(labels.max() + 1) if np.any(near_center[labels == k])]
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda k: np.sum(labels == k))
+    table_points = plane_points[labels == best]
+    if len(table_points) < MIN_PLANE_POINTS:
+        return None
+    if verbose:
+        print(f"  chão: {len(inliers)} pontos; mesa a {np.median((table_points - floor_point) @ floor_normal):.2f} m"
+              f" do chão")
+    return table_points
+
+
+def table_points_from_center(cloud, up, seed):
+    """Pontos do tampo, a partir do plano estimado no centro das imagens (método de recurso).
+
+    Usado quando o chão não é visível. Pontos da nuvem a menos de 1.5 cm do plano estimado e a menos
+    de 1 m do ponto estimado; dentro desses, a componente ligada (DBSCAN) que contém o ponto estimado.
+    """
+    points = np.asarray(cloud.voxel_down_sample(0.01).points)
+    rel = points - seed
+    height = rel @ up                                             # altura acima do plano
+    horizontal = np.linalg.norm(rel - np.outer(height, up), axis=1)   # distância 'no plano'
+    table_points = points[(np.abs(height) < 0.015) & (horizontal < 1.0)]
+
+    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(table_points))
+                      .cluster_dbscan(eps=0.025, min_points=3))
+    if labels.max() >= 0:
+        valid = labels >= 0
+        nearest = np.argmin(np.linalg.norm(table_points[valid] - seed, axis=1))
+        table_points = table_points[labels == labels[valid][nearest]]
+    return table_points
+
+
+def detect_table(cloud, T_camera0_cameras, views, verbose=True):
+    """Deteta o tampo da mesa e define o referencial da mesa.
+
+    1. Direção 'para cima' (normal da mesa, aproximada) pelo RANSAC no centro das imagens
+       (table_plane_guess);
+    2. Pontos do tampo como nas aulas: chão primeiro, depois a mesa entre 0.5 e 1.0 m acima do chão,
+       com o RANSAC guiado pelas normais (table_points_from_floor). Se o chão não aparecer, usa o plano
+       estimado no centro das imagens (table_points_from_center);
+    3. Reajuste do plano por mínimos quadrados (SVD) com os pontos do tampo;
+    4. Retângulo de área mínima do tampo visto de cima: dá o centro (origem), a orientação (eixo x
+       ao longo do lado maior) e as dimensões do tampo.
+    Saída: objeto Table.
+    """
+    up, seed = table_plane_guess(views, T_camera0_cameras)
+
+    # 2. Pontos do tampo
+    table_points = table_points_from_floor(cloud, up, central_points(views, T_camera0_cameras), verbose)
+    if table_points is None:
+        if verbose:
+            print("  chão não encontrado: mesa pelo plano do centro das imagens")
+        table_points = table_points_from_center(cloud, up, seed)
+
+    # Reajuste do plano por mínimos quadrados (SVD): a normal é a direção de menor variância
+    centroid = table_points.mean(axis=0)
+    _, _, Vt = np.linalg.svd(table_points - centroid)
+    normal = Vt[2] if Vt[2] @ up > 0 else -Vt[2]
+
+    # 4. Base ortonormada (e1, e2) no plano e retângulo de área mínima dos pontos do tampo
+    e1 = np.cross(normal, [1.0, 0.0, 0.0])
+    if np.linalg.norm(e1) < 0.1:
+        e1 = np.cross(normal, [0.0, 1.0, 0.0])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(normal, e1)
+    uv = np.stack([(table_points - centroid) @ e1, (table_points - centroid) @ e2], axis=1)
+    (cu, cv), (size_a, size_b), angle = cv2.minAreaRect(uv.astype(np.float32))
+    angle = np.radians(angle)
+    axis_a = np.cos(angle) * e1 + np.sin(angle) * e2              # direção do lado 'size_a'
+    if size_b > size_a:                                            # o eixo x fica ao longo do lado maior
+        axis_a = np.cross(normal, axis_a)
+        size_a, size_b = size_b, size_a
+    x_axis = axis_a / np.linalg.norm(axis_a)
+    y_axis = np.cross(normal, x_axis)
+    origin = centroid + cu * e1 + cv * e2                          # centro do tampo
+
+    T_camera0_table = make_T(np.column_stack([x_axis, y_axis, normal]), origin)
+    if verbose:
+        print(f"Parte 2: mesa detetada com {len(table_points)} pontos, tampo de {size_a:.3f} x {size_b:.3f} m")
+    return Table(T_camera0_table, float(size_a), float(size_b), normal)
+
+
+# ----------------------------------------------------------------------------------------------------
+# 1.2 Retirar a mesa e o fundo
+# ----------------------------------------------------------------------------------------------------
+def extract_objects(cloud, table, voxel=OBJECT_VOXEL):
+    """Pontos dos objetos sobre a mesa, no referencial da MESA.
+
+    1. Transforma a nuvem para o referencial da mesa: a coordenada z passa a ser a altura acima do tampo;
+    2. Fica com os pontos entre 8 mm e 60 cm acima da mesa E dentro dos limites do tampo
+       (só a altura não chega: o chão à volta e outros móveis também podem estar a essa altura);
+    3. Downsampling (voxel de 4 mm) e remoção de outliers (flying pixels a 'flutuar').
+    Saída: (pontos M x 3, cores M x 3).
+    """
+    T_table_camera0 = np.linalg.inv(table.T_camera0_table)
+    points = transform_points(T_table_camera0, np.asarray(cloud.points))
+    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+    mask = ((z > ABOVE_TABLE_MIN) & (z < ABOVE_TABLE_MAX) &
+            (np.abs(x) < table.length / 2 - TABLE_MARGIN) & (np.abs(y) < table.width / 2 - TABLE_MARGIN))
+
+    objects = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points[mask]))
+    objects.colors = o3d.utility.Vector3dVector(np.asarray(cloud.colors)[mask])
+    objects = objects.voxel_down_sample(voxel)
+    objects, _ = objects.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    return np.asarray(objects.points), np.asarray(objects.colors)
+
+
+# #####################################################################################################
+# 2. PARTE 2 - SEGMENTAÇÃO (2.ª etapa): SEPARAR AS CAIXAS
+# #####################################################################################################
+# Sobre os pontos dos objetos (referencial da mesa; a mesa e o fundo já saíram):
+#   3. separar os objetos com clustering euclidiano (DBSCAN) e decidir quantas caixas tem cada cluster
+#      (é aqui que entra o número de caixas);
+#   4. dentro de um cluster com várias caixas, tentar separá-las pela cor (Nível 4).
+# A divisão final de cada conjunto em caixas é feita na estimativa inicial da Parte 3 (initial_boxes).
+@dataclass
+class Segmentation:
+    """Resultado da segmentação, tudo no referencial da MESA."""
+    points: np.ndarray        # M x 3: pontos dos objetos (filtrados e reduzidos)
+    colors: np.ndarray        # M x 3: cor RGB de cada ponto, em [0, 1]
+    clusters: np.ndarray      # M: índice do cluster euclidiano de cada ponto
+    boxes_per_cluster: dict   # cluster -> quantas caixas se pensa estarem nesse cluster
+    color_groups: dict        # cluster -> rótulo de cor de cada ponto (ou None se a cor não ajuda)
+
+
+# ----------------------------------------------------------------------------------------------------
+# 2.1 Clustering euclidiano e número de caixas por cluster
+# ----------------------------------------------------------------------------------------------------
+def euclidean_clusters(points, eps=CLUSTER_EPS, min_points=10, min_cluster_size=150):
+    """DBSCAN: junta no mesmo cluster os pontos ligados por cadeias de vizinhos a menos de eps metros.
+
+    Clusters com menos de 'min_cluster_size' pontos são ruído (rótulo -1).
+    Saída: rótulo de cada ponto; os clusters ficam numerados do maior (0) para o mais pequeno.
+    """
+    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+                      .cluster_dbscan(eps=eps, min_points=min_points))
+    result = np.full(len(points), -1)
+    sizes = [(np.sum(labels == k), k) for k in range(labels.max() + 1)]
+    for new_label, (size, k) in enumerate(sorted((s for s in sizes if s[0] >= min_cluster_size), reverse=True)):
+        result[labels == k] = new_label
+    return result
+
+
+def largest_component(points, eps=0.012):
+    """Índices da maior componente ligada (DBSCAN) de um conjunto de pontos (retira pontos soltos)."""
+    if len(points) < 20:
+        return np.arange(len(points))
+    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points)).cluster_dbscan(eps, 5))
+    if labels.max() < 0:
+        return np.arange(len(points))
+    return np.nonzero(labels == np.bincount(labels[labels >= 0]).argmax())[0]
+
+
+def footprint_area(points_xy):
+    """Área ocupada por um conjunto de pontos visto de cima: área do retângulo de área mínima."""
+    (_, _), (a, b), _ = cv2.minAreaRect(points_xy.astype(np.float32))
+    return a * b
+
+
+def large_components(points, eps=0.012, fraction=0.1, min_size=50):
+    """Índices das componentes ligadas (DBSCAN) com pelo menos 10% dos pontos da maior (e 50 pontos)."""
+    if len(points) < 20:
+        return np.arange(len(points))
+    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points)).cluster_dbscan(eps, 5))
+    if labels.max() < 0:
+        return np.arange(len(points))
+    sizes = np.bincount(labels[labels >= 0])
+    keep = np.nonzero(sizes >= max(fraction * sizes.max(), min_size))[0]
+    return np.nonzero(np.isin(labels, keep))[0]
+
+
+def components_with(points, n_seed, eps=0.012, min_seed=10, min_size=50):
+    """Índices das componentes ligadas (DBSCAN) que pertencem à caixa.
+
+    Os primeiros n_seed pontos são os de confiança (o topo de uma caixa). Fica uma componente que tem
+    pelo menos min_seed desses pontos, ou que é grande (min_size pontos): um pedaço de parede pode
+    não tocar no topo visível (a caixa de cima tapa o topo quase todo). Saem os grupos pequenos de
+    pontos soltos.
+    """
+    if len(points) < 20:
+        return np.arange(len(points))
+    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points)).cluster_dbscan(eps, 5))
+    seed = labels[:n_seed]
+    keep = [k for k in range(labels.max() + 1)
+            if np.sum(seed == k) >= min_seed or np.sum(labels == k) >= min_size]
+    if not keep:
+        return largest_component(points, eps)
+    return np.nonzero(np.isin(labels, keep))[0]
+
+
+def top_surface_points(points, cell=0.02, tolerance=0.006):
+    """Índices dos pontos que estão no TOPO de alguma caixa.
+
+    Divide o plano da mesa numa grelha de células de 2 cm e, em cada célula, fica com os pontos que
+    estão a menos de 'tolerance' do ponto mais alto da célula. Os pontos das faces laterais ficam de
+    fora (estão mais abaixo do que o topo da mesma célula).
+    """
+    keys = np.floor(points[:, :2] / cell).astype(np.int64)        # célula de cada ponto
+    _, inverse = np.unique(keys, axis=0, return_inverse=True)
+    inverse = inverse.ravel()
+    cell_max = np.full(inverse.max() + 1, -np.inf)
+    np.maximum.at(cell_max, inverse, points[:, 2])                # altura máxima de cada célula
+    return np.nonzero((points[:, 2] > cell_max[inverse] - tolerance) & (points[:, 2] > 0.02))[0]
+
+
+def count_top_levels(points, min_points=30):
+    """Número de topos de caixa (superfícies horizontais separadas) num cluster.
+
+    1. Agrupa os pontos do topo (top_surface_points) com DBSCAN em 3D. Grupos com menos de 30 pontos
+       (ruído) não contam;
+    2. Conta as ALTURAS diferentes desses grupos, e não os grupos: numa pilha, a caixa de cima tapa
+       parte do topo da caixa de baixo, e o que se vê desse topo pode ficar partido em vários pedaços
+       (um de cada lado da caixa de cima). Pedaços a menos de 1.5 cm de altura uns dos outros são
+       o mesmo topo.
+    Serve para as caixas empilhadas: uma pilha de 2 tem 2 topos, a alturas diferentes.
+    """
+    top = points[top_surface_points(points)]
+    if len(top) < min_points:
+        return 1
+    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(top)).cluster_dbscan(0.012, 5))
+    heights = sorted(np.median(top[labels == k, 2]) for k in range(labels.max() + 1)
+                     if np.sum(labels == k) >= min_points)
+    if not heights:
+        return 1
+    # Alturas ordenadas: um novo topo começa sempre que a altura salta mais de 1.5 cm
+    return 1 + int(np.sum(np.diff(heights) > 0.015))
+
+
+def allocate_boxes(points, clusters, num_boxes):
+    """Decide quantas caixas há em cada cluster (o número total de caixas é dado).
+
+    - Tantos clusters como caixas: uma caixa por cluster (Níveis 1 e 2);
+    - Menos clusters do que caixas: algumas caixas tocam-se e formam um só cluster (Níveis 3 e 4,
+      e caixas empilhadas). As caixas extra vão primeiro para os clusters com mais TOPOS do que
+      caixas (uma pilha tem pouca área vista de cima, mas tem vários topos). As que sobram vão,
+      uma a uma, para o cluster com maior área por caixa;
+    - Mais clusters do que caixas: ficam os maiores (os outros são ruído ou outros objetos).
+    Saída: dicionário cluster -> número de caixas.
+    """
+    labels = list(range(clusters.max() + 1))[:num_boxes]
+    counts = {k: 1 for k in labels}
+    areas = {k: footprint_area(points[clusters == k, :2]) for k in labels}
+    tops = {k: count_top_levels(points[clusters == k]) for k in labels} if num_boxes > len(labels) else {}
+    for _ in range(num_boxes - len(labels)):
+        missing = [c for c in labels if tops[c] > counts[c]]
+        if missing:
+            k = max(missing, key=lambda c: areas[c])
+        else:
+            k = max(labels, key=lambda c: areas[c] / counts[c])
+        counts[k] += 1
+    return counts
+
+
+# ----------------------------------------------------------------------------------------------------
+# 2.2 Separação por cor (Nível 4)
+# ----------------------------------------------------------------------------------------------------
+def chroma_features(colors):
+    """Converte cores RGB em cromaticidade normalizada (r, g) = (R, G) / (R + G + B), x 100.
+
+    Cada face da caixa recebe uma iluminação diferente: as faces em sombra são muito mais escuras do
+    que o topo. A sombra multiplica R, G e B pelo MESMO fator, e esse fator cancela-se na divisão,
+    por isso (r, g) é igual em todas as faces da mesma caixa (a mesma ideia do HSV da Parte 02: separar
+    a cor do brilho).
+    Nota: o Lab (a*, b*) não serve: nas faces escuras (a*, b*) aproximam-se de zero e, numa cena de
+    teste, um azul e um roxo deixaram de ser distinguíveis.
+    """
+    colors = colors.astype(np.float64)
+    total = colors.sum(axis=1, keepdims=True) + 1e-3
+    return (colors / total)[:, :2] * 100
+
+
+def color_split(colors, k, min_separation=4.0):
+    """Tenta separar um cluster em k grupos de cor com k-means na cromaticidade.
+
+    Saída: rótulo de cor de cada ponto, ou None se as cores não se distinguem (caixas da mesma cor).
+    Critério: distância entre os centros de cor dividida pelo desvio padrão (robusto) dentro dos
+    grupos tem de ser >= min_separation, e cada grupo tem de ter pelo menos 5% dos pontos.
+    """
+    if k < 2:
+        return None
+    features = chroma_features(colors)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.01)
+    _, labels, centers = cv2.kmeans(features.astype(np.float32), k, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
+    labels = labels.ravel()
+    # Desvio padrão robusto: mediana dos desvios absolutos x 1.4826
+    spread = np.median(np.linalg.norm(features - centers[labels], axis=1)) * 1.4826 + 1e-6
+    center_dist = min(np.linalg.norm(centers[i] - centers[j]) for i in range(k) for j in range(i + 1, k))
+    smallest = np.bincount(labels, minlength=k).min() / len(labels)
+    if center_dist / spread < min_separation or smallest < 0.05:
+        return None
+    return labels
+
+
+def segment(points, colors, num_boxes, use_color=True, verbose=True):
+    """Segmentação das caixas: clusters -> caixas por cluster -> cor.
+
+    Entrada: os pontos das caixas (objetos.ply, no referencial da mesa, já sem a
+    mesa e o fundo), as suas cores e o número de caixas.
+    Saída: objeto Segmentation (tudo no referencial da mesa).
+    """
+    clusters = euclidean_clusters(points)
+    counts = allocate_boxes(points, clusters, num_boxes)
+
+    # Pontos de clusters que não foram usados (ruído) ficam de fora
+    keep = np.isin(clusters, list(counts.keys()))
+    points, colors, clusters = points[keep], colors[keep], clusters[keep]
+
+    # Em cada cluster com várias caixas, tenta separar as caixas pela cor. Primeiro em n cores; se
+    # não der (há caixas com a mesma cor), em n-1, ..., 2 cores: por exemplo, duas caixas verdes e
+    # uma rosa por cima dão 2 grupos de cor, e o grupo verde é depois dividido pela geometria.
+    def partial_color_split(cluster_colors, n):
+        for k in range(n, 1, -1):
+            labels = color_split(cluster_colors, k)
+            if labels is not None:
+                return labels
+        return None
+
+    color_groups = {k: partial_color_split(colors[clusters == k], n) if (use_color and n > 1) else None
+                    for k, n in counts.items()}
+    if verbose:
+        print(f"  {len(points)} pontos de objetos, {len(counts)} clusters euclidianos; "
+              f"caixas por cluster: {counts}; "
+              f"clusters separados por cor: {[k for k, g in color_groups.items() if g is not None]}")
+    return Segmentation(points, colors, clusters, counts, color_groups)
+
+
+# #####################################################################################################
+# 3. SAÍDA: objetos.ply, mesa.json e segmentacao.npz (são a entrada da Parte 3)
+# #####################################################################################################
+OBJECTS_CLOUD = "objetos.ply"           # pontos dos objetos (sem a mesa e o fundo), referencial da mesa
+TABLE_FILE = "mesa.json"                # pose e dimensões da mesa
+SEGMENTATION_FILE = "segmentacao.npz"   # cluster e grupo de cor de cada ponto
+
+
+def save_objects(folder, table, points, colors):
+    """Grava a nuvem de pontos só dos objetos (objetos.ply, com cor) e a mesa (mesa.json)."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+    cloud.colors = o3d.utility.Vector3dVector(colors)
+    o3d.io.write_point_cloud(str(folder / OBJECTS_CLOUD), cloud)
+    info = {"T_camera0_table": np.round(table.T_camera0_table, 9).tolist(),
+            "comprimento": table.length, "largura": table.width,
+            "normal": np.round(table.normal, 9).tolist()}
+    (folder / TABLE_FILE).write_text(json.dumps(info, indent=2), encoding="utf-8")
+
+
+def load_objects(folder):
+    """Lê a mesa (mesa.json) e a nuvem dos objetos (objetos.ply). Saída: (Table, pontos, cores)."""
+    folder = Path(folder)
+    info = json.loads((folder / TABLE_FILE).read_text(encoding="utf-8"))
+    table = Table(np.array(info["T_camera0_table"]), info["comprimento"], info["largura"], np.array(info["normal"]))
+    cloud = o3d.io.read_point_cloud(str(folder / OBJECTS_CLOUD))
+    return table, np.asarray(cloud.points), np.asarray(cloud.colors)
+
+
+def save_segmentation(folder, seg):
+    """Grava a segmentação (segmentacao.npz): pontos, cores, cluster de cada ponto, n.º de caixas de cada
+    cluster e grupo de cor de cada ponto (-1 nos clusters em que a cor não separou as caixas)."""
+    color_group = np.full(len(seg.points), -1)
+    for k, groups in seg.color_groups.items():
+        if groups is not None:
+            color_group[seg.clusters == k] = groups
+    np.savez_compressed(Path(folder) / SEGMENTATION_FILE, points=seg.points, colors=seg.colors,
+                        clusters=seg.clusters, cluster_ids=np.array(list(seg.boxes_per_cluster.keys())),
+                        boxes_per_cluster=np.array(list(seg.boxes_per_cluster.values())),
+                        color_group=color_group)
+
+
+def load_segmentation(folder):
+    """Lê o segmentacao.npz e reconstrói o objeto Segmentation."""
+    d = np.load(Path(folder) / SEGMENTATION_FILE)
+    counts = {int(k): int(n) for k, n in zip(d["cluster_ids"], d["boxes_per_cluster"])}
+    color_groups = {}
+    for k in counts:
+        groups = d["color_group"][d["clusters"] == k]
+        color_groups[k] = groups if len(groups) and groups.min() >= 0 else None
+    return Segmentation(d["points"], d["colors"], d["clusters"], counts, color_groups)
+
+
+# #####################################################################################################
+# 4. VISUALIZAÇÃO
+# #####################################################################################################
+SET_COLORS = plt.cm.tab10(np.arange(10))[:, :3]      # uma cor por conjunto da segmentação
+
+
+def segment_sets(seg):
+    """Conjunto de cada ponto: um por cluster euclidiano ou, se a cor separou o cluster, um por grupo de cor."""
+    sets = np.full(len(seg.points), -1)
+    next_id = 0
+    for k in sorted(seg.boxes_per_cluster):
+        mask = seg.clusters == k
+        groups = seg.color_groups.get(k)
+        if groups is None:
+            sets[mask] = next_id
+            next_id += 1
+        else:
+            sets[mask] = next_id + groups
+            next_id += int(groups.max()) + 1
+    return sets
+
+
+def table_outline(table):
+    """Contorno do tampo (referencial da mesa, z = 0), para desenhar."""
+    c = box_corners_2d(0.0, 0.0, 0.0, table.length, table.width)
+    c = np.vstack([c, c[:1]])
+    return np.column_stack([c, np.zeros(len(c))])
+
+
+def figure_data(r2):
+    """Dados da janela da Parte 2 (r2 = resultado de run_segmentation): uma amostra da nuvem agregada à
+    volta da mesa, os pontos dos objetos com a sua cor e os pontos da segmentação com o conjunto de cada
+    um (tudo no referencial da mesa)."""
+    table, seg = r2["table"], r2["seg"]
+    cloud = transform_points(np.linalg.inv(table.T_camera0_table), np.asarray(r2["cloud"].points))
+    near = np.nonzero((np.abs(cloud[:, 0]) < table.length / 2 + 0.3) & (np.abs(cloud[:, 1]) < table.width / 2 + 0.3)
+                      & (cloud[:, 2] > -0.2) & (cloud[:, 2] < 0.7))[0]
+    near = near[sample_indices(len(near), DISPLAY_POINTS)]
+    obj = sample_indices(len(r2["object_points"]), DISPLAY_POINTS)
+    s = sample_indices(len(seg.points), DISPLAY_POINTS)
+    return {"parte": "parte2_segmentacao", "cena": Path(r2["scene_folder"]).name, "background": cloud[near],
+            "objects": r2["object_points"][obj], "object_colors": r2["object_colors"][obj],
+            "seg_points": seg.points[s], "seg_sets": segment_sets(seg)[s], "table_outline": table_outline(table),
+            "num_boxes": r2["num_boxes"],
+            "boxes_per_cluster": np.array([[k, n] for k, n in sorted(seg.boxes_per_cluster.items())]).reshape(-1, 2)}
+
+
+def make_figures(data):
+    """Janela da Parte 2. Esquerda, como a figura do enunciado: os pontos dos objetos, com a sua cor,
+    isolados do resto da nuvem agregada (a cinzento). Direita: os pontos da segmentação em 3D, com uma
+    cor por conjunto (cluster euclidiano ou, se a cor os separou, grupo de cor)."""
+    fig = plt.figure(figsize=(14, 7))
+    fig.suptitle(f"Parte 2 - segmentação ({data['cena']}, {int(data['num_boxes'])} caixas)")
+    axes = [fig.add_subplot(1, 2, k, projection="3d") for k in (1, 2)]
+    scatter_3d(axes[0], data["background"], "0.72", 0.3)
+    scatter_3d(axes[0], data["objects"], data["object_colors"], 1.5)
+    axes[0].set_title("pontos dos objetos isolados (resto da nuvem agregada a cinzento)")
+    sets = data["seg_sets"]
+    scatter_3d(axes[1], data["seg_points"], SET_COLORS[sets % 10], 1.5)
+    per_cluster = ", ".join(f"cluster {k}: {n}" for k, n in data["boxes_per_cluster"])
+    axes[1].set_title(f"{len(set(sets[sets >= 0]))} conjuntos (cluster euclidiano + cor)\n"
+                      f"caixas por cluster - {per_cluster}")
+    axes[0].plot(*data["table_outline"].T, color="k", lw=1)     # contorno do tampo
+    for ax in axes:
+        ax.view_init(elev=35, azim=-60)
+        ax.set_xlabel("x mesa (m)")
+        ax.set_ylabel("y mesa (m)")
+        ax.set_zlabel("z mesa (m)")
+    set_equal_3d(axes[0], np.vstack([data["background"], data["table_outline"]]))
+    set_equal_3d(axes[1], data["seg_points"])
+    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.03, top=0.9, wspace=0.02)
+    link_views(fig, axes)
+    return [{"name": "", "fig": fig}]
+
+
+# Janela 3D do Open3D (opção --open3d)
+def show_boxes_cloud(points, colors):
+    """A nuvem de pontos só das caixas (objetos.ply), com as cores reais."""
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+    pc.colors = o3d.utility.Vector3dVector(colors)
+    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)    # referencial da mesa
+    o3d.visualization.draw_geometries([pc, frame], window_name="Nuvem de pontos só das caixas (referencial da mesa)")
+
+
+# #####################################################################################################
+# 5. PROGRAMA PRINCIPAL
+# #####################################################################################################
+def ask_num_boxes():
+    """Pergunta no terminal o número de caixas da cena."""
+    while True:
+        answer = input("Número de caixas na mesa: ").strip()
+        if answer.isdigit() and int(answer) > 0:
+            return int(answer)
+        print("  escreve um número inteiro positivo")
+
+
+def run_segmentation(r1, num_boxes, cloud=None, use_color=True, verbose=True):
+    """Parte 2 numa cena: mesa, pontos dos objetos e separação das caixas.
+
+    Entrada: o resultado da Parte 1 (run_registration ou load_registration), o número de caixas e, se
+    já existir, a nuvem agregada (senão as nuvens voltam a ser juntadas com as poses do registo).
+    Grava objetos.ply, mesa.json e segmentacao.npz na pasta das partes.
+    Saída: dicionário com a mesa, os pontos dos objetos, a segmentação e a nuvem agregada.
+    """
+    t0 = time.time()
+    scene = r1["scene"] if r1.get("scene") is not None else load_scene(r1["scene_folder"])
+    registered = r1["registered"]
+    if cloud is None:
+        cloud = r1.get("cloud")
+    if cloud is None:
+        cloud, _ = aggregate(scene, r1["T_cams"], registered)
+    folder = Path(r1["folder"])
+
+    # 1. Mesa (só com as câmaras que entraram na nuvem) e 2. pontos dos objetos
+    used = [k for k, ok in enumerate(registered) if ok]
+    table = detect_table(cloud, [r1["T_cams"][k] for k in used], [scene.views[k] for k in used], verbose=verbose)
+    points, colors = extract_objects(cloud, table)
+    # A nuvem dos objetos é gravada e a separação das caixas usa a nuvem gravada (a mesma que a Parte 3
+    # e o avaliador leem quando correm sozinhos)
+    save_objects(folder, table, points, colors)
+    table, points, colors = load_objects(folder)
+    if verbose:
+        print(f"  {len(points)} pontos dos objetos gravados em {folder / OBJECTS_CLOUD}; {num_boxes} caixas")
+
+    # 3. e 4. Separar as caixas (clusters e cor)
+    seg = segment(points, colors, num_boxes, use_color=use_color, verbose=verbose)
+    save_segmentation(folder, seg)
+    if verbose:
+        print(f"  segmentação gravada em {folder / SEGMENTATION_FILE} ({time.time() - t0:.1f} s)")
+    return {"table": table, "object_points": points, "object_colors": colors, "seg": seg,
+            "num_boxes": num_boxes, "cloud": cloud, "scene_folder": Path(r1["scene_folder"])}
+
+
+def main():
+    """Lê os argumentos da linha de comandos e corre a Parte 2."""
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--scene", required=True, help="pasta da cena (já com a Parte 1 feita)")
+    parser.add_argument("--num_boxes", type=int, help="número de caixas na mesa (se faltar, é perguntado)")
+    parser.add_argument("--no_color", action="store_true", help="não usar a cor para separar as caixas")
+    parser.add_argument("--visualize", action="store_true", help="janela com a segmentação (2 subplots)")
+    parser.add_argument("--open3d", action="store_true", help="janela 3D do Open3D com a nuvem dos objetos")
+    args = parser.parse_args()
+
+    r1 = load_registration(Path(args.scene) / OUTPUT_FOLDER)
+    num_boxes = args.num_boxes if args.num_boxes else ask_num_boxes()
+    r2 = run_segmentation(r1, num_boxes, use_color=not args.no_color)
+    print(f"\nSegmentação gravada em {r1['folder']}. A seguir:\n"
+          f"    python savi/parte3_ajuste.py --scene {args.scene}")
+    if args.visualize:
+        show_figures(make_figures(figure_data(r2)))
+    if args.open3d:
+        show_boxes_cloud(r2["object_points"], r2["object_colors"])
+
+
+if __name__ == "__main__":
+    main()

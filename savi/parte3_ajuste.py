@@ -1,279 +1,63 @@
 #!/usr/bin/env python3
-"""SAVIBoxes - Trabalho 1 de SAVI. SCRIPT 2 de 2: AVALIADOR (n.º de caixas -> caixas -> result.json).
+"""SAVIBoxes - Trabalho 1 de SAVI. PARTE 3: AJUSTE DAS CAIXAS (otimização e bounding box -> result.json).
 
 =====================================================================================================
 COMO CORRER
 =====================================================================================================
-    (a partir da pasta principal do trabalho, DEPOIS do script 1: python savi/detecao_caixas.py --scene ...)
-    python savi/avaliador_caixas.py --detection test/cena_1/detecao --num_boxes 2
-    python savi/avaliador_caixas.py --detection test/cena_1/detecao        # pergunta o n.º de caixas
+    (a partir da pasta principal do trabalho, DEPOIS das Partes 1 e 2)
+    python savi/parte3_ajuste.py --scene test/cena_1
+    python savi/parte3_ajuste.py --scene test/cena_1 --visualize   # janelas: bounding box | otimização
+                                                                   # e evolução da otimização em 3D
 
-Lê a pasta escrita pelo script 1 (detecao_caixas.py): a nuvem de pontos SÓ DAS CAIXAS (caixas.ply) e
-o detecao.json (câmaras e mesa). Com o número de caixas indicado, separa as caixas, ajusta-as por
-otimização e escreve o result.json (por omissão, na pasta da cena) com a pose de cada câmara e a
-pose e as dimensões de cada caixa, tudo no referencial da câmara 000.
+Lê <cena>/partes/ (registo.json da Parte 1; objetos.ply, mesa.json e segmentacao.npz da Parte 2),
+ajusta as caixas pelos dois métodos do enunciado e escreve o result.json (por omissão, na pasta da cena)
+com a pose de cada câmara e a pose e as dimensões de cada caixa, no referencial da câmara 000.
+Grava também <cena>/partes/ajuste.npz (para o avaliador.py).
 
-Opções extra (não mudam o result.json):
-    --evaluate     compara com o ground_truth.json (se a cena o tiver) e mostra tabelas de erros
-    --visualize    abre janelas 3D (segmentação, evolução da otimização, caixas finais)
-    --figures      grava as figuras top_view.png e optimization.png ao lado do result.json
-
-Avaliação em várias cenas (corre os 2 scripts em cada cena; tabelas em results_offline/results.md):
-    python savi/avaliador_caixas.py --evaluate_scenes scenes_offline/level_* scenes_offline/stack_*
-    python savi/avaliador_caixas.py --evaluate_scenes scenes_offline/level_* --gt_registration
+Ordem das partes (o run_test.py corre-as todas, cena a cena):
+    parte1_registo.py      -> <cena>/partes/registo.json   (pose de cada câmara)
+    extra_fotometria.py    -> <cena>/partes/fotometria.json (ganho e desvio de cada imagem)
+    parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (precisa do n.º de caixas)
+    parte3_ajuste.py       -> result.json e <cena>/partes/ajuste.npz
+    avaliador.py           -> erros em relação ao ground truth (só nas cenas que o têm)
 
 =====================================================================================================
-ORGANIZAÇÃO DESTE FICHEIRO (pela ordem do enunciado)
+ORGANIZAÇÃO DESTE FICHEIRO
 =====================================================================================================
-    3. PARTE 2 - Segmentação  separar as caixas: clusters euclidianos (DBSCAN), n.º de caixas por
-                              cluster e cor
-    4. PARTE 3 - Ajuste   estimativa inicial + otimização com scipy.optimize.least_squares
-    5. Método base        bounding box orientada (só para comparar com a otimização)
-    6. Avaliação          erros de uma cena em relação ao ground truth (câmaras, segmentação, caixas, IoU 3D)
-    7. Visualização       janelas 3D (Open3D) e figuras PNG (matplotlib)
-    8. Várias cenas       corre várias cenas e escreve as tabelas de erros (--evaluate_scenes)
-    9. Programa principal ler a deteção do script 1, run() e main()
-(As secções 0 a 2 - geometria, leitura da cena e registo - estão no script 1, detecao_caixas.py.
- As convenções - T_A_B, referencial da mesa, caixa = [x, y, yaw, length, width, height, z] - também.)
+    1. Otimização         estimativa inicial + modelo da caixa + função objetivo + least_squares
+    2. Método base        bounding box orientada (só para comparar com a otimização)
+    3. Saída              gravar e ler o ajuste.npz e escrever o result.json
+    4. Visualização       janela com 2 subplots (bounding box | otimização) e evolução 3D da otimização
+    5. Programa principal run_fit() e main()
+(Convenções: caixa = [x, y, yaw, length, width, height, z] no referencial da mesa; ver parte1_registo.py.)
 """
 
 import argparse
-import glob
-import json
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2                                   # OpenCV: k-means, retângulos
-import matplotlib
-matplotlib.use("Agg")                        # o matplotlib só grava ficheiros PNG (não abre janelas)
-import matplotlib.pyplot as plt              # figuras (secção 7)
+import matplotlib.pyplot as plt              # janelas (secção 4)
 import numpy as np
-import open3d as o3d                         # nuvens de pontos: DBSCAN, bounding boxes, janelas 3D
-from scipy.optimize import least_squares, linear_sum_assignment   # otimização (Parte 3) / emparelhar caixas (avaliação)
+import open3d as o3d                         # nuvens de pontos: bounding boxes, janelas 3D
+from matplotlib.animation import FuncAnimation   # evolução da otimização em 3D
+from scipy.optimize import least_squares     # otimização (Parte 05/06)
 from scipy.spatial import cKDTree            # procura rápida do vizinho mais próximo
 
-# O script 1 está na mesma pasta: junta-a aos sítios onde o Python procura módulos
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import detecao_caixas as det                 # noqa: E402 (script 1: deteção)
-from detecao_caixas import (  # noqa: E402 (funções do script 1 usadas aqui)
-    CLUSTER_EPS, Table, aggregate, box_T_table, box_corners_2d, box_lines_3d, box_signed_distance,
-    boxes_to_camera0, load_scene, rotation_angle_deg, transform_points, wrap_angle, write_result, yaw_of,
+from parte1_registo import (  # funções da Parte 1 usadas aqui
+    DISPLAY_POINTS, OUTPUT_FOLDER, box_corners_2d, box_lines_3d, box_signed_distance, box_T_table,
+    boxes_to_camera0, load_ground_truth, load_registration, sample_indices, scatter_3d, set_equal_3d,
+    show_figures, wrap_angle, write_result, yaw_of,
+)
+from parte2_segmentacao import (  # funções da Parte 2 usadas aqui
+    allocate_boxes, chroma_features, components_with, large_components, largest_component, load_objects,
+    load_segmentation, top_surface_points,
 )
 
 
 # #####################################################################################################
-# 3. PARTE 2 - SEGMENTAÇÃO (2.ª metade): SEPARAR AS CAIXAS
-# #####################################################################################################
-# Sobre a nuvem SÓ DAS CAIXAS gravada pelo script 1 (referencial da mesa; a mesa e o fundo já saíram):
-#   3. separar os objetos com clustering euclidiano (DBSCAN) e decidir quantas caixas tem cada cluster
-#      (é aqui que entra o número de caixas);
-#   4. dentro de um cluster com várias caixas, tentar separá-las pela cor (Nível 4).
-# (Os passos 1 e 2 - mesa e pontos das caixas - estão no script 1.)
-
-@dataclass
-class Segmentation:
-    """Resultado da segmentação, tudo no referencial da MESA."""
-    points: np.ndarray        # M x 3: pontos dos objetos (filtrados e reduzidos)
-    colors: np.ndarray        # M x 3: cor RGB de cada ponto, em [0, 1]
-    clusters: np.ndarray      # M: índice do cluster euclidiano de cada ponto
-    boxes_per_cluster: dict   # cluster -> quantas caixas se pensa estarem nesse cluster
-    color_groups: dict        # cluster -> rótulo de cor de cada ponto (ou None se a cor não ajuda)
-
-# ----------------------------------------------------------------------------------------------------
-# 3.3 Clustering euclidiano e número de caixas por cluster
-# ----------------------------------------------------------------------------------------------------
-def euclidean_clusters(points, eps=CLUSTER_EPS, min_points=10, min_cluster_size=150):
-    """DBSCAN: junta no mesmo cluster os pontos ligados por cadeias de vizinhos a menos de eps metros.
-
-    Clusters com menos de 'min_cluster_size' pontos são ruído (rótulo -1).
-    Saída: rótulo de cada ponto; os clusters ficam numerados do maior (0) para o mais pequeno.
-    """
-    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-                      .cluster_dbscan(eps=eps, min_points=min_points))
-    result = np.full(len(points), -1)
-    sizes = [(np.sum(labels == k), k) for k in range(labels.max() + 1)]
-    for new_label, (size, k) in enumerate(sorted((s for s in sizes if s[0] >= min_cluster_size), reverse=True)):
-        result[labels == k] = new_label
-    return result
-
-
-def footprint_area(points_xy):
-    """Área ocupada por um conjunto de pontos visto de cima: área do retângulo de área mínima."""
-    (_, _), (a, b), _ = cv2.minAreaRect(points_xy.astype(np.float32))
-    return a * b
-
-
-def large_components(points, eps=0.012, fraction=0.1, min_size=50):
-    """Índices das componentes ligadas (DBSCAN) com pelo menos 10% dos pontos da maior (e 50 pontos)."""
-    if len(points) < 20:
-        return np.arange(len(points))
-    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points)).cluster_dbscan(eps, 5))
-    if labels.max() < 0:
-        return np.arange(len(points))
-    sizes = np.bincount(labels[labels >= 0])
-    keep = np.nonzero(sizes >= max(fraction * sizes.max(), min_size))[0]
-    return np.nonzero(np.isin(labels, keep))[0]
-
-
-def components_with(points, n_seed, eps=0.012, min_seed=10, min_size=50):
-    """Índices das componentes ligadas (DBSCAN) que pertencem à caixa.
-
-    Os primeiros n_seed pontos são os de confiança (o topo de uma caixa). Fica uma componente que tem
-    pelo menos min_seed desses pontos, ou que é grande (min_size pontos): um pedaço de parede pode
-    não tocar no topo visível (a caixa de cima tapa o topo quase todo). Saem os grupos pequenos de
-    pontos soltos.
-    """
-    if len(points) < 20:
-        return np.arange(len(points))
-    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points)).cluster_dbscan(eps, 5))
-    seed = labels[:n_seed]
-    keep = [k for k in range(labels.max() + 1)
-            if np.sum(seed == k) >= min_seed or np.sum(labels == k) >= min_size]
-    if not keep:
-        return largest_component(points, eps)
-    return np.nonzero(np.isin(labels, keep))[0]
-
-
-def top_surface_points(points, cell=0.02, tolerance=0.006):
-    """Índices dos pontos que estão no TOPO de alguma caixa.
-
-    Divide o plano da mesa numa grelha de células de 2 cm e, em cada célula, fica com os pontos que
-    estão a menos de 'tolerance' do ponto mais alto da célula. Os pontos das faces laterais ficam de
-    fora (estão mais abaixo do que o topo da mesma célula).
-    """
-    keys = np.floor(points[:, :2] / cell).astype(np.int64)        # célula de cada ponto
-    _, inverse = np.unique(keys, axis=0, return_inverse=True)
-    inverse = inverse.ravel()
-    cell_max = np.full(inverse.max() + 1, -np.inf)
-    np.maximum.at(cell_max, inverse, points[:, 2])                # altura máxima de cada célula
-    return np.nonzero((points[:, 2] > cell_max[inverse] - tolerance) & (points[:, 2] > 0.02))[0]
-
-
-def count_top_levels(points, min_points=30):
-    """Número de topos de caixa (superfícies horizontais separadas) num cluster.
-
-    1. Agrupa os pontos do topo (top_surface_points) com DBSCAN em 3D. Grupos com menos de 30 pontos
-       (ruído) não contam;
-    2. Conta as ALTURAS diferentes desses grupos, e não os grupos: numa pilha, a caixa de cima tapa
-       parte do topo da caixa de baixo, e o que se vê desse topo pode ficar partido em vários pedaços
-       (um de cada lado da caixa de cima). Pedaços a menos de 1.5 cm de altura uns dos outros são
-       o mesmo topo.
-    Serve para as caixas empilhadas: uma pilha de 2 tem 2 topos, a alturas diferentes.
-    """
-    top = points[top_surface_points(points)]
-    if len(top) < min_points:
-        return 1
-    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(top)).cluster_dbscan(0.012, 5))
-    heights = sorted(np.median(top[labels == k, 2]) for k in range(labels.max() + 1)
-                     if np.sum(labels == k) >= min_points)
-    if not heights:
-        return 1
-    # Alturas ordenadas: um novo topo começa sempre que a altura salta mais de 1.5 cm
-    return 1 + int(np.sum(np.diff(heights) > 0.015))
-
-
-def allocate_boxes(points, clusters, num_boxes):
-    """Decide quantas caixas há em cada cluster (o número total de caixas é dado).
-
-    - Tantos clusters como caixas: uma caixa por cluster (Níveis 1 e 2);
-    - Menos clusters do que caixas: algumas caixas tocam-se e formam um só cluster (Níveis 3 e 4,
-      e caixas empilhadas). As caixas extra vão primeiro para os clusters com mais TOPOS do que
-      caixas (uma pilha tem pouca área vista de cima, mas tem vários topos). As que sobram vão,
-      uma a uma, para o cluster com maior área por caixa;
-    - Mais clusters do que caixas: ficam os maiores (os outros são ruído ou outros objetos).
-    Saída: dicionário cluster -> número de caixas.
-    """
-    labels = list(range(clusters.max() + 1))[:num_boxes]
-    counts = {k: 1 for k in labels}
-    areas = {k: footprint_area(points[clusters == k, :2]) for k in labels}
-    tops = {k: count_top_levels(points[clusters == k]) for k in labels} if num_boxes > len(labels) else {}
-    for _ in range(num_boxes - len(labels)):
-        missing = [c for c in labels if tops[c] > counts[c]]
-        if missing:
-            k = max(missing, key=lambda c: areas[c])
-        else:
-            k = max(labels, key=lambda c: areas[c] / counts[c])
-        counts[k] += 1
-    return counts
-
-
-# ----------------------------------------------------------------------------------------------------
-# 3.4 Separação por cor (Nível 4)
-# ----------------------------------------------------------------------------------------------------
-def chroma_features(colors):
-    """Converte cores RGB em cromaticidade normalizada (r, g) = (R, G) / (R + G + B), x 100.
-
-    Cada face da caixa recebe uma iluminação diferente: as faces em sombra são muito mais escuras do
-    que o topo. A sombra multiplica R, G e B pelo MESMO fator, e esse fator cancela-se na divisão,
-    por isso (r, g) é igual em todas as faces da mesma caixa (a mesma ideia do HSV da Parte 02: separar
-    a cor do brilho).
-    Nota: o Lab (a*, b*) não serve: nas faces escuras (a*, b*) aproximam-se de zero e, numa cena de
-    teste, um azul e um roxo deixaram de ser distinguíveis.
-    """
-    colors = colors.astype(np.float64)
-    total = colors.sum(axis=1, keepdims=True) + 1e-3
-    return (colors / total)[:, :2] * 100
-
-
-def color_split(colors, k, min_separation=4.0):
-    """Tenta separar um cluster em k grupos de cor com k-means na cromaticidade.
-
-    Saída: rótulo de cor de cada ponto, ou None se as cores não se distinguem (caixas da mesma cor).
-    Critério: distância entre os centros de cor dividida pelo desvio padrão (robusto) dentro dos
-    grupos tem de ser >= min_separation, e cada grupo tem de ter pelo menos 5% dos pontos.
-    """
-    if k < 2:
-        return None
-    features = chroma_features(colors)
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.01)
-    _, labels, centers = cv2.kmeans(features.astype(np.float32), k, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
-    labels = labels.ravel()
-    # Desvio padrão robusto: mediana dos desvios absolutos x 1.4826
-    spread = np.median(np.linalg.norm(features - centers[labels], axis=1)) * 1.4826 + 1e-6
-    center_dist = min(np.linalg.norm(centers[i] - centers[j]) for i in range(k) for j in range(i + 1, k))
-    smallest = np.bincount(labels, minlength=k).min() / len(labels)
-    if center_dist / spread < min_separation or smallest < 0.05:
-        return None
-    return labels
-
-
-def segment(points, colors, num_boxes, use_color=True, verbose=True):
-    """Segmentação das caixas: clusters -> caixas por cluster -> cor.
-
-    Entrada: os pontos das caixas (a nuvem gravada pelo script 1, no referencial da mesa, já sem a
-    mesa e o fundo), as suas cores e o número de caixas.
-    Saída: objeto Segmentation (tudo no referencial da mesa).
-    """
-    clusters = euclidean_clusters(points)
-    counts = allocate_boxes(points, clusters, num_boxes)
-
-    # Pontos de clusters que não foram usados (ruído) ficam de fora
-    keep = np.isin(clusters, list(counts.keys()))
-    points, colors, clusters = points[keep], colors[keep], clusters[keep]
-
-    # Em cada cluster com várias caixas, tenta separar as caixas pela cor. Primeiro em n cores; se
-    # não der (há caixas com a mesma cor), em n-1, ..., 2 cores: por exemplo, duas caixas verdes e
-    # uma rosa por cima dão 2 grupos de cor, e o grupo verde é depois dividido pela geometria.
-    def partial_color_split(cluster_colors, n):
-        for k in range(n, 1, -1):
-            labels = color_split(cluster_colors, k)
-            if labels is not None:
-                return labels
-        return None
-
-    color_groups = {k: partial_color_split(colors[clusters == k], n) if (use_color and n > 1) else None
-                    for k, n in counts.items()}
-    if verbose:
-        print(f"  {len(points)} pontos de objetos, {len(counts)} clusters euclidianos; "
-              f"caixas por cluster: {counts}; "
-              f"clusters separados por cor: {[k for k, g in color_groups.items() if g is not None]}")
-    return Segmentation(points, colors, clusters, counts, color_groups)
-
-
-# #####################################################################################################
-# 4. PARTE 3 - AJUSTE DAS CAIXAS POR OTIMIZAÇÃO
+# 1. PARTE 3 - AJUSTE DAS CAIXAS POR OTIMIZAÇÃO
 # #####################################################################################################
 # Função objetivo (um vetor de resíduos que o scipy.optimize.least_squares minimiza, Parte 05/06):
 #   1. Dados -> modelo: para cada ponto, a distância à superfície da caixa que melhor o explica.
@@ -286,7 +70,6 @@ def segment(points, colors, num_boxes, use_color=True, verbose=True):
 #      posição E a sua cor (Nível 4).
 # A perda robusta 'soft_l1' (Parte 06, Ex. 5) faz com que uns poucos pontos errados (flying pixels,
 # cores trocadas junto às fronteiras) não estraguem o resultado.
-
 NUM_PARAMS = 7            # x, y, yaw, length, width, height, z
 FIT_VOXEL = 0.006         # m: os pontos são reduzidos a este voxel antes da otimização
 MAX_FIT_POINTS = 12000    # e limitados a este número (velocidade)
@@ -298,22 +81,12 @@ NORMAL_PENALTY = 0.02     # m: custo extra de explicar um ponto com uma face de 
 
 
 # ----------------------------------------------------------------------------------------------------
-# 4.1 Estimativa inicial (Parte 06, Ex. 6: a otimização precisa de começar perto da solução)
+# 1.1 Estimativa inicial (Parte 06, Ex. 6: a otimização precisa de começar perto da solução)
 # ----------------------------------------------------------------------------------------------------
 def rect_params(points_xy):
     """Retângulo de área mínima de pontos 2D (cv2.minAreaRect) -> [x, y, yaw, length, width]."""
     (cx, cy), (a, b), angle = cv2.minAreaRect(points_xy.astype(np.float32))
     return np.array([cx, cy, np.radians(angle), max(a, 0.02), max(b, 0.02)])
-
-
-def largest_component(points, eps=0.012):
-    """Índices da maior componente ligada (DBSCAN) de um conjunto de pontos (retira pontos soltos)."""
-    if len(points) < 20:
-        return np.arange(len(points))
-    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points)).cluster_dbscan(eps, 5))
-    if labels.max() < 0:
-        return np.arange(len(points))
-    return np.nonzero(labels == np.bincount(labels[labels >= 0]).argmax())[0]
 
 
 def split_kmeans(group):
@@ -622,7 +395,7 @@ def initial_boxes(seg, split_method="kmeans"):
 
 
 # ----------------------------------------------------------------------------------------------------
-# 4.2 Modelo da caixa
+# 1.2 Modelo da caixa
 # ----------------------------------------------------------------------------------------------------
 def to_box_frame(points, p):
     """Escreve pontos do referencial da mesa no referencial da caixa p (origem no centro da caixa)."""
@@ -753,7 +526,7 @@ def normalize_box(p):
 
 
 # ----------------------------------------------------------------------------------------------------
-# 4.3 Função objetivo
+# 1.3 Função objetivo e otimização
 # ----------------------------------------------------------------------------------------------------
 @dataclass
 class FitProblem:
@@ -936,7 +709,7 @@ def fit_boxes(seg, init_params, init_colors, use_color=True, use_normals=True, c
 
 
 # #####################################################################################################
-# 5. MÉTODO BASE: BOUNDING BOX ORIENTADA (só para comparar com a otimização)
+# 2. MÉTODO BASE: BOUNDING BOX ORIENTADA (só para comparar com a otimização)
 # #####################################################################################################
 def bbox_box(points, minimal=True, stacked=False):
     """Bounding box orientada (Parte 08, Ex. 5) de um conjunto de pontos -> [x, y, yaw, l, w, h, z].
@@ -987,31 +760,40 @@ def bbox_method(seg_points, box_labels, num_boxes, minimal=True, init_params=Non
 
 
 # #####################################################################################################
-# 6. AVALIAÇÃO DE UMA CENA (comparação com o ground truth; só para avaliar, NUNCA para estimar)
+# 3. SAÍDA: ajuste.npz (para o avaliador) e result.json
 # #####################################################################################################
-# Usado pela opção --evaluate, pela opção --evaluate_scenes e pelo run_test.py.
-#   - Registo: erro de translação (mm) e de rotação (graus) de cada câmara;
-#   - Segmentação: n.º de conjuntos encontrados, precisão e recall de cada conjunto de pontos;
-#   - Caixas: erro de posição (mm), de yaw (graus), das dimensões (mm), da altura da base (mm) e IoU 3D,
-#     tendo em conta as simetrias da caixa (rodar 180° ou trocar comprimento e largura é a mesma caixa).
-
-# --------------------------------------------------------------------------------------
-# Registo
-# --------------------------------------------------------------------------------------
-def camera_errors(T_est_list, ground_truth):
-    """Lista de (imagem, erro de translação em mm, erro de rotação em graus)."""
-    rows = []
-    for T_est, cam in zip(T_est_list, ground_truth["cameras"]):
-        T_gt = np.array(cam["T_camera0_camera"])
-        t_err = np.linalg.norm(T_est[:3, 3] - T_gt[:3, 3]) * 1000
-        r_err = rotation_angle_deg(T_est[:3, :3].T @ T_gt[:3, :3])   # ângulo de R_est^T R_gt
-        rows.append((cam["image"], t_err, r_err))
-    return rows
+FIT_FILE = "ajuste.npz"     # caixas dos dois métodos, estimativa inicial, caixa de cada ponto, evolução
 
 
-# --------------------------------------------------------------------------------------
-# Caixas
-# --------------------------------------------------------------------------------------
+def save_fit(folder, r3):
+    """Grava o ajuste (ajuste.npz): caixas da otimização e da bounding box, estimativa inicial, caixa
+    atribuída a cada ponto da segmentação e as caixas em cada passo da otimização."""
+    np.savez_compressed(Path(folder) / FIT_FILE, params_opt=r3["params_opt"],
+                        params_bbox=np.asarray(r3["params_bbox"]).reshape(-1, NUM_PARAMS),
+                        init_params=r3["init_params"], box_labels=r3["box_labels"],
+                        snapshots=np.array(evolution_snapshots(r3["problem"].history)))
+
+
+def load_fit(folder):
+    """Lê o ajuste.npz. Saída: dicionário com as mesmas chaves que run_fit (sem o problema de otimização)."""
+    d = np.load(Path(folder) / FIT_FILE)
+    return {k: d[k] for k in d.files}
+
+
+def write_scene_result(path, r1, r2, r3, method="opt"):
+    """Escreve o result.json: pose de cada câmara (Parte 1) e as caixas do método escolhido (otimização
+    ou bounding box), passadas do referencial da mesa para o da câmara 000."""
+    params = r3["params_opt"] if method == "opt" else r3["params_bbox"]
+    boxes = boxes_to_camera0(params, r2["table"].T_camera0_table)
+    return write_result(path, r1["images"], r1["T_cams"], boxes)
+
+
+# #####################################################################################################
+# 4. VISUALIZAÇÃO
+# #####################################################################################################
+BOX_COLORS = [(0.9, 0.1, 0.1), (0.1, 0.4, 0.9), (0.1, 0.7, 0.2), (0.9, 0.6, 0.0), (0.6, 0.2, 0.8), (0.0, 0.7, 0.7)]
+
+
 def gt_params_in_table(ground_truth, T_camera0_table):
     """Caixas verdadeiras no referencial da mesa estimada (só para desenhar nas figuras)."""
     T_table_camera0 = np.linalg.inv(T_camera0_table)
@@ -1023,164 +805,159 @@ def gt_params_in_table(ground_truth, T_camera0_table):
     return np.array(params)
 
 
-def print_evaluation(r):
-    """Mostra no terminal as tabelas de erros de uma cena (r = resultado de run())."""
-    gt = r["ground_truth"]
-    print("\nRegisto (erro de cada câmara):")
-    print(f"  {'imagem':8s}{'transl. (mm)':>14s}{'rot. (°)':>10s}")
-    for name, t, a in camera_errors(r["T_cams"], gt):
-        print(f"  {name:8s}{t:14.2f}{a:10.3f}")
-
-    n_sets, n_gt, seg_rows = evaluate_segmentation(
-        r["seg"].points, r["box_labels"], r["table"].T_camera0_table, full_cloud_points(r), gt)
-    print(f"\nSegmentação: {n_sets} conjuntos para {n_gt} caixas")
-    for row in seg_rows:
-        print(f"  caixa {row['gt_box']}: precisão {row['precision']:.3f}, recall {row['recall']:.3f}")
-
-    T_ct = r["table"].T_camera0_table
-    for name in ("bbox", "opt"):
-        rows = evaluate_boxes(boxes_to_camera0(r[f"params_{name}"], T_ct), gt)
-        print(f"\nCaixas - {'bounding box' if name == 'bbox' else 'otimização'}:")
-        print(f"  {'caixa':6s}{'pos (mm)':>10s}{'yaw (°)':>9s}{'dL (mm)':>9s}{'dW (mm)':>9s}{'dH (mm)':>9s}"
-              f"{'dz (mm)':>9s}{'IoU':>7s}")
-        for j, e in enumerate(rows):
-            print(f"  {j:<6d}{e['pos_mm']:10.1f}{e['yaw_deg']:9.2f}{e['dl_mm']:9.1f}{e['dw_mm']:9.1f}"
-                  f"{e['dh_mm']:9.1f}{e['dz_mm']:9.1f}{e['iou']:7.3f}")
-        print(f"  IoU médio: {np.mean([e['iou'] for e in rows]):.3f}")
+# ----------------------------------------------------------------------------------------------------
+# Janelas (matplotlib): bounding box | otimização, e evolução da otimização em 3D
+# ----------------------------------------------------------------------------------------------------
+def _draw_rects(ax, params, style, label=None):
+    for j, p in enumerate(params):
+        c = box_corners_2d(p[0], p[1], p[2], p[3], p[4])
+        c = np.vstack([c, c[:1]])
+        color = style.get("color") or BOX_COLORS[j % len(BOX_COLORS)]
+        ax.plot(c[:, 0], c[:, 1], color=color, lw=style.get("lw", 1.5), ls=style.get("ls", "-"),
+                label=label if j == 0 else None)
 
 
-def _box_in_world(T_world_box, length, width, height):
-    """Descrição de uma caixa no referencial do mundo (z para cima): centro, yaw e dimensões."""
-    return {"center": T_world_box[:3, 3], "yaw": yaw_of(T_world_box[:3, :3]),
-            "dims": np.array([length, width, height])}
+MAX_FRAMES = 60             # passos da otimização mostrados na animação 3D
 
 
-def iou_3d(a, b):
-    """IoU 3D de duas caixas com z para cima.
-
-    Volume da interseção = área da interseção dos retângulos vistos de cima
-                           x sobreposição dos intervalos de altura.
-    """
-    r1 = (tuple(a["center"][:2]), tuple(a["dims"][:2]), np.degrees(a["yaw"]))
-    r2 = (tuple(b["center"][:2]), tuple(b["dims"][:2]), np.degrees(b["yaw"]))
-    status, region = cv2.rotatedRectangleIntersection(r1, r2)
-    area = 0.0
-    if status != cv2.INTERSECT_NONE and region is not None and len(region) >= 3:
-        area = cv2.contourArea(cv2.convexHull(region.reshape(-1, 2).astype(np.float32)))
-    z1 = (a["center"][2] - a["dims"][2] / 2, a["center"][2] + a["dims"][2] / 2)
-    z2 = (b["center"][2] - b["dims"][2] / 2, b["center"][2] + b["dims"][2] / 2)
-    dz = max(0.0, min(z1[1], z2[1]) - max(z1[0], z2[0]))
-    inter = area * dz
-    union = np.prod(a["dims"]) + np.prod(b["dims"]) - inter
-    return inter / union if union > 0 else 0.0
+def snapshot_frames(snapshots, max_frames=MAX_FRAMES):
+    """Até max_frames passos da otimização, igualmente espaçados (com o primeiro e o último), cada um como
+    uma lista de caixas [x, y, yaw, l, w, h, z]. Saída: (caixas de cada passo, número de cada passo)."""
+    snapshots = np.asarray(snapshots)
+    picks = np.unique(np.linspace(0, len(snapshots) - 1, min(max_frames, len(snapshots))).astype(int))
+    frames = np.array([[normalize_box(p) for p in snapshots[k].reshape(-1, NUM_PARAMS)] for k in picks])
+    return frames, picks
 
 
-def box_errors(est, gt):
-    """Erros de uma caixa estimada em relação à verdadeira, com as simetrias.
-
-    Versões equivalentes da caixa verdadeira: rodar k*90° em torno de z (k = 0..3), trocando
-    length com width quando k é ímpar. Ficamos com a versão de menor erro de yaw.
-    """
-    pos_err = np.linalg.norm(est["center"] - gt["center"]) * 1000
-    best = None
-    for k in range(4):
-        yaw_err = abs(np.degrees(wrap_angle(est["yaw"] - gt["yaw"] - k * np.pi / 2)))
-        dims_gt = gt["dims"][[1, 0, 2]] if k % 2 else gt["dims"]
-        dim_err = (est["dims"] - dims_gt) * 1000
-        score = yaw_err + np.abs(dim_err).sum() * 0.01      # yaw primeiro; dimensões desempatam (caixas quadradas)
-        if best is None or score < best[0]:
-            best = (score, yaw_err, dim_err)
-    _, yaw_err, dim_err = best
-    # Erro de altura: diferença entre as alturas das BASES (z = centro - height/2)
-    z_err = ((est["center"][2] - est["dims"][2] / 2) - (gt["center"][2] - gt["dims"][2] / 2)) * 1000
-    return {"pos_mm": pos_err, "yaw_deg": yaw_err, "dl_mm": dim_err[0], "dw_mm": dim_err[1],
-            "dh_mm": dim_err[2], "dz_mm": z_err, "iou": iou_3d(est, gt)}
+def figure_data(r2, r3, gt_params=None):
+    """Dados das janelas da Parte 3 (r2 = Parte 2, r3 = resultado de run_fit ou load_fit): uma amostra dos
+    pontos dos objetos, as caixas dos dois métodos, as caixas ao longo da otimização e, se houver ground
+    truth, as caixas verdadeiras (só para desenhar)."""
+    seg = r2["seg"]
+    s = sample_indices(len(seg.points), DISPLAY_POINTS)
+    snapshots = evolution_snapshots(r3["problem"].history) if "problem" in r3 else r3["snapshots"]
+    frames, steps = snapshot_frames(snapshots)
+    return {"parte": "parte3_ajuste", "cena": Path(r2["scene_folder"]).name, "points": seg.points[s],
+            "colors": seg.colors[s], "params_bbox": np.asarray(r3["params_bbox"]).reshape(-1, NUM_PARAMS),
+            "params_opt": np.asarray(r3["params_opt"]).reshape(-1, NUM_PARAMS), "frames": frames,
+            "steps": steps, "total_steps": len(snapshots) - 1,
+            "gt_params": np.zeros((0, NUM_PARAMS)) if gt_params is None else np.asarray(gt_params)}
 
 
-def evaluate_boxes(est_boxes, ground_truth):
-    """Associa cada caixa estimada a uma verdadeira (máximo IoU, algoritmo húngaro) e calcula os erros.
-
-    Para comparar no referencial do mundo (onde z é exatamente perpendicular à mesa), as caixas
-    estimadas são levadas para o mundo com a pose VERDADEIRA da câmara 0 (só na avaliação).
-    Caixas verdadeiras sem correspondência contam com IoU = 0.
-    """
-    T_world_camera0 = np.array(ground_truth["cameras"][0]["T_world_camera"])
-    gt = [_box_in_world(np.array(b["T_world_box"]), b["length"], b["width"], b["height"])
-          for b in ground_truth["boxes"]]
-    est = [_box_in_world(T_world_camera0 @ b["T_camera0_box"], b["length"], b["width"], b["height"])
-           for b in est_boxes]
-
-    iou = np.array([[iou_3d(e, g) for g in gt] for e in est]).reshape(len(est), len(gt))
-    rows_est, cols_gt = linear_sum_assignment(-iou) if len(est) else ([], [])
-    results = []
-    matched = {}
-    for i, j in zip(rows_est, cols_gt):
-        matched[j] = box_errors(est[i], gt[j])
-    for j in range(len(gt)):
-        results.append(matched.get(j, {"pos_mm": np.nan, "yaw_deg": np.nan, "dl_mm": np.nan,
-                                       "dw_mm": np.nan, "dh_mm": np.nan, "dz_mm": np.nan,
-                                       "iou": 0.0}))
-    return results
+def box_edges_3d(p):
+    """As 12 arestas de uma caixa [x, y, yaw, l, w, h, z] (referencial da mesa), cada uma 2 x 3."""
+    corners, edges = box_lines_3d(box_T_table(p[0], p[1], p[2], p[5], p[6]), p[3], p[4], p[5])
+    return [corners[list(e)] for e in edges]
 
 
-# --------------------------------------------------------------------------------------
-# Segmentação
-# --------------------------------------------------------------------------------------
-def inside_gt_boxes(points_camera0, ground_truth, margin=0.005):
-    """Para cada caixa verdadeira, máscara dos pontos (referencial da câmara 0) que estão dentro dela
-    (com uma margem de 5 mm por causa do ruído)."""
-    masks = []
-    for b in ground_truth["boxes"]:
-        T_box_camera0 = np.linalg.inv(np.array(b["T_camera0_box"]))
-        local = transform_points(T_box_camera0, points_camera0)
-        half = np.array([b["length"], b["width"], b["height"]]) / 2 + margin
-        masks.append(np.all(np.abs(local) <= half, axis=1))
-    return masks
+def _top_view(ax, data, params, title):
+    """Um subplot da vista de cima: pontos dos objetos, caixas de um método e (se houver) as verdadeiras."""
+    ax.scatter(data["points"][:, 0], data["points"][:, 1], c=data["colors"], s=1)
+    if len(data["gt_params"]):
+        _draw_rects(ax, data["gt_params"], {"color": "k", "lw": 2.5}, "verdadeira")
+    _draw_rects(ax, params, {"lw": 2}, "estimada")
+    ax.set_aspect("equal")
+    ax.set_xlabel("x mesa (m)")
+    ax.set_ylabel("y mesa (m)")
+    ax.set_title(f"{title} ({len(params)} caixas)")
+    ax.legend(loc="upper right", fontsize=8)
 
 
-def evaluate_segmentation(points_table, labels, T_camera0_table, all_points_camera0, ground_truth, voxel=0.004):
-    """Precisão e recall dos conjuntos de pontos de cada caixa.
+def make_figures(data):
+    """Janelas da Parte 3:
+    1. dois subplots (vista de cima): método base (bounding box) | método principal (otimização);
+    2. a evolução das caixas ao longo da otimização, em 3D, sobre a nuvem de pontos (animação; a figura
+       gravada mostra o estado final)."""
+    figures = []
+    fig, axes = plt.subplots(1, 2, figsize=(13, 6.5), sharex=True, sharey=True)
+    fig.suptitle(f"Parte 3 - ajuste das caixas ({data['cena']})")
+    _top_view(axes[0], data, data["params_bbox"], "Método base: bounding box")
+    _top_view(axes[1], data, data["params_opt"], "Método principal: otimização")
+    fig.tight_layout()
+    figures.append({"name": "", "fig": fig})
 
-    points_table, labels: pontos segmentados (referencial da mesa) e caixa atribuída a cada um.
-    all_points_camera0: TODOS os pontos da nuvem agregada (para saber quantos pontos tem cada caixa
-                        verdadeira, incluindo os que a segmentação deitou fora).
-    As duas nuvens têm densidades diferentes (uma foi reduzida), por isso o recall é calculado
-    com voxels: fração dos voxels ocupados pela caixa verdadeira que ficaram no conjunto certo.
-    """
-    pts_c0 = transform_points(T_camera0_table, points_table)
-    gt_masks_seg = inside_gt_boxes(pts_c0, ground_truth)
-    gt_masks_all = inside_gt_boxes(all_points_camera0, ground_truth)
+    fig3 = plt.figure(figsize=(9, 8))
+    ax = fig3.add_subplot(projection="3d")
+    sel = sample_indices(len(data["points"]), 8000)
+    scatter_3d(ax, data["points"][sel], data["colors"][sel], 1.0)
+    for p in data["gt_params"]:                           # caixas verdadeiras (se houver), a preto
+        for e in box_edges_3d(p):
+            ax.plot(*e.T, color="k", lw=1, ls="--")
+    corners = [np.vstack(box_edges_3d(p)) for frame in data["frames"] for p in frame]
+    set_equal_3d(ax, np.vstack(corners + [data["points"]]))
+    ax.set_xlabel("x mesa (m)")
+    ax.set_ylabel("y mesa (m)")
+    ax.set_zlabel("z mesa (m)")
+    lines = []
 
-    def voxel_keys(p):
-        return set(map(tuple, np.floor(p / voxel).astype(np.int64)))
+    def draw(i):
+        """Desenha as caixas do passo i da otimização."""
+        for line in lines:
+            line.remove()
+        lines.clear()
+        for j, p in enumerate(data["frames"][i]):
+            for e in box_edges_3d(p):
+                lines.extend(ax.plot(*e.T, color=BOX_COLORS[j % len(BOX_COLORS)], lw=2))
+        ax.set_title(f"Parte 3 - evolução da otimização ({data['cena']}): "
+                     f"passo {int(data['steps'][i])} de {int(data['total_steps'])}")
+        return lines
 
-    num_sets = len(set(labels[labels >= 0]))
-    # Associação conjunto <-> caixa verdadeira pelo maior número de pontos em comum
-    overlap = np.array([[np.sum((labels == s) & m) for m in gt_masks_seg] for s in range(num_sets)])
-    rows, cols = linear_sum_assignment(-overlap) if num_sets else ([], [])
-    results = []
-    for s, j in zip(rows, cols):
-        mine = labels == s
-        precision = np.sum(mine & gt_masks_seg[j]) / max(np.sum(mine), 1)
-        gt_keys = voxel_keys(all_points_camera0[gt_masks_all[j]])
-        my_keys = voxel_keys(pts_c0[mine & gt_masks_seg[j]])
-        recall = len(gt_keys & my_keys) / max(len(gt_keys), 1)
-        results.append({"gt_box": int(j), "precision": precision, "recall": recall})
-    return num_sets, len(ground_truth["boxes"]), results
+    draw(len(data["frames"]) - 1)                         # estado final (é o que fica na figura gravada)
 
+    def start():
+        """Começa a animação (do primeiro ao último passo, e repete)."""
+        return FuncAnimation(fig3, draw, frames=len(data["frames"]), interval=150, repeat=True, repeat_delay=2000)
 
-# #####################################################################################################
-# 7. VISUALIZAÇÃO (janelas 3D do Open3D e figuras PNG do matplotlib)
-# #####################################################################################################
-# Janelas só com a opção --visualize; figuras com --figures, --evaluate_scenes e no run_test.py.
-
-CAMERA_COLORS = plt.cm.tab10(np.arange(10))[:, :3]
-BOX_COLORS = [(0.9, 0.1, 0.1), (0.1, 0.4, 0.9), (0.1, 0.7, 0.2), (0.9, 0.6, 0.0), (0.6, 0.2, 0.8), (0.0, 0.7, 0.7)]
+    figures.append({"name": "_otimizacao", "fig": fig3, "start": start})
+    return figures
 
 
-# --------------------------------------------------------------------------------------
-# Open3D
-# --------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------
+# Figuras PNG (vista de cima), usadas pelo avaliador.py --evaluate_scenes
+# ----------------------------------------------------------------------------------------------------
+def save_top_view(path, points, colors, params_opt, params_bbox=None, gt_params=None, title=""):
+    """Vista de cima: pontos + caixas (otimização, bounding box e, se houver, verdadeiras)."""
+    fig, ax = plt.subplots(figsize=(6, 6))
+    sel = np.random.default_rng(0).choice(len(points), min(len(points), 15000), replace=False)
+    ax.scatter(points[sel, 0], points[sel, 1], c=colors[sel], s=1)
+    if gt_params is not None:
+        _draw_rects(ax, gt_params, {"color": "k", "lw": 2.5}, "verdadeira")
+    if params_bbox is not None:
+        _draw_rects(ax, params_bbox, {"color": "gray", "ls": "--"}, "bounding box")
+    _draw_rects(ax, params_opt, {}, "otimização")
+    ax.set_aspect("equal")
+    ax.set_xlabel("x mesa (m)")
+    ax.set_ylabel("y mesa (m)")
+    ax.set_title(title)
+    ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+def save_evolution(path, points, problem, num_frames=6):
+    """Várias fases da otimização lado a lado (da estimativa inicial ao resultado final)."""
+    snaps = evolution_snapshots(problem.history)
+    picks = np.unique(np.linspace(0, len(snaps) - 1, min(num_frames, len(snaps))).astype(int))
+    fig, axes = plt.subplots(1, len(picks), figsize=(3.2 * len(picks), 3.4), squeeze=False)
+    sel = np.random.default_rng(0).choice(len(points), min(len(points), 6000), replace=False)
+    for ax, k in zip(axes[0], picks):
+        ax.scatter(points[sel, 0], points[sel, 1], c="0.6", s=0.5)
+        params = [normalize_box(p) for p in snaps[k].reshape(-1, NUM_PARAMS)]
+        _draw_rects(ax, params, {})
+        ax.set_aspect("equal")
+        ax.set_title(f"passo {k}/{len(snaps) - 1}", fontsize=9)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.suptitle("Evolução das caixas durante a otimização (vista de cima)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+# ----------------------------------------------------------------------------------------------------
+# Janelas 3D do Open3D (opção --open3d)
+# ----------------------------------------------------------------------------------------------------
 def box_lineset(T, length, width, height, color):
     """LineSet com as 12 arestas de uma caixa com pose T."""
     corners, edges = box_lines_3d(T, length, width, height)
@@ -1236,204 +1013,28 @@ def show_final(points, colors, params_opt, params_bbox=None, gt_params=None):
     o3d.visualization.draw_geometries(geoms, window_name="Caixas finais")
 
 
-# --------------------------------------------------------------------------------------
-# Figuras (matplotlib, vista de cima no referencial da mesa)
-# --------------------------------------------------------------------------------------
-def _draw_rects(ax, params, style, label=None):
-    for j, p in enumerate(params):
-        c = box_corners_2d(p[0], p[1], p[2], p[3], p[4])
-        c = np.vstack([c, c[:1]])
-        color = style.get("color") or BOX_COLORS[j % len(BOX_COLORS)]
-        ax.plot(c[:, 0], c[:, 1], color=color, lw=style.get("lw", 1.5), ls=style.get("ls", "-"),
-                label=label if j == 0 else None)
-
-
-def save_top_view(path, points, colors, params_opt, params_bbox=None, gt_params=None, title=""):
-    """Vista de cima: pontos + caixas (otimização, bounding box e, se houver, verdadeiras)."""
-    fig, ax = plt.subplots(figsize=(6, 6))
-    sel = np.random.default_rng(0).choice(len(points), min(len(points), 15000), replace=False)
-    ax.scatter(points[sel, 0], points[sel, 1], c=colors[sel], s=1)
-    if gt_params is not None:
-        _draw_rects(ax, gt_params, {"color": "k", "lw": 2.5}, "verdadeira")
-    if params_bbox is not None:
-        _draw_rects(ax, params_bbox, {"color": "gray", "ls": "--"}, "bounding box")
-    _draw_rects(ax, params_opt, {}, "otimização")
-    ax.set_aspect("equal")
-    ax.set_xlabel("x mesa (m)")
-    ax.set_ylabel("y mesa (m)")
-    ax.set_title(title)
-    ax.legend(loc="upper right", fontsize=8)
-    fig.tight_layout()
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-
-
-def save_evolution(path, points, problem, num_frames=6):
-    """Várias fases da otimização lado a lado (da estimativa inicial ao resultado final)."""
-    snaps = evolution_snapshots(problem.history)
-    picks = np.unique(np.linspace(0, len(snaps) - 1, min(num_frames, len(snaps))).astype(int))
-    fig, axes = plt.subplots(1, len(picks), figsize=(3.2 * len(picks), 3.4), squeeze=False)
-    sel = np.random.default_rng(0).choice(len(points), min(len(points), 6000), replace=False)
-    for ax, k in zip(axes[0], picks):
-        ax.scatter(points[sel, 0], points[sel, 1], c="0.6", s=0.5)
-        params = [normalize_box(p) for p in snaps[k].reshape(-1, NUM_PARAMS)]
-        _draw_rects(ax, params, {})
-        ax.set_aspect("equal")
-        ax.set_title(f"passo {k}/{len(snaps) - 1}", fontsize=9)
-        ax.set_xticks([])
-        ax.set_yticks([])
-    fig.suptitle("Evolução das caixas durante a otimização (vista de cima)")
-    fig.tight_layout()
-    fig.savefig(path, dpi=110)
-    plt.close(fig)
-
-
 # #####################################################################################################
-# 8. AVALIAÇÃO EM VÁRIAS CENAS (opção --evaluate_scenes: gera as tabelas do Read_me)
+# 5. PROGRAMA PRINCIPAL
 # #####################################################################################################
-ROOT_FOLDER = Path(__file__).resolve().parent.parent      # pasta principal do trabalho
+def run_fit(r1, r2, use_color=True, verbose=True):
+    """Parte 3 numa cena: estimativa inicial, ajuste por otimização e bounding box.
 
-
-def fmt(v, d=1):
-    """Número com d casas decimais, ou "-" se não existir (para as tabelas)."""
-    return "-" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:.{d}f}"
-
-
-def evaluate_scenes(patterns, gt_registration=False, use_color=True, output=None):
-    """Corre VÁRIAS cenas com ground truth e escreve as tabelas de erros dos dois métodos (para o Read_me).
-
-    patterns: pastas das cenas (aceita wildcards, por exemplo scenes_offline/level_*). O número de
-    caixas é lido do config.json da cena, o que é permitido porque isto só serve para avaliar.
-    gt_registration=True usa as poses verdadeiras das câmaras (avalia só a segmentação e o ajuste).
-    Escreve <output>/results.md (tabelas em Markdown) e duas figuras por cena. As cenas são
-    processadas uma de cada vez.
-    """
-    folders = sorted({f for pattern in patterns for f in glob.glob(pattern) if Path(f, "ground_truth.json").exists()})
-    out = Path(output) if output else ROOT_FOLDER / "results_offline"
-    out.mkdir(parents=True, exist_ok=True)
-    if not folders:
-        print("Nenhuma cena com ground_truth.json encontrada.")
-        return
-
-    reg_lines = ["| cena | erro transl. médio (mm) | máx (mm) | erro rot. médio (°) | máx (°) | só encadeamento: transl. máx (mm) |",
-                 "|---|---|---|---|---|---|"]
-    seg_lines = ["| cena | conjuntos / caixas | precisão média | recall médio |", "|---|---|---|---|"]
-    box_lines = ["| cena | caixa | método | pos (mm) | yaw (°) | dL (mm) | dW (mm) | dH (mm) | dz (mm) | IoU |",
-                 "|---|---|---|---|---|---|---|---|---|---|"]
-    summary = ["| cena | IoU médio bounding box | IoU médio otimização |", "|---|---|---|"]
-
-    for folder in folders:
-        num_boxes = len(json.loads(Path(folder, "config.json").read_text(encoding="utf-8"))["boxes"])
-        name = Path(folder).name
-        detection = Path(folder) / "detecao"
-        det.run_detection(folder, detection, gt_registration=gt_registration)       # script 1
-        r = run(detection, num_boxes, use_color=use_color)                          # script 2
-        gt = r["ground_truth"]
-
-        if not gt_registration:
-            cams = camera_errors(r["T_cams"], gt)
-            chain = camera_errors(r["T_chain"], gt)
-            t, a = np.array([c[1] for c in cams]), np.array([c[2] for c in cams])
-            reg_lines.append(f"| {name} | {t[1:].mean():.2f} | {t.max():.2f} | {a[1:].mean():.3f} | {a.max():.3f} | "
-                             f"{max(c[1] for c in chain):.2f} |")
-
-        n_sets, n_gt, seg_rows = evaluate_segmentation(
-            r["seg"].points, r["box_labels"], r["table"].T_camera0_table, full_cloud_points(r), gt)
-        seg_lines.append(f"| {name} | {n_sets} / {n_gt} | {np.mean([s['precision'] for s in seg_rows]):.3f} | "
-                         f"{np.mean([s['recall'] for s in seg_rows]):.3f} |")
-
-        ious = {}
-        for method, label in (("bbox", "bounding box"), ("opt", "otimização")):
-            rows = evaluate_boxes(boxes_to_camera0(r[f"params_{method}"], r["table"].T_camera0_table), gt)
-            ious[method] = np.mean([e["iou"] for e in rows])
-            for j, e in enumerate(rows):
-                box_lines.append(f"| {name} | {j} | {label} | {fmt(e['pos_mm'])} | {fmt(e['yaw_deg'], 2)} | "
-                                 f"{fmt(e['dl_mm'])} | {fmt(e['dw_mm'])} | {fmt(e['dh_mm'])} | {fmt(e['dz_mm'])} | {e['iou']:.3f} |")
-        summary.append(f"| {name} | {ious['bbox']:.3f} | {ious['opt']:.3f} |")
-
-        gt_params = gt_params_in_table(gt, r["table"].T_camera0_table)
-        save_top_view(out / f"{name}_top_view.png", r["seg"].points, r["seg"].colors,
-                                    r["params_opt"], r["params_bbox"], gt_params, title=name)
-        save_evolution(out / f"{name}_optimization.png", r["fit_points"], r["problem"])
-
-    text = ["# Resultados", "",
-            f"Registo: {'poses verdadeiras (só segmentação e ajuste)' if gt_registration else 'estimado'}", ""]
-    if not gt_registration:
-        text += ["## Registo", ""] + reg_lines + [""]
-    text += ["## Segmentação", ""] + seg_lines + [""]
-    text += ["## Resumo (IoU 3D médio)", ""] + summary + [""]
-    text += ["## Erros por caixa", ""] + box_lines + [""]
-    (out / "results.md").write_text("\n".join(text), encoding="utf-8")
-    print(f"\nTabelas escritas em {out / 'results.md'}")
-
-
-# #####################################################################################################
-# 9. PROGRAMA PRINCIPAL
-# #####################################################################################################
-def load_detection(folder):
-    """Lê a pasta escrita pelo script 1: a nuvem só das caixas (caixas.ply) e o detecao.json.
-
-    Saída: dicionário com os pontos e as cores das caixas (referencial da mesa), a pose de cada câmara
-    (grafo de poses e só encadeamento), a mesa (Table), os nomes das imagens, a pasta da cena e o
-    ground truth (None se a cena não o tiver; só serve para avaliar, NUNCA para estimar).
-    """
-    folder = Path(folder)
-    info = json.loads((folder / det.DETECTION_FILE).read_text(encoding="utf-8"))
-    cloud = o3d.io.read_point_cloud(str(folder / info["nuvem_das_caixas"]))
-    mesa = info["mesa"]
-    table = Table(np.array(mesa["T_camera0_table"]), mesa["comprimento"], mesa["largura"], np.array(mesa["normal"]))
-    gt_path = Path(info["cena"]) / "ground_truth.json"
-    ground_truth = json.loads(gt_path.read_text(encoding="utf-8")) if gt_path.exists() else None
-    return {"points": np.asarray(cloud.points), "colors": np.asarray(cloud.colors),
-            "T_cams": [np.array(T) for T in info["T_camera0_camera"]],
-            "T_chain": [np.array(T) for T in info["T_camera0_camera_so_encadeamento"]],
-            "table": table, "images": info["imagens"], "scene_folder": Path(info["cena"]),
-            "ground_truth": ground_truth}
-
-
-def full_cloud_points(r):
-    """TODOS os pontos da nuvem agregada (referencial da câmara 0), só para o recall da segmentação.
-
-    O script 1 só grava os pontos das caixas; para saber quantos pontos tem cada caixa verdadeira
-    (incluindo os que a segmentação deitou fora) volta-se a juntar as nuvens da cena com as poses
-    das câmaras já estimadas (não se repete o registo).
-    """
-    cloud, _ = aggregate(load_scene(r["scene_folder"]), r["T_cams"])
-    return np.asarray(cloud.points)
-
-
-def ask_num_boxes():
-    """Pergunta no terminal o número de caixas da cena."""
-    while True:
-        answer = input("Número de caixas na mesa: ").strip()
-        if answer.isdigit() and int(answer) > 0:
-            return int(answer)
-        print("  escreve um número inteiro positivo")
-
-
-def run(detection_folder, num_boxes, use_color=True, verbose=True):
-    """Parte 2 (separar as caixas) e Parte 3 (ajuste) a partir da deteção do script 1.
-
-    Entrada: pasta da deteção (caixas.ply + detecao.json) e o número de caixas.
-    Saída: dicionário com os resultados de cada etapa (para o result.json, a avaliação e as figuras).
+    Entrada: o resultado da Parte 1 (poses das câmaras) e da Parte 2 (mesa e segmentação).
+    Saída: dicionário com as caixas dos dois métodos (referencial da mesa), a estimativa inicial, a caixa
+    de cada ponto, o problema de otimização (com o histórico) e os pontos usados. Grava o ajuste.npz.
     """
     t0 = time.time()
-    r = load_detection(detection_folder)
-    if verbose:
-        print(f"Deteção {detection_folder}: {len(r['points'])} pontos das caixas, {num_boxes} caixas")
+    seg, table = r2["seg"], r2["table"]
 
-    # ---------------- Parte 2: separar as caixas ----------------
-    seg = segment(r["points"], r["colors"], num_boxes, use_color=use_color, verbose=verbose)
-
-    # ---------------- Parte 3: ajuste ----------------
     # Multi-start: com caixas da mesma cor em contacto a estimativa inicial é incerta e a otimização
     # pode ficar presa num mínimo local. Experimentam-se duas estimativas iniciais (k-means e degraus
     # do contorno) e fica a que acaba com MENOR CUSTO (os custos são comparáveis: a função objetivo e
     # os pontos são os mesmos nas duas tentativas).
     methods = ["kmeans", "profile"] if needs_geometric_split(seg) else ["kmeans"]
     # Centros das câmaras no referencial da mesa (para o ajuste saber que faces podem ser vistas)
-    T_table_camera0 = np.linalg.inv(r["table"].T_camera0_table)
-    camera_centers = np.array([(T_table_camera0 @ T)[:3, 3] for T in r["T_cams"]])
+    T_table_camera0 = np.linalg.inv(table.T_camera0_table)
+    # (só as câmaras que entraram na nuvem: uma câmara com o registo falhado está no sítio errado)
+    camera_centers = np.array([(T_table_camera0 @ T)[:3, 3] for T, ok in zip(r1["T_cams"], r1["registered"]) if ok])
     best = None
     for method in methods:
         init_params, init_colors, box_labels = initial_boxes(seg, method)
@@ -1452,62 +1053,46 @@ def run(detection_folder, num_boxes, use_color=True, verbose=True):
     if verbose:
         print(f"  tempo: {time.time() - t0:.1f} s")
 
-    r.update({"seg": seg, "init_params": np.array(init_params), "box_labels": box_labels,
-              "params_bbox": params_bbox, "params_opt": params_opt, "problem": problem,
-              "fit_points": fit_points, "fit_assoc": fit_assoc})
-    return r
+    r3 = {"init_params": np.array(init_params), "box_labels": box_labels, "params_bbox": params_bbox,
+          "params_opt": params_opt, "problem": problem, "fit_points": fit_points, "fit_assoc": fit_assoc}
+    save_fit(r1["folder"], r3)
+    return r3
 
 
 def main():
     """Lê os argumentos da linha de comandos, ajusta as caixas e escreve o result.json."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--detection", help="pasta escrita pelo script 1 (ex.: test/cena_1/detecao)")
-    parser.add_argument("--num_boxes", type=int, help="número de caixas na mesa (se faltar, é perguntado)")
+    parser.add_argument("--scene", required=True, help="pasta da cena (já com as Partes 1 e 2 feitas)")
     parser.add_argument("--output", help="ficheiro de saída (por omissão: <cena>/result.json)")
     parser.add_argument("--method", choices=["opt", "bbox"], default="opt",
                         help="método usado no result.json: otimização (opt) ou bounding box (bbox)")
-    parser.add_argument("--no_color", action="store_true", help="não usar a cor (segmentação nem otimização)")
-    parser.add_argument("--evaluate", action="store_true", help="compara com o ground_truth.json, se existir")
-    parser.add_argument("--visualize", action="store_true", help="abre janelas 3D com cada etapa")
-    parser.add_argument("--figures", action="store_true", help="grava top_view.png e optimization.png")
-    parser.add_argument("--evaluate_scenes", nargs="+", metavar="CENA",
-                        help="corre os 2 scripts em várias cenas com ground truth (aceita wildcards) e escreve as tabelas")
-    parser.add_argument("--gt_registration", action="store_true",
-                        help="com --evaluate_scenes: usa as poses verdadeiras (avalia só segmentação e ajuste)")
+    parser.add_argument("--no_color", action="store_true", help="não usar a cor na otimização")
+    parser.add_argument("--visualize", action="store_true",
+                        help="janelas: bounding box | otimização (2 subplots) e evolução da otimização em 3D")
+    parser.add_argument("--open3d", action="store_true", help="janelas 3D do Open3D (segmentação, evolução, final)")
     args = parser.parse_args()
 
-    # Modo "várias cenas": só avaliação, não escreve result.json
-    if args.evaluate_scenes:
-        evaluate_scenes(args.evaluate_scenes, gt_registration=args.gt_registration,
-                        use_color=not args.no_color, output=args.output)
-        return
-    if args.detection is None:
-        parser.error("indica --detection (a pasta escrita pelo script 1) ou --evaluate_scenes")
-    num_boxes = args.num_boxes if args.num_boxes else ask_num_boxes()
+    folder = Path(args.scene) / OUTPUT_FOLDER
+    r1 = load_registration(folder)
+    table, points, colors = load_objects(folder)
+    r2 = {"table": table, "object_points": points, "object_colors": colors, "seg": load_segmentation(folder),
+          "scene_folder": r1["scene_folder"]}
+    r3 = run_fit(r1, r2, use_color=not args.no_color)
 
-    r = run(args.detection, num_boxes, use_color=not args.no_color)
-
-    # Escrita do result.json
-    params = r["params_opt"] if args.method == "opt" else r["params_bbox"]
-    boxes = boxes_to_camera0(params, r["table"].T_camera0_table)
-    output = Path(args.output) if args.output else r["scene_folder"] / "result.json"
-    write_result(output, r["images"], r["T_cams"], boxes)
+    output = Path(args.output) if args.output else Path(r1["scene_folder"]) / "result.json"
+    write_scene_result(output, r1, r2, r3, args.method)
     print(f"\nResultado escrito em {output}")
 
-    # Opções extra (secções 6 e 7)
-    gt = r["ground_truth"]
-    if args.evaluate or args.visualize or args.figures:
-        gt_params = gt_params_in_table(gt, r["table"].T_camera0_table) if gt else None
-        if args.figures:
-            save_top_view(output.parent / "top_view.png", r["seg"].points, r["seg"].colors,
-                          r["params_opt"], r["params_bbox"], gt_params, title=r["scene_folder"].name)
-            save_evolution(output.parent / "optimization.png", r["fit_points"], r["problem"])
-        if args.evaluate and gt:
-            print_evaluation(r)
-        if args.visualize:
-            show_segmentation(r["seg"], r["box_labels"])
-            animate_optimization(r["fit_points"], np.full_like(r["fit_points"], 0.6), r["problem"])
-            show_final(r["seg"].points, r["seg"].colors, r["params_opt"], r["params_bbox"], gt_params)
+    # Caixas verdadeiras (se a cena tiver ground truth): só para desenhar
+    gt = load_ground_truth(r1["scene_folder"])
+    gt_params = gt_params_in_table(gt, table.T_camera0_table) if gt else None
+    if args.visualize:
+        show_figures(make_figures(figure_data(r2, r3, gt_params)))
+    if args.open3d:
+        seg = r2["seg"]
+        show_segmentation(seg, r3["box_labels"])
+        animate_optimization(r3["fit_points"], np.full_like(r3["fit_points"], 0.6), r3["problem"])
+        show_final(seg.points, seg.colors, r3["params_opt"], r3["params_bbox"], gt_params)
 
 
 if __name__ == "__main__":

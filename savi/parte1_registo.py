@@ -1,36 +1,38 @@
 #!/usr/bin/env python3
-"""SAVIBoxes - Trabalho 1 de SAVI. SCRIPT 1 de 2: DETEÇÃO DAS CAIXAS (nuvem de pontos só das caixas).
+"""SAVIBoxes - Trabalho 1 de SAVI. PARTE 1: REGISTO (pose de cada câmara e nuvem de pontos agregada).
 
 =====================================================================================================
 COMO CORRER
 =====================================================================================================
     (a partir da pasta principal do trabalho)
-    python savi/detecao_caixas.py --scene test/cena_1
-    python savi/detecao_caixas.py --scene test/cena_1 --visualize      # + janelas 3D
+    python savi/parte1_registo.py --scene test/cena_1
+    python savi/parte1_registo.py --scene test/cena_1 --visualize   # janela: nuvem agregada (2 subplots)
+    python savi/parte1_registo.py --scene test/cena_1 --open3d      # janelas 3D do Open3D (+ ground truth)
 
-Não precisa do número de caixas. Escreve na pasta <cena>/detecao/ (ou na indicada em --output):
-    caixas.ply     nuvem de pontos SÓ DAS CAIXAS (sem a mesa, o chão nem o resto da sala), com cor,
-                   no referencial da MESA (z = altura acima do tampo)
-    detecao.json   pose de cada câmara (T_camera0_camera), pose e dimensões da mesa (T_camera0_table)
-                   e a pasta da cena
-Depois, o SCRIPT 2 (avaliador_caixas.py) lê esta pasta, recebe o número de caixas, ajusta as caixas e
-escreve o result.json:
-    python savi/avaliador_caixas.py --detection test/cena_1/detecao --num_boxes 2
+Não precisa do número de caixas. Grava <cena>/partes/registo.json com a pose de cada câmara em relação
+à câmara 000 (T_camera0_camera) e as câmaras que entraram na nuvem agregada.
+
+Ordem das partes (o run_test.py corre-as todas, cena a cena):
+    parte1_registo.py      -> <cena>/partes/registo.json   (pose de cada câmara)
+    extra_fotometria.py    -> <cena>/partes/fotometria.json (ganho e desvio de cada imagem)
+    parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (precisa do n.º de caixas)
+    parte3_ajuste.py       -> result.json e <cena>/partes/ajuste.npz
+    avaliador.py           -> erros em relação ao ground truth (só nas cenas que o têm)
 
 =====================================================================================================
-ORGANIZAÇÃO DESTE FICHEIRO (pela ordem do enunciado)
+ORGANIZAÇÃO DESTE FICHEIRO
 =====================================================================================================
-    0. Geometria          funções de matrizes 4x4, rotações, caixas (usadas também pelo script 2)
+    0. Geometria          funções de matrizes 4x4, rotações, caixas (usadas também pelas outras partes)
     1. Leitura da cena    ler as imagens / nuvens de pontos e escrever o result.json
-    2. PARTE 1 - Registo  estimar a pose de cada câmara em relação à câmara 000
+    2. Registo            estimar a pose de cada câmara em relação à câmara 000 e juntar as nuvens
                           (features ASIFT + RANSAC + ICP + hipóteses da mesa + grafo de poses)
-    3. PARTE 2 - Mesa     detetar a mesa e ficar só com os pontos das caixas (sem a mesa e o fundo)
-    4. Saída              gravar a nuvem das caixas (caixas.ply) e o detecao.json
-    5. Visualização       janelas 3D (Open3D) do registo e da nuvem das caixas
-    6. Programa principal run_detection() e main()
+    3. Saída              gravar e ler o registo.json
+    4. Visualização       janela com 2 subplots: nuvem agregada com a cor dos píxeis | com uma cor por
+                          câmara (e funções de desenho usadas também pelas outras partes)
+    5. Programa principal run_registration() e main()
 
 =====================================================================================================
-CONVENÇÕES
+CONVENÇÕES (usadas em todas as partes)
 =====================================================================================================
 - T_A_B é a matriz 4x4 que leva pontos do referencial B para o referencial A:   p_A = T_A_B @ p_B
 - Referencial da MESA: origem no centro do tampo, eixo z perpendicular à mesa e a apontar para cima,
@@ -54,9 +56,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2                                   # OpenCV: features das imagens, retângulos
+import matplotlib.pyplot as plt              # janelas com subplots (secção 4)
 import numpy as np
 import open3d as o3d                         # nuvens de pontos: ICP, RANSAC de planos, DBSCAN
 from scipy.spatial import cKDTree            # procura rápida do vizinho mais próximo
+
+# Correção da exposição (extra_fotometria.py): usada para comparar cores de imagens diferentes no
+# registo (alignment_score) e para juntar as nuvens com a mesma exposição (aggregate)
+from extra_fotometria import exposure_corrected, exposure_fit
+
 
 reg = o3d.pipelines.registration             # atalho para o módulo de registo do Open3D
 
@@ -65,7 +73,6 @@ reg = o3d.pipelines.registration             # atalho para o módulo de registo 
 # 0. GEOMETRIA
 # #####################################################################################################
 # Pequenas funções de matemática usadas em todas as partes.
-
 def make_T(R=np.eye(3), t=np.zeros(3)):
     """Junta uma rotação e uma translação numa matriz homogénea 4x4.
 
@@ -190,7 +197,6 @@ def box_signed_distance(points_box, half_dims):
 #         rgb/000.png            imagem a cores correspondente
 #         intrinsics.json        fx, fy, cx, cy, width, height
 #         ground_truth.json      (só existe nas cenas de desenvolvimento; NUNCA é usado para estimar)
-
 @dataclass
 class View:
     """Uma imagem RGB-D da cena."""
@@ -269,6 +275,12 @@ def load_scene(folder):
     return Scene(folder, views, K, width, height, ground_truth)
 
 
+def load_ground_truth(scene_folder):
+    """O ground_truth.json da cena, ou None se não existir (só para avaliar, NUNCA para estimar)."""
+    path = Path(scene_folder) / "ground_truth.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+
 def boxes_to_camera0(params, T_camera0_table):
     """Converte as caixas (7 parâmetros no referencial da mesa) para o formato do result.json.
 
@@ -323,15 +335,14 @@ def write_result(path, view_names, T_camera0_cameras, boxes):
 #     paredes), que têm todos o mesmo descritor, e o RANSAC alinha os planos errados.
 #   - O ruído da profundidade cresce com z^2 (a 4 m são ~2.5 cm). No ICP ignoram-se os pontos a mais
 #     de 3 m e usa-se um kernel robusto (Tukey).
-
 MAX_ICP_DEPTH = 3.0                      # m: pontos mais longe são demasiado ruidosos para o ICP
 ICP_VOXELS = (0.04, 0.02, 0.01, 0.005)   # escalas do ICP, da mais grosseira para a mais fina (m)
-
 # Critérios para aceitar o registo de um par (ver is_confident e free_space_violation)
 MIN_PAIR_SCORE = 0.18   # score >= 0.18: o par é sempre de confiança (pares corretos: 0.26-0.48)
 LOW_PAIR_SCORE = 0.05   # entre 0.05 e 0.18: só se for claramente melhor que as alternativas
 MARGIN_RATIO = 1.5      # 'claramente melhor' = score >= 1.5 x o score da melhor hipótese DIFERENTE
 MAX_VIOLATION = 0.10    # fração máxima de pontos em 'espaço livre' (corretas 0.01-0.055, erradas 0.19-0.40)
+CONFIRMED_RATIO = 0.75  # hipótese confirmada pela mesa E pelas features: aceita se score >= 0.75 x o melhor
 MAX_LOOP_ANGLE = 100.0  # graus: câmaras com direções de vista mais afastadas não se sobrepõem
 
 
@@ -460,7 +471,7 @@ def ransac_hypotheses(points_src, points_dst, threshold=0.02, iterations=3000, m
 
 
 # ----------------------------------------------------------------------------------------------------
-# 2.3 ICP e avaliação de um alinhamento
+# 2.3 ICP e avaliação de um alinhamento (a correção da exposição está em extra_fotometria.py)
 # ----------------------------------------------------------------------------------------------------
 def multiscale_icp(source, target, T_init, voxels=ICP_VOXELS):
     """ICP ponto-a-plano em várias escalas, da grosseira para a fina (Parte 08, Ex. 2).
@@ -504,37 +515,6 @@ def alignment_score(source, target, T, distance=0.02, max_color_diff=0.08):
     color_diff = np.abs(np.asarray(dst.colors)[idx] - src_colors).mean(axis=1)
     good = (dist < distance) & (color_diff < max_color_diff)
     return good.mean()
-
-
-def exposure_fit(colors, colors_target, close, min_points=50):
-    """Ganho s e desvio b que levam a exposição de uma imagem à de outra: cor' = s * cor + b.
-
-    Com exposição automática, a mesma superfície pode aparecer mais clara ou mais escura em cada
-    imagem (no teste 10, uma imagem tinha s = 0.66 e b = -0.06). s e b estimam-se por mínimos
-    quadrados com os pares de pontos que coincidem em geometria ('close'), em duas passagens: a
-    segunda sem os 30% de pares com maior resíduo (arestas, sombras, pares de objetos diferentes).
-    Sem pares suficientes: s = 1, b = 0 (não se corrige).
-    """
-    if close.sum() < min_points:
-        return 1.0, 0.0
-    x, y = colors[close].ravel(), colors_target[close].ravel()
-    keep = np.ones(len(x), bool)
-    for _ in range(2):
-        A = np.stack([x[keep], np.ones(keep.sum())], axis=1)
-        s, b = np.linalg.lstsq(A, y[keep], rcond=None)[0]
-        residual = np.abs(y - (s * x + b))
-        keep = residual <= np.percentile(residual, 70)
-    return float(np.clip(s, 0.5, 2.0)), float(np.clip(b, -0.2, 0.2))
-
-
-def exposure_corrected(colors, colors_target, close):
-    """Cores de uma imagem com a exposição corrigida para a de outra (ver exposure_fit).
-
-    Sem isto, comparar cores diretamente dava score ~0 a TODAS as hipóteses de um par com exposições
-    diferentes, e a certa deixava de se distinguir da errada (mesa rodada 180°).
-    """
-    s, b = exposure_fit(colors, colors_target, close)
-    return np.clip(s * colors + b, 0.0, 1.0)
 
 
 def free_space_violation(view_target, K, T_target_source, cloud_source, margin=0.03):
@@ -602,8 +582,41 @@ def is_confident(candidates):
     return best[0] >= MARGIN_RATIO * max(rivals + [LOW_PAIR_SCORE])
 
 
+def is_confirmed(candidate, candidates):
+    """True se outra hipótese, vinda da OUTRA fonte (mesa vs features), chega à mesma solução.
+
+    As hipóteses da mesa e as das features são independentes: se as duas levam à mesma pose, é muito
+    pouco provável que estejam ambas erradas da mesma maneira.
+    """
+    source = candidate[2] == "mesa"
+    return any(c is not candidate and (c[2] == "mesa") != source and not is_different(c[1], candidate[1])
+               for c in candidates)
+
+
+def choose_candidate(candidates):
+    """Escolhe a hipótese de um par. Saída: (candidato vencedor, de confiança sim/não).
+
+    1. Se a de maior score é de confiança (is_confident), é essa;
+    2. Senão, se houver UMA solução confirmada pela mesa e pelas features (is_confirmed) com score
+       >= CONFIRMED_RATIO x o melhor, é essa, e é de confiança. Caso do teste 16, cena 1 (pilha da
+       mesma cor, 2 imagens, exposição diferente): a hipótese da mesa rodada 180° tinha score 0.110,
+       sozinha; a correta tinha 0.095, mas a mesa e 4 hipóteses das features concordavam com ela.
+    3. Senão, a de maior score, sem confiança.
+    """
+    best = max(candidates, key=lambda c: c[0])
+    if is_confident(candidates):
+        return best, True
+    confirmed = [c for c in candidates if c[0] >= LOW_PAIR_SCORE and is_confirmed(c, candidates)]
+    if confirmed:
+        top = max(confirmed, key=lambda c: c[0])
+        single_solution = all(not is_different(c[1], top[1]) for c in confirmed)
+        if single_solution and top[0] >= CONFIRMED_RATIO * best[0]:
+            return top, True
+    return best, False
+
+
 # ----------------------------------------------------------------------------------------------------
-# 2.4 Hipóteses a partir da mesa vista por cada câmara
+# 2.4 Hipóteses a partir da mesa vista por cada câmara (a deteção da mesa é a da Parte 2)
 # ----------------------------------------------------------------------------------------------------
 def table_hypotheses(table_a, table_b):
     """Hipóteses de T_a_b a partir do tampo da mesa visto por cada câmara SOZINHA.
@@ -628,6 +641,7 @@ def view_tables(views):
     Usa a mesma função da Parte 2 (detect_table) com a nuvem de uma só câmara e a identidade como
     pose. Só se aceita se o tampo parecer completo (largura > 30 cm).
     """
+    from parte2_segmentacao import detect_table     # aqui dentro: a Parte 2 importa este ficheiro
     tables = []
     for view in views:
         try:
@@ -679,7 +693,7 @@ def register_pair(view_a, feats_a, view_b, feats_b, table_a=None, table_b=None, 
     candidates += found
     candidates = [c for c in candidates if is_plausible(view_a, view_b, K, c[1])]
 
-    if not candidates or not is_confident(candidates):
+    if not candidates or not choose_candidate(candidates)[1]:
         if verbose:
             best_score = max((c[0] for c in candidates), default=0.0)
             print(f"    {view_a.name} <- {view_b.name}: pouca confiança ({best_score:.3f}), "
@@ -691,10 +705,11 @@ def register_pair(view_a, feats_a, view_b, feats_b, table_a=None, table_b=None, 
         # Nenhuma hipótese plausível: parte-se da identidade (o par vai ser marcado como falhado)
         T, _, _ = multiscale_icp(view_b.cloud, view_a.cloud, np.eye(4), voxels=ICP_VOXELS[:2])
         candidates = [(0.0, T, "identidade (nenhuma hipótese plausível)")]
-    confident = is_confident(candidates)
+    (score, T_coarse, origin), confident = choose_candidate(candidates)
+    if confident and not is_confident(candidates):
+        origin += ", confirmada pela mesa e pelas features"
 
     # Refinamento final da hipótese vencedora nas escalas finas
-    score, T_coarse, origin = max(candidates, key=lambda c: c[0])
     T, result, information = multiscale_icp(view_b.cloud, view_a.cloud, T_coarse, voxels=ICP_VOXELS[2:])
     if verbose:
         flag = "" if confident else "  <-- FALHOU (não será usado)"
@@ -705,7 +720,7 @@ def register_pair(view_a, feats_a, view_b, feats_b, table_a=None, table_b=None, 
 
 
 # ----------------------------------------------------------------------------------------------------
-# 2.6 Registo de todas as imagens
+# 2.6 Registo de todas as imagens e nuvem agregada
 # ----------------------------------------------------------------------------------------------------
 def poses_from_edges(n, edges):
     """Pose T_0_k de cada câmara, percorrendo o grafo de arestas a partir da câmara 0.
@@ -767,12 +782,15 @@ def register_scene(scene, loop_closure=True, verbose=True):
     for i, j, T, *_ in edges:
         T_chain.append(T_chain[i] @ T)
 
-    if not loop_closure or n < 3:
-        return T_chain, T_chain
-
-    # 2. Fecho de ciclo, só se a primeira e a última câmara olharem para lados parecidos
     good = [e for e in edges if e[4]]                 # só as arestas de confiança
     poses = poses_from_edges(n, good)
+    if not loop_closure or n < 3:
+        # Uma câmara ligada à 0 por um par falhado fica com a pose do encadeamento (o result.json
+        # precisa de uma pose), mas NÃO entra na nuvem: com 2 imagens e o registo errado, a mesma
+        # pilha aparecia duas vezes, em dois sítios da mesa (teste 16, cena 1)
+        return T_chain, T_chain, [p is not None for p in poses]
+
+    # 2. Fecho de ciclo, só se a primeira e a última câmara olharem para lados parecidos
     if poses[n - 1] is not None:
         # Ângulo entre os eixos óticos (eixo z) da câmara 0 e da última câmara
         angle = np.degrees(np.arccos(np.clip(poses[n - 1][2, 2], -1.0, 1.0)))
@@ -801,7 +819,9 @@ def register_scene(scene, loop_closure=True, verbose=True):
                 good.append((m, k, T, info, ok, True))
                 poses = poses_from_edges(n, good)
                 break
-    # Último recurso: câmaras ainda sem pose ficam com a pose do encadeamento
+    # Último recurso: câmaras ainda sem pose ficam com a pose do encadeamento (só para o result.json;
+    # não entram na nuvem)
+    registered = [p is not None for p in poses]
     poses = [p if p is not None else T_chain[k] for k, p in enumerate(poses)]
 
     # 4. Grafo de poses: cada nó é uma câmara (pose T_0_i), cada aresta é o registo de um par
@@ -820,21 +840,27 @@ def register_scene(scene, loop_closure=True, verbose=True):
 
     # A câmara 0 tem de ser exatamente a identidade (é a referência)
     T0_inv = np.linalg.inv(T_graph[0])
-    return [T0_inv @ T for T in T_graph], T_chain
+    return [T0_inv @ T for T in T_graph], T_chain, registered
 
 
-def aggregate(scene, T_camera0_cameras):
-    """Junta todas as nuvens (resolução original) no referencial da câmara 0, com a exposição de
-    cada imagem corrigida para a da câmara 0.
+def aggregate(scene, T_camera0_cameras, registered=None, photometric=True, exposures=None):
+    """Junta as nuvens (resolução original) no referencial da câmara 0, com a exposição de cada
+    imagem corrigida para a da câmara 0.
 
+    registered: lista de True/False por câmara; as câmaras com False (registo falhado) ficam de fora.
+    photometric=False: sem a correção da exposição (só para a janela do extra_fotometria.py).
+    exposures: lista onde se acrescenta (imagem, s, b) de cada câmara (para o extra_fotometria.py).
     Saída: (nuvem agregada, índice da câmara que adquiriu cada ponto).
     """
     aggregated = o3d.geometry.PointCloud()
     camera_index = []
     for k, (view, T) in enumerate(zip(scene.views, T_camera0_cameras)):
+        if registered is not None and not registered[k]:
+            continue
         cloud = copy.deepcopy(view.cloud)       # cópia, para não alterar a nuvem original
         cloud.transform(T)                      # leva os pontos para o referencial da câmara 0
-        if k > 0:
+        s, b = 1.0, 0.0                         # câmara 0 (a referência) ou sem correção
+        if len(aggregated.points) > 0 and photometric:
             # Exposição: a cor desta imagem passa a ter a exposição das anteriores. A cromaticidade
             # (chroma_features) cancela o ganho s mas não o desvio b, e com cores de exposições
             # diferentes duas caixas de cores parecidas (laranja e castanho) deixavam de se separar.
@@ -842,316 +868,51 @@ def aggregate(scene, T_camera0_cameras):
             dist, idx = cKDTree(np.asarray(ref.points)).query(np.asarray(small.points), k=1)
             s, b = exposure_fit(np.asarray(small.colors), np.asarray(ref.colors)[idx], dist < 0.01)
             cloud.colors = o3d.utility.Vector3dVector(np.clip(s * np.asarray(cloud.colors) + b, 0.0, 1.0))
+        if exposures is not None:
+            exposures.append((view.name, s, b))
         aggregated += cloud
         camera_index.append(np.full(len(cloud.points), k))
     return aggregated, np.concatenate(camera_index)
 
 
 # #####################################################################################################
-# 3. PARTE 2 - SEGMENTAÇÃO (1.ª metade): MESA E PONTOS DAS CAIXAS
+# 3. SAÍDA: registo.json (é a entrada das outras partes)
 # #####################################################################################################
-# Sobre a nuvem AGREGADA:
-#   1. detetar o plano da mesa (RANSAC, Parte 07) e definir o referencial da mesa (Parte 08, Ex. 4);
-#   2. retirar a mesa e o fundo: ficam só os pontos acima da mesa e dentro dos limites do tampo,
-#      ou seja, os pontos das caixas (é a nuvem que este script grava, secção 4).
-# A 2.ª metade (separar as caixas: clusters euclidianos e cor) está no script 2, avaliador_caixas.py,
-# porque precisa do número de caixas.
-
-PLANE_DISTANCE = 0.008       # m: distância máxima ao plano para um ponto ser do plano (RANSAC)
-ABOVE_TABLE_MIN = 0.008      # m: pontos abaixo disto (ruído do tampo) são retirados
-ABOVE_TABLE_MAX = 0.60       # m: pontos acima disto já não são objetos sobre a mesa
-TABLE_MARGIN = 0.01          # m: margem para dentro dos limites do tampo
-CLUSTER_EPS = 0.015          # m: no DBSCAN, pontos a menos de 1.5 cm ficam no mesmo cluster (script 2)
-OBJECT_VOXEL = 0.004         # m: voxel usado nos pontos dos objetos
+OUTPUT_FOLDER = "partes"              # pasta, dentro da cena, onde cada parte grava o seu resultado
+REGISTRATION_FILE = "registo.json"    # pose de cada câmara
 
 
-@dataclass
-class Table:
-    """Mesa detetada."""
-    T_camera0_table: np.ndarray   # pose do referencial da mesa no referencial da câmara 0
-    length: float                 # comprimento do tampo (lado maior), m
-    width: float                  # largura do tampo, m
-    normal: np.ndarray            # normal do tampo (para cima), no referencial da câmara 0
-
-
-# ----------------------------------------------------------------------------------------------------
-# 3.1 Plano da mesa e referencial da mesa
-# ----------------------------------------------------------------------------------------------------
-def central_points(views, T_camera0_cameras, fraction=0.4):
-    """Pontos 3D (referencial da câmara 0) da zona central de cada imagem.
-
-    Cada câmara aponta para a mesa (é para isso que lá está), por isso os pixels do centro da imagem
-    são quase todos do tampo ou das caixas. Assim não é preciso saber quantas câmaras há nem como
-    estão dispostas (volta completa, arco, ou uma só). 'fraction' = lado da zona central (40%).
-    """
-    pts = []
-    for view, T in zip(views, T_camera0_cameras):
-        h, w = view.xyz_image.shape[:2]
-        r0, r1 = int(h * (0.5 - fraction / 2)), int(h * (0.5 + fraction / 2))
-        c0, c1 = int(w * (0.5 - fraction / 2)), int(w * (0.5 + fraction / 2))
-        p = view.xyz_image[r0:r1, c0:c1].reshape(-1, 3)
-        p = p[p[:, 2] > 0]                                # só pixels com medição
-        pts.append(transform_points(T, p))
-    return np.concatenate(pts)
-
-
-def table_plane_guess(views, T_camera0_cameras):
-    """Primeira estimativa do plano da mesa: RANSAC sobre os pontos centrais das imagens.
-
-    1. Encontra até 3 planos nos pontos centrais (RANSAC repetido, como na Parte 07 Ex. 3: cada
-       plano encontrado é retirado e procura-se o seguinte nos pontos que sobram);
-    2. A normal de cada plano é orientada para o lado das câmaras ('cima' = de onde a mesa é vista);
-    3. Altura de referência: o pixel MESMO no centro de cada imagem (tampo ou topo de uma caixa);
-    4. Dos planos paralelos ao maior, com pelo menos 25% dos seus pontos e não mais de 35 cm abaixo
-       da referência, fica o MAIS BAIXO: os topos das caixas também são horizontais mas estão acima
-       da mesa; o chão também pode aparecer, mas está ~75 cm abaixo.
-    Saída: (normal para cima, um ponto do tampo).
-    """
-    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(central_points(views, T_camera0_cameras)))
-    rest = pc.voxel_down_sample(0.01)
-    centers = np.array([T[:3, 3] for T in T_camera0_cameras])     # posição de cada câmara
-    planes = []
-    for _ in range(3):
-        if len(rest.points) < 300:
-            break
-        model, inliers = rest.segment_plane(distance_threshold=PLANE_DISTANCE, ransac_n=3, num_iterations=2000)
-        normal = np.array(model[:3]) / np.linalg.norm(model[:3])
-        point = np.asarray(rest.points)[inliers].mean(axis=0)
-        if np.mean((centers - point) @ normal) < 0:               # orienta a normal para as câmaras
-            normal = -normal
-        planes.append((len(inliers), normal, point))
-        rest = rest.select_by_index(inliers, invert=True)         # retira o plano e continua
-    if not planes:
-        raise RuntimeError("Não foi encontrado nenhum plano no centro das imagens")
-    biggest_count, up, _ = max(planes, key=lambda p: p[0])
-
-    # Altura (ao longo de 'up') dos pixels do centro de cada imagem
-    center_heights = []
-    for v, T in zip(views, T_camera0_cameras):
-        h, w = v.xyz_image.shape[:2]
-        patch = v.xyz_image[h // 2 - 5:h // 2 + 5, w // 2 - 5:w // 2 + 5].reshape(-1, 3)
-        patch = patch[patch[:, 2] > 0]
-        center_heights.append(transform_points(T, patch) @ up)
-    center_heights = np.concatenate(center_heights)
-    reference = np.median(center_heights) if len(center_heights) else -np.inf
-
-    parallel = [p for p in planes if p[0] >= 0.25 * biggest_count and abs(p[1] @ up) > np.cos(np.radians(10))
-                and p[2] @ up > reference - 0.35]
-    if not parallel:
-        parallel = planes
-    _, _, point = min(parallel, key=lambda p: p[2] @ up)          # o mais baixo
-    return up, point
-
-
-HORIZONTAL_MAX_ANGLE = 10    # graus: normal a menos disto da vertical -> ponto de uma superfície horizontal
-TABLE_HEIGHT_MIN = 0.5       # m: o tampo está entre 0.5 m e 1.0 m acima do chão (Parte 08, Ex. 4)
-TABLE_HEIGHT_MAX = 1.0
-MIN_PLANE_POINTS = 300       # n.º mínimo de pontos (voxel de 1 cm) para aceitar um plano do chão ou da mesa
-
-
-def horizontal_points(pc, up):
-    """Pontos de superfícies HORIZONTAIS, escolhidos pela normal (Parte 07, Ex. 5 e 6).
-
-    1. Calcula a normal de cada ponto (plano ajustado aos vizinhos, raio 3 cm);
-    2. Ângulo entre a normal n e a vertical 'up':  theta = arccos(|n . up|)  (|.| porque a normal pode
-       apontar para cima ou para baixo, as duas são a mesma superfície);
-    3. Fica com os pontos com theta < 10°.
-    Saída: nova nuvem só com esses pontos.
-    """
-    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.03, max_nn=30))
-    cos_angle = np.abs(np.asarray(pc.normals) @ up)
-    keep = np.where(cos_angle > np.cos(np.radians(HORIZONTAL_MAX_ANGLE)))[0]
-    return pc.select_by_index(keep)
-
-
-def table_points_from_floor(cloud, up, central, verbose=True):
-    """Pontos do tampo, pela lógica das aulas: primeiro o CHÃO, depois a mesa (Parte 08, Ex. 4).
-
-    O RANSAC é guiado pelas normais (Parte 07, Ex. 8): só corre sobre pontos de superfícies
-    horizontais, para não encontrar 'planos' que cortam paredes, móveis ou caixas na diagonal.
-      1. Nuvem agregada (voxel de 1 cm) -> só os pontos com normal vertical (horizontal_points);
-      2. Chão = o MAIOR plano desses pontos (segment_plane). A altura de cada ponto acima do chão é
-         a distância ao plano, com a normal orientada para cima (para o lado das câmaras);
-      3. RANSAC outra vez, só nos pontos horizontais com altura entre 0.5 e 1.0 m -> plano da mesa;
-      4. No mesmo plano podem aparecer outras superfícies à mesma altura (um aparador, uma cómoda).
-         Clustering euclidiano (DBSCAN) dos pontos do plano e fica o MAIOR grupo, como na aula; mas só
-         entre os grupos que aparecem no centro das imagens (as câmaras estão a olhar para a mesa).
-    Saída: pontos do tampo (N x 3) ou None se não houver chão ou mesa visíveis (por exemplo, com
-    poucas câmaras muito perto da mesa o chão quase não aparece); nesse caso usa-se o outro método.
-    """
-    pc = horizontal_points(cloud.voxel_down_sample(0.01), up)
-    if len(pc.points) < MIN_PLANE_POINTS:
-        return None
-
-    # 2. Chão: o maior plano horizontal
-    model, inliers = pc.segment_plane(distance_threshold=PLANE_DISTANCE, ransac_n=3, num_iterations=2000)
-    if len(inliers) < MIN_PLANE_POINTS:
-        return None
-    floor_normal = np.array(model[:3]) / np.linalg.norm(model[:3])
-    if floor_normal @ up < 0:                                     # normal do chão a apontar para cima
-        floor_normal = -floor_normal
-    floor_point = np.asarray(pc.points)[inliers].mean(axis=0)
-    points = np.asarray(pc.points)
-    height = (points - floor_point) @ floor_normal                # altura acima do chão
-
-    # 3. Plano da mesa: RANSAC só nos pontos entre 0.5 e 1.0 m acima do chão
-    band = np.where((height > TABLE_HEIGHT_MIN) & (height < TABLE_HEIGHT_MAX))[0]
-    if len(band) < MIN_PLANE_POINTS:
-        return None
-    band_pc = pc.select_by_index(band)
-    _, inliers = band_pc.segment_plane(distance_threshold=PLANE_DISTANCE, ransac_n=3, num_iterations=2000)
-    plane_points = np.asarray(band_pc.points)[inliers]
-
-    # 4. Maior grupo do plano, entre os que aparecem no centro das imagens
-    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(plane_points))
-                      .cluster_dbscan(eps=0.025, min_points=3))
-    near_center = cKDTree(central).query(plane_points, distance_upper_bound=0.02)[0] < np.inf
-    candidates = [k for k in range(labels.max() + 1) if np.any(near_center[labels == k])]
-    if not candidates:
-        return None
-    best = max(candidates, key=lambda k: np.sum(labels == k))
-    table_points = plane_points[labels == best]
-    if len(table_points) < MIN_PLANE_POINTS:
-        return None
-    if verbose:
-        print(f"  chão: {len(inliers)} pontos; mesa a {np.median((table_points - floor_point) @ floor_normal):.2f} m"
-              f" do chão")
-    return table_points
-
-
-def table_points_from_center(cloud, up, seed):
-    """Pontos do tampo, a partir do plano estimado no centro das imagens (método de recurso).
-
-    Usado quando o chão não é visível. Pontos da nuvem a menos de 1.5 cm do plano estimado e a menos
-    de 1 m do ponto estimado; dentro desses, a componente ligada (DBSCAN) que contém o ponto estimado.
-    """
-    points = np.asarray(cloud.voxel_down_sample(0.01).points)
-    rel = points - seed
-    height = rel @ up                                             # altura acima do plano
-    horizontal = np.linalg.norm(rel - np.outer(height, up), axis=1)   # distância 'no plano'
-    table_points = points[(np.abs(height) < 0.015) & (horizontal < 1.0)]
-
-    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(table_points))
-                      .cluster_dbscan(eps=0.025, min_points=3))
-    if labels.max() >= 0:
-        valid = labels >= 0
-        nearest = np.argmin(np.linalg.norm(table_points[valid] - seed, axis=1))
-        table_points = table_points[labels == labels[valid][nearest]]
-    return table_points
-
-
-def detect_table(cloud, T_camera0_cameras, views, verbose=True):
-    """Deteta o tampo da mesa e define o referencial da mesa.
-
-    1. Direção 'para cima' (normal da mesa, aproximada) pelo RANSAC no centro das imagens
-       (table_plane_guess);
-    2. Pontos do tampo como nas aulas: chão primeiro, depois a mesa entre 0.5 e 1.0 m acima do chão,
-       com o RANSAC guiado pelas normais (table_points_from_floor). Se o chão não aparecer, usa o plano
-       estimado no centro das imagens (table_points_from_center);
-    3. Reajuste do plano por mínimos quadrados (SVD) com os pontos do tampo;
-    4. Retângulo de área mínima do tampo visto de cima: dá o centro (origem), a orientação (eixo x
-       ao longo do lado maior) e as dimensões do tampo.
-    Saída: objeto Table.
-    """
-    up, seed = table_plane_guess(views, T_camera0_cameras)
-
-    # 2. Pontos do tampo
-    table_points = table_points_from_floor(cloud, up, central_points(views, T_camera0_cameras), verbose)
-    if table_points is None:
-        if verbose:
-            print("  chão não encontrado: mesa pelo plano do centro das imagens")
-        table_points = table_points_from_center(cloud, up, seed)
-
-    # Reajuste do plano por mínimos quadrados (SVD): a normal é a direção de menor variância
-    centroid = table_points.mean(axis=0)
-    _, _, Vt = np.linalg.svd(table_points - centroid)
-    normal = Vt[2] if Vt[2] @ up > 0 else -Vt[2]
-
-    # 4. Base ortonormada (e1, e2) no plano e retângulo de área mínima dos pontos do tampo
-    e1 = np.cross(normal, [1.0, 0.0, 0.0])
-    if np.linalg.norm(e1) < 0.1:
-        e1 = np.cross(normal, [0.0, 1.0, 0.0])
-    e1 /= np.linalg.norm(e1)
-    e2 = np.cross(normal, e1)
-    uv = np.stack([(table_points - centroid) @ e1, (table_points - centroid) @ e2], axis=1)
-    (cu, cv), (size_a, size_b), angle = cv2.minAreaRect(uv.astype(np.float32))
-    angle = np.radians(angle)
-    axis_a = np.cos(angle) * e1 + np.sin(angle) * e2              # direção do lado 'size_a'
-    if size_b > size_a:                                            # o eixo x fica ao longo do lado maior
-        axis_a = np.cross(normal, axis_a)
-        size_a, size_b = size_b, size_a
-    x_axis = axis_a / np.linalg.norm(axis_a)
-    y_axis = np.cross(normal, x_axis)
-    origin = centroid + cu * e1 + cv * e2                          # centro do tampo
-
-    T_camera0_table = make_T(np.column_stack([x_axis, y_axis, normal]), origin)
-    if verbose:
-        print(f"Parte 2: mesa detetada com {len(table_points)} pontos, tampo de {size_a:.3f} x {size_b:.3f} m")
-    return Table(T_camera0_table, float(size_a), float(size_b), normal)
-
-
-# ----------------------------------------------------------------------------------------------------
-# 3.2 Retirar a mesa e o fundo
-# ----------------------------------------------------------------------------------------------------
-def extract_objects(cloud, table, voxel=OBJECT_VOXEL):
-    """Pontos dos objetos sobre a mesa, no referencial da MESA.
-
-    1. Transforma a nuvem para o referencial da mesa: a coordenada z passa a ser a altura acima do tampo;
-    2. Fica com os pontos entre 8 mm e 60 cm acima da mesa E dentro dos limites do tampo
-       (só a altura não chega: o chão à volta e outros móveis também podem estar a essa altura);
-    3. Downsampling (voxel de 4 mm) e remoção de outliers (flying pixels a 'flutuar').
-    Saída: (pontos M x 3, cores M x 3).
-    """
-    T_table_camera0 = np.linalg.inv(table.T_camera0_table)
-    points = transform_points(T_table_camera0, np.asarray(cloud.points))
-    x, y, z = points[:, 0], points[:, 1], points[:, 2]
-    mask = ((z > ABOVE_TABLE_MIN) & (z < ABOVE_TABLE_MAX) &
-            (np.abs(x) < table.length / 2 - TABLE_MARGIN) & (np.abs(y) < table.width / 2 - TABLE_MARGIN))
-
-    objects = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points[mask]))
-    objects.colors = o3d.utility.Vector3dVector(np.asarray(cloud.colors)[mask])
-    objects = objects.voxel_down_sample(voxel)
-    objects, _ = objects.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    return np.asarray(objects.points), np.asarray(objects.colors)
-
-
-# #####################################################################################################
-# 4. SAÍDA: NUVEM DE PONTOS SÓ DAS CAIXAS (é a entrada do script 2, avaliador_caixas.py)
-# #####################################################################################################
-BOXES_CLOUD = "caixas.ply"          # nuvem das caixas, no referencial da mesa
-DETECTION_FILE = "detecao.json"     # câmaras, mesa e pasta da cena
-
-
-def save_detection(folder, scene, T_cams, T_chain, table, points, colors):
-    """Grava a deteção numa pasta: a nuvem só das caixas (caixas.ply) e o detecao.json.
-
-    Entrada: pasta de saída, a cena, a pose de cada câmara (grafo de poses e só encadeamento), a mesa
-    e os pontos das caixas (referencial da mesa) com as suas cores.
-    O detecao.json guarda tudo o que o script 2 precisa além dos pontos: a pose de cada câmara (para
-    o result.json e para saber que faces das caixas podem ser vistas), a pose da mesa (para passar as
-    caixas do referencial da mesa para o da câmara 000) e a pasta da cena (para o ground truth).
+def save_registration(folder, scene, T_cams, T_chain, registered):
+    """Grava o registo.json: a pose de cada câmara (grafo de poses e só encadeamento) e as câmaras que
+    entraram na nuvem agregada (False = registo falhado). É a entrada das outras partes.
     """
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
-    cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-    cloud.colors = o3d.utility.Vector3dVector(colors)
-    o3d.io.write_point_cloud(str(folder / BOXES_CLOUD), cloud)
     info = {
         "cena": str(Path(scene.folder).resolve()),
         "imagens": [v.name for v in scene.views],
         "T_camera0_camera": [np.round(T, 9).tolist() for T in T_cams],
         "T_camera0_camera_so_encadeamento": [np.round(T, 9).tolist() for T in T_chain],
-        "mesa": {"T_camera0_table": np.round(table.T_camera0_table, 9).tolist(),
-                 "comprimento": table.length, "largura": table.width,
-                 "normal": np.round(table.normal, 9).tolist()},
-        "nuvem_das_caixas": BOXES_CLOUD,
-        "numero_de_pontos": int(len(points)),
+        "camaras_registadas": [bool(ok) for ok in registered],
     }
-    (folder / DETECTION_FILE).write_text(json.dumps(info, indent=2), encoding="utf-8")
+    (folder / REGISTRATION_FILE).write_text(json.dumps(info, indent=2), encoding="utf-8")
+
+
+def load_registration(folder):
+    """Lê o registo.json gravado por save_registration.
+
+    Saída: dicionário com a pasta da cena, os nomes das imagens, a pose de cada câmara (grafo de
+    poses e só encadeamento), as câmaras registadas e a pasta das partes. As nuvens não são lidas aqui.
+    """
+    info = json.loads((Path(folder) / REGISTRATION_FILE).read_text(encoding="utf-8"))
+    return {"scene_folder": Path(info["cena"]), "images": info["imagens"],
+            "T_cams": [np.array(T) for T in info["T_camera0_camera"]],
+            "T_chain": [np.array(T) for T in info["T_camera0_camera_so_encadeamento"]],
+            "registered": info["camaras_registadas"], "folder": Path(folder)}
 
 
 # #####################################################################################################
-# 5. VISUALIZAÇÃO (janelas 3D do Open3D; só com a opção --visualize)
+# 4. VISUALIZAÇÃO
 # #####################################################################################################
 # Uma cor por câmara (as 10 cores 'tab10' do matplotlib)
 CAMERA_COLORS = np.array([[0.12, 0.47, 0.71], [1.0, 0.5, 0.05], [0.17, 0.63, 0.17], [0.84, 0.15, 0.16],
@@ -1159,14 +920,109 @@ CAMERA_COLORS = np.array([[0.12, 0.47, 0.71], [1.0, 0.5, 0.05], [0.17, 0.63, 0.1
                           [0.74, 0.74, 0.13], [0.09, 0.75, 0.81]])
 
 
-def show_boxes_cloud(points, colors):
-    """A nuvem de pontos só das caixas (a saída deste script), com as cores reais."""
-    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-    pc.colors = o3d.utility.Vector3dVector(colors)
-    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)    # referencial da mesa
-    o3d.visualization.draw_geometries([pc, frame], window_name="Nuvem de pontos só das caixas (referencial da mesa)")
+# As janelas são feitas com o matplotlib (permite subplots). Cada parte tem duas funções:
+#   figure_data(...)  -> dicionário só com arrays (pode ser gravado num .npz e desenhado noutro processo:
+#                        é assim que o run_test.py abre as janelas sem parar o programa);
+#   make_figures(data) -> lista de janelas {"name", "fig"} (e "start" para as animações).
+DISPLAY_POINTS = 20000    # pontos desenhados em cada subplot 3D (com mais, o matplotlib fica lento a rodar)
+DISPLAY_RADIUS = 2.0      # m: só se desenham os pontos a menos disto do centro das câmaras (mesa e à volta)
 
 
+def sample_indices(n, max_points, seed=0):
+    """Índices de uma amostra aleatória de no máximo max_points pontos (para desenhar)."""
+    if n <= max_points:
+        return np.arange(n)
+    return np.sort(np.random.default_rng(seed).choice(n, max_points, replace=False))
+
+
+def camera_to_display(points):
+    """Pontos no referencial da câmara 000 (x para a direita, y para baixo, z para a frente) -> eixos de
+    desenho com o 'cima' para cima: (x, z, -y)."""
+    p = np.asarray(points, float).reshape(-1, 3)
+    return np.stack([p[:, 0], p[:, 2], -p[:, 1]], axis=1)
+
+
+def scatter_3d(ax, points, colors, size=0.5):
+    """Nuvem de pontos num subplot 3D."""
+    ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=colors, s=size, depthshade=False, linewidths=0)
+
+
+def set_equal_3d(ax, points):
+    """Mesma escala nos 3 eixos (sem isto a mesa e as caixas aparecem deformadas)."""
+    lo, hi = points.min(axis=0), points.max(axis=0)
+    center, half = (lo + hi) / 2, (hi - lo) / 2
+    for set_limits, c, h in zip((ax.set_xlim, ax.set_ylim, ax.set_zlim), center, half):
+        set_limits(c - h, c + h)
+    ax.set_box_aspect(np.maximum(hi - lo, 1e-3))
+
+
+def link_views(fig, axes):
+    """Rodar um dos subplots 3D com o rato roda também os outros (ficam com o mesmo ponto de vista)."""
+    def on_move(event):
+        if event.inaxes in axes and event.button is not None:
+            for ax in axes:
+                if ax is not event.inaxes:
+                    ax.view_init(elev=event.inaxes.elev, azim=event.inaxes.azim)
+            fig.canvas.draw_idle()
+    fig.canvas.mpl_connect("motion_notify_event", on_move)
+
+
+def show_figures(figures):
+    """Mostra as janelas de make_figures e espera que sejam fechadas (quando uma parte corre sozinha)."""
+    animations = [f["start"]() for f in figures if f.get("start")]    # guardadas, senão param
+    plt.show()
+    return animations
+
+
+def figure_data(r):
+    """Dados da janela da Parte 1 (r = resultado de run_registration): uma amostra da nuvem agregada à
+    volta da mesa, a cor de cada ponto, a câmara que o adquiriu e o centro de cada câmara."""
+    points = np.asarray(r["cloud"].points)
+    colors = np.asarray(r["cloud"].colors)
+    registered = np.array(r["registered"], bool)
+    centers = np.array([T[:3, 3] for T in r["T_cams"]])
+    near = np.nonzero(np.linalg.norm(points - centers[registered].mean(axis=0), axis=1) < DISPLAY_RADIUS)[0]
+    idx = near[sample_indices(len(near), DISPLAY_POINTS)]
+    return {"parte": "parte1_registo", "cena": Path(r["scene_folder"]).name, "points": points[idx],
+            "colors": colors[idx], "camera": r["camera_index"][idx], "camera_centers": centers,
+            "images": np.array(r["images"]), "registered": registered}
+
+
+def make_figures(data):
+    """Janela da Parte 1, como a figura do enunciado: a mesma nuvem agregada com a cor de cada píxel
+    (esquerda) e com a cor da câmara que adquiriu cada ponto (direita)."""
+    points = camera_to_display(data["points"])
+    centers = camera_to_display(data["camera_centers"])
+    registered = np.asarray(data["registered"], bool)
+    fig = plt.figure(figsize=(14, 7))
+    fig.suptitle(f"Parte 1 - registo: nuvem agregada ({data['cena']}, {len(centers)} imagens)")
+    axes = [fig.add_subplot(1, 2, k, projection="3d") for k in (1, 2)]
+    scatter_3d(axes[0], points, data["colors"])
+    axes[0].set_title("cor de cada píxel")
+    scatter_3d(axes[1], points, CAMERA_COLORS[data["camera"] % 10])
+    axes[1].set_title("cor da câmara que adquiriu o ponto")
+    for k, (center, name) in enumerate(zip(centers, data["images"])):
+        if not registered[k]:
+            continue
+        for ax in axes:                      # posição de cada câmara (triângulo com o nome da imagem)
+            ax.scatter(*center, color=CAMERA_COLORS[k % 10], s=60, marker="^", depthshade=False)
+            ax.text(*center, f" {name}", color=CAMERA_COLORS[k % 10], fontsize=9)
+    for ax in axes:
+        set_equal_3d(ax, np.vstack([points, centers[registered]]))
+        ax.view_init(elev=30, azim=-60)
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("z (m)")
+        ax.set_zlabel("-y (m)")
+    left_out = [str(n) for n, ok in zip(data["images"], registered) if not ok]
+    if left_out:
+        fig.text(0.5, 0.03, "câmaras sem registo de confiança (fora da nuvem): " + ", ".join(left_out),
+                 ha="center", color="red")
+    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.05, top=0.92, wspace=0.02)
+    link_views(fig, axes)
+    return [{"name": "", "fig": fig}]
+
+
+# Janelas 3D do Open3D (opção --open3d)
 def show_registration(scene, T_est, camera_index_cloud=None, T_gt=None):
     """Nuvem agregada: cores reais | cor por câmara | (se houver GT) estimada a vermelho sobre a verdadeira a verde."""
     cloud, cam = aggregate(scene, T_est)
@@ -1192,62 +1048,66 @@ def show_registration(scene, T_est, camera_index_cloud=None, T_gt=None):
 
 
 # #####################################################################################################
-# 6. PROGRAMA PRINCIPAL
+# 5. PROGRAMA PRINCIPAL
 # #####################################################################################################
-def run_detection(scene_folder, output=None, loop_closure=True, gt_registration=False, verbose=True):
-    """Parte 1 (registo) e Parte 2 (mesa) numa cena; grava a nuvem só das caixas.
+def run_registration(scene_folder, output=None, loop_closure=True, gt_registration=False, verbose=True):
+    """Parte 1 numa cena: regista as imagens, junta as nuvens e grava o registo.json.
 
-    Entrada: pasta da cena e pasta de saída (por omissão <cena>/detecao).
+    Entrada: pasta da cena e pasta de saída (por omissão <cena>/partes).
     gt_registration=True usa as poses VERDADEIRAS das câmaras em vez do registo. Só serve para
     avaliar a segmentação e o ajuste isoladamente (como pede o enunciado); nunca no resultado final.
-    Saída: dicionário com a cena, as poses das câmaras, a nuvem agregada, a mesa, os pontos das caixas
-    e a pasta onde a deteção foi gravada.
+    Saída: dicionário com a cena, as poses das câmaras, as câmaras registadas, a nuvem agregada (e a
+    câmara de cada ponto) e o ganho e o desvio de cada imagem (para o extra_fotometria.py).
     """
     t0 = time.time()
     scene = load_scene(scene_folder)
-    output = Path(output) if output else Path(scene_folder) / "detecao"
+    output = Path(output) if output else Path(scene_folder) / OUTPUT_FOLDER
     if verbose:
         print(f"Cena {scene.folder.name}: {len(scene.views)} imagens")
 
-    # ---------------- Parte 1: registo ----------------
     if gt_registration:
         T_cams = [np.array(c["T_camera0_camera"]) for c in scene.ground_truth["cameras"]]
         T_chain = T_cams
+        registered = [True] * len(T_cams)
     else:
-        T_cams, T_chain = register_scene(scene, loop_closure=loop_closure, verbose=verbose)
-    cloud, _ = aggregate(scene, T_cams)
+        T_cams, T_chain, registered = register_scene(scene, loop_closure=loop_closure, verbose=verbose)
+    if verbose and not all(registered):
+        left_out = [v.name for v, ok in zip(scene.views, registered) if not ok]
+        print(f"  câmaras sem registo de confiança, deixadas de fora da nuvem: {', '.join(left_out)}")
 
-    # ---------------- Parte 2: mesa e pontos das caixas ----------------
-    table = detect_table(cloud, T_cams, scene.views, verbose=verbose)
-    points, colors = extract_objects(cloud, table)
-    save_detection(output, scene, T_cams, T_chain, table, points, colors)
+    exposures = []                       # (imagem, s, b) de cada câmara, preenchido pelo aggregate
+    cloud, camera_index = aggregate(scene, T_cams, registered, exposures=exposures)
+    save_registration(output, scene, T_cams, T_chain, registered)
     if verbose:
-        print(f"  {len(points)} pontos das caixas gravados em {output / BOXES_CLOUD} ({time.time() - t0:.1f} s)")
-    return {"scene": scene, "T_cams": T_cams, "T_chain": T_chain, "cloud": cloud, "table": table,
-            "points": points, "colors": colors, "folder": output}
+        print(f"  nuvem agregada com {len(cloud.points)} pontos; registo gravado em "
+              f"{output / REGISTRATION_FILE} ({time.time() - t0:.1f} s)")
+    return {"scene": scene, "scene_folder": scene.folder, "images": [v.name for v in scene.views],
+            "T_cams": T_cams, "T_chain": T_chain, "registered": registered, "cloud": cloud,
+            "camera_index": camera_index, "exposures": exposures, "folder": output}
 
 
 def main():
-    """Lê os argumentos da linha de comandos, corre a deteção e grava a nuvem das caixas."""
+    """Lê os argumentos da linha de comandos e corre a Parte 1."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scene", required=True, help="pasta da cena")
-    parser.add_argument("--output", help="pasta de saída (por omissão: <cena>/detecao)")
     parser.add_argument("--no_loop_closure", action="store_true", help="registo só por encadeamento")
     parser.add_argument("--gt_registration", action="store_true",
                         help="usa as poses verdadeiras das câmaras (só para avaliar o resto do sistema)")
-    parser.add_argument("--visualize", action="store_true", help="abre janelas 3D do registo e da nuvem das caixas")
+    parser.add_argument("--visualize", action="store_true", help="janela com a nuvem agregada (2 subplots)")
+    parser.add_argument("--open3d", action="store_true",
+                        help="janelas 3D do Open3D (com ground truth: nuvem estimada sobre a verdadeira)")
     args = parser.parse_args()
 
-    r = run_detection(args.scene, args.output, loop_closure=not args.no_loop_closure,
-                      gt_registration=args.gt_registration)
-    print(f"\nDeteção gravada em {r['folder']}. A seguir:\n"
-          f"    python savi/avaliador_caixas.py --detection {r['folder']}")
-
+    r = run_registration(args.scene, loop_closure=not args.no_loop_closure, gt_registration=args.gt_registration)
+    print(f"\nRegisto gravado em {r['folder']}. A seguir:\n"
+          f"    python savi/extra_fotometria.py --scene {args.scene}\n"
+          f"    python savi/parte2_segmentacao.py --scene {args.scene} --num_boxes N")
     if args.visualize:
+        show_figures(make_figures(figure_data(r)))
+    if args.open3d:
         gt = r["scene"].ground_truth
         T_gt = [np.array(c["T_camera0_camera"]) for c in gt["cameras"]] if gt else None
         show_registration(r["scene"], r["T_cams"], T_gt=T_gt)
-        show_boxes_cloud(r["points"], r["colors"])
 
 
 if __name__ == "__main__":
