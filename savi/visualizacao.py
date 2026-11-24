@@ -8,13 +8,13 @@ enunciado. Cada parte tem duas funções próprias, que usam as funções deste 
     make_windows(data) -> lista de janelas, cada uma um dicionário com o título, o que desenhar
                           (points_item, lines_item, box_item, frame_item, ou uma imagem 2D:
                           image_item) e o ponto de vista.
-SceneWindows abre as janelas (ou, sem janelas, só grava cada uma num PNG).
+SceneWindows abre as janelas (as vistas não são gravadas em ficheiros: a única imagem gravada nos
+resultados é o top_view.png da Parte 3).
 """
 
 import os
 import time
 
-import cv2                                   # OpenCV: gravar os PNG
 import numpy as np
 import open3d as o3d                         # janelas 3D
 
@@ -32,7 +32,7 @@ CAMERA_NAMES = ["azul", "laranja", "verde", "vermelho", "roxo", "castanho", "ros
 
 
 # Uma janela por cena, com uma vista de cada vez (as setas <- e -> mudam de vista).
-WINDOW_SIZE = (1100, 750)     # pixels de cada janela (e de cada PNG)
+WINDOW_SIZE = (1100, 750)     # pixels de cada janela
 POINT_SIZE = 2.0              # tamanho de cada ponto desenhado (pixels)
 WHITE = (1.0, 1.0, 1.0)       # cor do fundo
 FRAME_SECONDS = 0.15          # duração de cada passo das animações
@@ -126,12 +126,6 @@ def close_view(view, points, factor=1.5, minimum=0.25):
     return {"center": center, "eye": center + distance * direction / np.linalg.norm(direction), "up": view["up"]}
 
 
-def save_png(image, path):
-    """Grava uma imagem RGB (uint8) em PNG (cv2.imwrite falha no Windows com caminhos com acentos)."""
-    rgb = np.asarray(image)[..., :3]
-    cv2.imencode(".png", np.ascontiguousarray(rgb[..., ::-1]))[1].tofile(str(path))
-
-
 # #####################################################################################################
 # 2. JANELAS DO OPEN3D QUE NÃO PARAM O PROGRAMA
 # #####################################################################################################
@@ -218,16 +212,14 @@ class SceneWindows:
     com todas as vistas dessa cena; as setas <- e -> do teclado mudam de vista (o título diz qual é).
 
     Cada vista é aberta com add(), e as janelas só respondem ao rato e ao teclado (e as animações só
-    avançam) enquanto se chama tick(); run() espera que todas sejam fechadas. Cada vista pode também ser
-    gravada num PNG (numa janela invisível). show=False: não abre janelas, só grava os PNG.
-    Uma vista (dicionário) tem: "name" (sufixo do PNG), "title", "items" (o que desenhar), "view"
+    avançam) enquanto se chama tick(); run() espera que todas sejam fechadas.
+    Uma vista (dicionário) tem: "name" (identifica a vista), "title", "items" (o que desenhar), "view"
     ({"center", "eye", "up"}; sem view, a vista inicial do draw_geometries) e, para as animações,
     "frames" (o que desenhar em cada passo, por cima dos items). Uma vista pode também ser só uma imagem
     2D (image_item), por exemplo um gráfico do matplotlib.
     """
 
-    def __init__(self, show=True):
-        self.show = show
+    def __init__(self):
         self.groups = {}                 # janela de cada cena: {nome: dicionário da janela}
 
     @property
@@ -254,28 +246,8 @@ class SceneWindows:
         _look_at(vis, spec.get("view"))
         return shown
 
-    def save(self, spec, png):
-        """Grava a imagem de uma vista num PNG (janela invisível; nas animações, o último passo). Uma vista
-        que é só uma imagem 2D é gravada tal como está."""
-        if len(spec["items"]) == 1 and spec["items"][0]["type"] == "image":
-            save_png(spec["items"][0]["image"], png)
-            return
-        vis = o3d.visualization.Visualizer()
-        vis.create_window("png", *WINDOW_SIZE, visible=False)
-        self._draw(vis, spec)
-        vis.poll_events()
-        vis.update_renderer()
-        image = np.asarray(vis.capture_screen_float_buffer(do_render=True))
-        save_png((np.clip(image, 0, 1) * 255 + 0.5).astype(np.uint8), png)
-        vis.destroy_window()
-
-    def add(self, spec, png=None, group="vistas"):
-        """Junta uma vista à janela do grupo (a cena), abrindo-a se for a primeira, e mostra-a.
-        png: onde gravar a imagem da vista."""
-        if png is not None:
-            self.save(spec, png)
-        if not self.show:
-            return
+    def add(self, spec, group="vistas"):
+        """Junta uma vista à janela do grupo (a cena), abrindo-a se for a primeira, e mostra-a."""
         window = self.groups.get(group)
         if window is None:
             vis = o3d.visualization.VisualizerWithKeyCallback()

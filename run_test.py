@@ -6,7 +6,7 @@ Utilização:
     python run_test.py              # corre todas as cenas que já estão em test/
     python run_test.py --git        # e faz git add + commit + push depois de cada cena
     python run_test.py --redo       # volta a correr cenas que já têm resultado
-    python run_test.py --sem_janelas   # não abre janelas (só grava as figuras em results_test/<cena>/)
+    python run_test.py --sem_janelas   # não abre janelas
 
 Corre as cenas UMA DE CADA VEZ: em cada cena, os 4 ficheiros (savi/) um depois do outro e o avaliador,
 e no fim mostra a janela da cena; só depois passa à cena seguinte:
@@ -24,8 +24,8 @@ Janelas: UMA janela 3D do Open3D por cena, com as vistas de todas as partes (com
 agregada do enunciado); as setas <- e -> do teclado mudam de vista e o título diz qual é. A janela
 de uma cena abre quando as 4 partes acabam (antes da pergunta do avaliador), sem parar o programa: as janelas são abertas por um
 segundo processo (python run_test.py --janelas ...), por isso pode ver-se, por exemplo, a cena 3 sem
-fechar as janelas das cenas 1 e 2, e o programa continua enquanto estão abertas. Cada vista é gravada
-também em PNG em results_test/<cena>/ (parte1_registo_cor_pixeis.png, parte1_registo_cor_camaras.png, ...).
+fechar as janelas das cenas 1 e 2, e o programa continua enquanto estão abertas. As vistas não são
+gravadas em ficheiros: a única imagem em results_test/<cena>/ é o top_view.png.
 
 Pensado para não perder resultados:
     - um erro numa cena não pára as outras (fica registado e passa-se à seguinte);
@@ -79,7 +79,8 @@ def download_scenes(url, scenes_dir):
     1. Faz 'git clone' do repositório para uma pasta temporária (só a última versão: --depth 1);
        aceita também o link copiado do browser (ex.: .../tree/main/cenas_teste), que é cortado;
     2. Procura todas as pastas que são cenas (têm a subpasta point_clouds/), em qualquer sítio do repositório;
-    3. Copia cada cena para test/<cena> (as que já lá estão não são copiadas outra vez);
+    3. Copia cada cena para test/<cena>, com o ground_truth.json se existir (as que já lá estão não são
+       copiadas outra vez);
     4. Apaga a pasta temporária.
     """
     if "/tree/" in url:                 # link de uma pasta no browser -> link do repositório
@@ -97,8 +98,9 @@ def download_scenes(url, scenes_dir):
             if target.exists():
                 print(f"  {scene.name}: já existe em {scenes_dir.name}/, não foi copiada")
                 continue
-            # Copia só os dados da cena (nunca o ground truth, se por acaso existir)
-            shutil.copytree(scene, target, ignore=shutil.ignore_patterns("ground_truth.json", "config.json"))
+            # Copia os dados da cena e o ground truth, se existir (só o avaliador o lê, para comparar os
+            # resultados; as partes nunca o leem). O config.json do simulador não é copiado.
+            shutil.copytree(scene, target, ignore=shutil.ignore_patterns("config.json"))
             copied += 1
         print(f"  {copied} cenas copiadas para {scenes_dir}")
 
@@ -147,13 +149,13 @@ def process_alive(pid):
 class Windows:
     """Lado deste programa: lança o processo das janelas e envia-lhe pedidos."""
 
-    def __init__(self, show=True):
+    def __init__(self):
         shutil.rmtree(WINDOWS_FOLDER, ignore_errors=True)       # pedidos de corridas anteriores
         self.folder = WINDOWS_FOLDER / time.strftime("%Y%m%d_%H%M%S")
         self.folder.mkdir(parents=True, exist_ok=True)
         self.count = 0
         command = [sys.executable, str(Path(__file__).resolve()), "--janelas", str(self.folder),
-                   "--pid", str(os.getpid())] + ([] if show else ["--sem_janelas"])
+                   "--pid", str(os.getpid())]
         # Prioridade baixa: as janelas não tiram tempo às partes que estão a correr
         flags = subprocess.BELOW_NORMAL_PRIORITY_CLASS if os.name == "nt" else 0
         self.log_path = self.folder / "janelas.log"
@@ -161,22 +163,19 @@ class Windows:
         self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=self.log,
                                         stderr=subprocess.STDOUT, creationflags=flags)
 
-    def add(self, data, title, png):
-        """Pede uma janela: data = figure_data de uma parte; png = onde a figura é gravada."""
+    def add(self, data, title):
+        """Pede uma janela: data = figure_data de uma parte."""
         self.count += 1
         name = f"{self.count:03d}"
-        Path(png).parent.mkdir(parents=True, exist_ok=True)
         np.savez(self.folder / f"{name}.npz", **data)
-        request = {"dados": f"{name}.npz", "parte": str(data["parte"]), "titulo": title, "png": str(png)}
+        request = {"dados": f"{name}.npz", "parte": str(data["parte"]), "titulo": title}
         tmp = self.folder / f"{name}.tmp"
         tmp.write_text(json.dumps(request), encoding="utf-8")
         tmp.rename(self.folder / f"{name}.json")      # o .json só aparece quando está completo
 
-    def finish(self, wait=False):
-        """Diz ao processo das janelas que não há mais pedidos (e, com wait, espera que acabe)."""
+    def finish(self):
+        """Diz ao processo das janelas que não há mais pedidos."""
         (self.folder / "fim").write_text("", encoding="utf-8")
-        if wait:
-            self.process.wait()
         self.log.close()
 
 
@@ -245,15 +244,14 @@ def run_scene(scene, output, views, show, known, push=False):
         print(f"  ERRO no avaliador da cena {scene.name}")
 
 
-def open_windows(folder, show, parent_pid):
-    """Lado do processo das janelas: abre as janelas de cada pedido que aparece na pasta e grava cada uma
-    em PNG.
+def open_windows(folder, parent_pid):
+    """Lado do processo das janelas: abre as janelas de cada pedido que aparece na pasta.
 
     Termina quando o programa principal acabou (ou foi interrompido) e todas as janelas foram fechadas.
     """
     import visualizacao                              # janelas 3D do Open3D (SceneWindows)
     folder = Path(folder)
-    windows = visualizacao.SceneWindows(show)
+    windows = visualizacao.SceneWindows()
     seen, finished = set(), False
     while True:
         for path in sorted(folder.glob("*.json")):
@@ -264,10 +262,9 @@ def open_windows(folder, show, parent_pid):
                 request = json.loads(path.read_text(encoding="utf-8"))
                 with np.load(folder / request["dados"]) as npz:
                     data = {k: (npz[k].item() if npz[k].ndim == 0 else npz[k]) for k in npz.files}
-                png = Path(request["png"])
                 for spec in importlib.import_module(request["parte"]).make_windows(data):
-                    windows.add(spec, png.with_name(png.stem + spec["name"] + ".png"), group=str(data["cena"]))
-                print(f"{request['titulo']}: {png}", flush=True)
+                    windows.add(spec, group=str(data["cena"]))
+                print(request["titulo"], flush=True)
             except Exception:
                 traceback.print_exc()
                 sys.stdout.flush()
@@ -294,13 +291,13 @@ def main_test():
     parser.add_argument("--git", action="store_true", help="commit + push depois de cada cena")
     parser.add_argument("--redo", action="store_true", help="volta a correr cenas que já têm resultado")
     parser.add_argument("--download", metavar="URL", help="copia primeiro as cenas deste repositório GitHub para --scenes")
-    parser.add_argument("--sem_janelas", action="store_true", help="não abre janelas (só grava as figuras)")
+    parser.add_argument("--sem_janelas", action="store_true", help="não abre janelas")
     parser.add_argument("--janelas", help=argparse.SUPPRESS)       # uso interno: processo das janelas
     parser.add_argument("--pid", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.janelas:
-        open_windows(args.janelas, not args.sem_janelas, args.pid)
+        open_windows(args.janelas, args.pid)
         return
 
     scenes_dir, output = Path(args.scenes), Path(args.output)
@@ -322,13 +319,13 @@ def main_test():
         return
     start = time.time()
     failed, done = [], []
-    windows = Windows(show=not args.sem_janelas)
+    windows = None if args.sem_janelas else Windows()
 
     def show(scene, views):
         """Abre a janela da cena com as vistas juntadas até aqui (e esvazia a lista)."""
-        for data, part in views:
+        for data, part in views if windows is not None else []:
             try:
-                windows.add(data, f"{scene.name} - {part}", Path(output) / scene.name / f"{part}.png")
+                windows.add(data, f"{scene.name} - {part}")
             except Exception as error:
                 print(f"  (vistas de {part} não mostradas: {error})")
         views.clear()
@@ -350,12 +347,9 @@ def main_test():
 
     print(f"\nTerminado em {(time.time() - start) / 60:.1f} min. "
           f"Feitas: {len(done)}  Com erro: {failed if failed else 'nenhuma'}")
-    windows.finish(wait=args.sem_janelas)
-    if args.sem_janelas:
-        print(f"Figuras gravadas em {output}/<cena>/")
-    else:
-        print(f"As janelas continuam abertas até serem fechadas (figuras também em {output}/<cena>/; "
-              f"erros das janelas em {windows.log_path})")
+    if windows is not None:
+        windows.finish()
+        print(f"As janelas continuam abertas até serem fechadas (erros das janelas em {windows.log_path})")
 
 
 if __name__ == "__main__":

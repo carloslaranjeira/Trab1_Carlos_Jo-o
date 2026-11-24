@@ -33,7 +33,7 @@ Pastas:
 | `simulator/` | simulador do professor e configurações das cenas (`configs/`, incluindo `stack_*.json`) |
 | `scenes_offline/` | cenas de desenvolvimento geradas pelo simulador (com `ground_truth.json`; não vão para o git) |
 | `test/` | cenas do dia do teste (copiadas do GitHub pelo `run_test.py`; não vão para o git) |
-| `results_test/` | por cena do teste: `result.json`, `top_view.png`, a figura de cada parte e, se a cena tiver ground truth, o relatório `avaliacao.md` com as figuras `avaliador_*.png`, escritos pelo `run_test.py` |
+| `results_test/` | por cena do teste: `result.json`, `top_view.png` (a única imagem: as vistas das partes e do avaliador só aparecem nas janelas) e, se a cena tiver ground truth, o relatório `avaliacao.md`, escritos pelo `run_test.py` |
 | `Read_me/` | este relatório, o enunciado e o `requirements.txt` |
 
 Opções de cada parte (todas têm `--scene`, a pasta da cena):
@@ -86,7 +86,7 @@ O `run_test.py` (na pasta principal) corre os 4 ficheiros e o avaliador em todas
 `results_test/<cena>/`. As cenas correm **uma de cada vez**: em cada cena correm seguidas a Parte 1, o extra, a Parte 2 e a Parte 3 (sem perguntas), abre a janela 3D (Open3D) dessa cena, com as vistas de todas as partes, por esta ordem: Parte 1, Parte 2, Parte 3 e, no fim, as do extra de fotometria (setas ← e → para mudar de vista), e por fim o avaliador pede o número real de caixas (se a cena não estiver em `test/num_boxes.json`) e compara; só depois passa à cena seguinte. As janelas **não param o programa** (são desenhadas por um segundo processo): pode ver-se a cena 3 sem fechar as
 janelas das cenas 1 e 2 (os pedidos ao segundo processo ficam na pasta temporária do sistema, `SAVIBoxes_janelas`).
 A pasta `test/` só é lida: os resultados intermédios de cada parte ficam em `results_test/<cena>/partes/`, que não
-vai para o git (`.gitignore`). Com `--sem_janelas` só são gravadas as figuras. Cada função tem um comentário que diz o
+vai para o git (`.gitignore`). Com `--sem_janelas` não abre janelas. Cada função tem um comentário que diz o
 que faz, o que recebe, o que devolve e porque foi feita assim.
 
 | Ficheiro | Secção | Funções principais | Para que serve |
@@ -308,7 +308,7 @@ caixa empilhada) são multiplicados por √M, com M o número de pontos. Os de *
 caixa), por isso o fator é √(M / (N·S)): o conjunto da cobertura pesa tanto como o conjunto dos pontos.
 
 **Evolução da otimização:** os parâmetros de cada avaliação ficam guardados e são desenhados no fim (animação 3D
-com `--visualize`, figura PNG no avaliador, janela do Open3D com `--open3d`). Nas Partes 05 e 06 o desenho é feito
+com `--visualize`, janela do Open3D com `--open3d`). Nas Partes 05 e 06 o desenho é feito
 dentro da função objetivo, mas aqui cada iteração avalia a função 7N+1 vezes (jacobiano por diferenças finitas), e
 desenhar em direto era lento e mostrava as caixas a tremer.
 
@@ -421,7 +421,7 @@ porque depende da divisão inicial dos pontos entre as caixas, que é apenas apr
    - **Parte 1:** erro de translação (mm) e de rotação (°) de cada câmara, com E = T_gt⁻¹ · T_est, como na
      Parte 08. O ângulo vem de `Rotation.from_matrix(R_E).magnitude()`, a alternativa que a Parte 08 indica ao
      arccos do traço: o `result.json` guarda as matrizes com 6 casas decimais, e para erros de centésimas de grau o
-     arccos dava 0°. Figura: a nuvem agregada com as poses estimadas (vermelho) sobre a nuvem com as poses
+     arccos dava 0°. Janela: a nuvem agregada com as poses estimadas (vermelho) sobre a nuvem com as poses
      verdadeiras (verde).
    - **Parte 2:** para avaliar só a segmentação, as nuvens são juntadas com as poses verdadeiras e as Partes 2 e 3
      (que dá os conjuntos de pontos de cada caixa) correm sobre essa nuvem, em `partes_gt/` ao lado do `result.json` (os resultados do
@@ -430,7 +430,7 @@ porque depende da divisão inicial dos pontos entre as caixas, que é apenas apr
    - **Parte 3:** os dois métodos. A otimização vem do `result.json` e a bounding box do `partes/ajuste.npz`.
      Para cada caixa verdadeira: posição (mm), altura z da base (mm), yaw (°), dL, dW, dH (mm) e IoU 3D, com as
      simetrias da caixa. A associação entre caixas é feita pelo IoU (algoritmo húngaro). Uma caixa verdadeira sem
-     caixa estimada conta com IoU 0, e as caixas a mais são indicadas. Figuras: as caixas estimadas sobre as
+     caixa estimada conta com IoU 0, e as caixas a mais são indicadas. Janelas: as caixas estimadas sobre as
      verdadeiras (preto), de cima e em 3D.
    - **Extra (fotometria):** s e b estimados de cada imagem e os verdadeiros, se a cena tiver o campo `photometry`.
 

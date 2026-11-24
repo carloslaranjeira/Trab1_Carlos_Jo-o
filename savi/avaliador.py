@@ -13,7 +13,8 @@ COMO CORRER
    nunca recebem o número de caixas (a Parte 2 estima-o).
 2. SÓ se a pasta da cena tiver ground_truth.json (as cenas do dia da apresentação não o têm): compara o
    result.json com o ground truth e escreve o relatório avaliacao.md ao lado do result.json, com os
-   tópicos de "Comparação com o ground truth" do enunciado para cada parte, e as figuras em PNG.
+   tópicos de "Comparação com o ground truth" do enunciado para cada parte (as figuras são só vistas
+   nas janelas: a única imagem gravada nos resultados é o top_view.png da Parte 3).
 Este é o ÚNICO ficheiro que lê o ground_truth.json: as partes nunca o leem.
 O run_test.py chama-o no fim de cada cena (evaluate_scene).
 
@@ -34,7 +35,7 @@ ORGANIZAÇÃO DESTE FICHEIRO
     4. Parte 3 - caixas    erros de posição, altura, yaw e dimensões e IoU 3D dos dois métodos, com as
                            simetrias; caixas estimadas sobre as verdadeiras
     5. Extra - fotometria  s e b estimados de cada imagem contra os verdadeiros
-    6. Relatório           avaliacao.md e figuras (PNG e janelas 3D)
+    6. Relatório           avaliacao.md e figuras (janelas 3D)
     7. Programa principal  evaluate_scene() e main()
 """
 
@@ -42,7 +43,6 @@ import argparse
 import json
 from pathlib import Path
 
-import matplotlib.pyplot as plt              # figura PNG vista de cima
 import numpy as np
 from scipy.optimize import linear_sum_assignment   # emparelhar caixas / conjuntos com o ground truth
 from scipy.spatial.transform import Rotation       # ângulo de uma rotação (Parte 08)
@@ -55,7 +55,7 @@ from extra_fotometria import PHOTOMETRY_FILE
 from parte1_registo import aggregate, load_registration, save_registration
 from parte2_segmentacao import load_objects, run_segmentation
 from parte3_ajuste import (  # IoU 3D (overlap_area, height_overlap) e figuras da Parte 3
-    BOX_COLORS, draw_rects, height_overlap, load_fit, overlap_area, run_fit, top_view,
+    BOX_COLORS, height_overlap, load_fit, overlap_area, run_fit, top_view,
 )
 from visualizacao import box_item, camera_view, close_view, colors_uint8, data_view, points_item, SceneWindows
 
@@ -63,7 +63,6 @@ from visualizacao import box_item, camera_view, close_view, colors_uint8, data_v
 GROUND_TRUTH_FILE = "ground_truth.json"
 GT_FOLDER = "partes_gt"        # 3. Parte 2 e conjuntos de pontos com as poses verdadeiras (ao lado do result.json)
 REPORT_FILE = "avaliacao.md"   # 6. relatório (ao lado do result.json)
-FIGURE_NAME = "avaliador"      # 6. as figuras chamam-se avaliador_<vista>.png (ao lado do result.json)
 INSIDE_MARGIN = 0.005          # 3. m: margem à volta das caixas verdadeiras (ruído), como no enunciado
 FIGURE_VOXEL = 0.005           # 6. m: voxel das nuvens das figuras
 EST_COLOR = (0.9, 0.1, 0.1)    # 2. nuvem com as poses estimadas: vermelho
@@ -425,29 +424,6 @@ def make_windows(data):
     return windows
 
 
-def save_top_view(path, data, title=""):
-    """Figura PNG vista de cima (matplotlib): pontos sobre a mesa, caixas verdadeiras (preto) e as dos
-    dois métodos (otimização a cores, bounding box a tracejado)."""
-    fig, ax = plt.subplots(figsize=(6, 6))
-    pts, cols = data["objects"], data["object_colors"] / 255.0
-    sel = np.random.default_rng(0).choice(len(pts), min(len(pts), 15000), replace=False)
-    ax.scatter(pts[sel, 0], pts[sel, 1], c=cols[sel], s=1)
-    styles = {"gt": ({"color": "k", "lw": 2.5}, "verdadeira"), "bounding_box": ({"color": "gray", "ls": "--"}, "bounding box"),
-              "otimizacao": ({}, "otimização")}
-    for key, params in (("gt", data["gt_params"]), ("bounding_box", data["params_bounding_box"]),
-                        ("otimizacao", data["params_otimizacao"])):
-        style, label = styles[key]
-        draw_rects(ax, params, style, label)
-    ax.set_aspect("equal")
-    ax.set_xlabel("x mundo (m)")
-    ax.set_ylabel("y mundo (m)")
-    ax.set_title(title)
-    ax.legend(loc="upper right", fontsize=8)
-    fig.tight_layout()
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-
-
 def write_report(path, name, count, cams, seg, boxes, photometry):
     """Escreve o relatório avaliacao.md: os tópicos de "Comparação com o ground truth" de cada parte."""
     found, real, num_gt = count
@@ -466,8 +442,6 @@ def write_report(path, name, count, cams, seg, boxes, photometry):
         t, r = [c["transl_mm"] for c in cams[1:]], [c["rot_deg"] for c in cams[1:]]
         text.append(f"| média (sem a 000) | {np.mean(t):.2f} | {np.mean(r):.3f} |")
         text.append(f"| máximo | {max(t):.2f} | {max(r):.3f} |")
-    text += ["", "Nuvem agregada com as poses estimadas (vermelho) sobre a nuvem com as poses verdadeiras (verde):", "",
-             f"![registo]({FIGURE_NAME}_registo.png)", f"![registo de perto]({FIGURE_NAME}_registo_perto.png)"]
 
     text += ["", "## Parte 2 - Segmentação", "",
              "Para avaliar só a segmentação (sem os erros do registo), as nuvens foram juntadas com as poses "
@@ -506,10 +480,6 @@ def write_report(path, name, count, cams, seg, boxes, photometry):
                     "(uma caixa verdadeira sem caixa estimada conta com IoU 0)."
                     + (f" Caixas estimadas a mais: {', '.join(map(str, extra))}." if extra else ""))
         text.append("")
-    text += ["Caixas estimadas sobrepostas às verdadeiras (preto):", "",
-             f"![vista de cima]({FIGURE_NAME}_vista_de_cima.png)",
-             f"![otimização em 3D]({FIGURE_NAME}_caixas_otimizacao_3d.png)",
-             f"![bounding box em 3D]({FIGURE_NAME}_caixas_bounding_box_3d.png)"]
 
     if photometry:
         text += ["", "## Extra - Fotometria", "", "cor_000 = s · cor + b de cada imagem:", "",
@@ -580,7 +550,6 @@ def evaluate_scene(scene_folder, result_path=None, num_boxes=None, verbose=True)
     data = figure_data(scene_folder.name, est_cloud, gt_cloud, T_world_camera0,
                        {k: boxes_in_world(v, ground_truth) if v is not None else None for k, v in est.items()},
                        gt_params)
-    save_top_view(out / f"{FIGURE_NAME}_vista_de_cima.png", data, title=scene_folder.name)
     write_report(out / REPORT_FILE, scene_folder.name, (found, real, len(ground_truth["boxes"])), cams, seg,
                  boxes, photometry)
     if verbose:
@@ -602,16 +571,18 @@ def main():
     parser.add_argument("--scene", required=True, help="pasta da cena (já com as 4 partes feitas)")
     parser.add_argument("--result", help="result.json a avaliar (por omissão: <cena>/result.json)")
     parser.add_argument("--num_boxes", type=int, help="número real de caixas (se faltar, é perguntado)")
-    parser.add_argument("--visualize", action="store_true", help="abre as janelas 3D (as figuras são sempre gravadas)")
+    parser.add_argument("--visualize", action="store_true", help="abre as janelas 3D com as figuras")
     args = parser.parse_args()
 
     result_path = Path(args.result) if args.result else Path(args.scene) / "result.json"
     data = evaluate_scene(args.scene, result_path, args.num_boxes)
     if data is None:
         return
-    windows = SceneWindows(show=args.visualize)
+    if not args.visualize:
+        return
+    windows = SceneWindows()
     for spec in make_windows(data):
-        windows.add(spec, result_path.parent / f"{FIGURE_NAME}{spec['name']}.png", group=str(data["cena"]))
+        windows.add(spec, group=str(data["cena"]))
     windows.run()
 
 
