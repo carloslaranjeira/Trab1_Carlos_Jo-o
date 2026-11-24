@@ -55,7 +55,7 @@ from extra_fotometria import PHOTOMETRY_FILE
 from parte1_registo import aggregate, load_registration, save_registration
 from parte2_segmentacao import load_objects, run_segmentation
 from parte3_ajuste import (  # IoU 3D (overlap_area, height_overlap) e figuras da Parte 3
-    BOX_COLORS, height_overlap, load_fit, overlap_area, run_fit, top_view, top_view_image,
+    BOX_COLORS, height_overlap, load_fit, overlap_area, run_fit, top_view_image,
 )
 from visualizacao import (  # janelas 3D (comuns a todas as partes)
     box_item, camera_view, close_view, colors_uint8, data_view, image_item, points_item, SceneWindows,
@@ -403,8 +403,9 @@ def make_windows(data):
     1. Parte 1: a nuvem com as poses estimadas (vermelho) sobre a nuvem com as poses verdadeiras (verde);
     2. o mesmo, de perto, à volta das caixas;
     3-6. Parte 3: as caixas de cada método (cores) sobre as verdadeiras (preto), vistas de cima e em 3D.
-       A vista de cima da otimização é um gráfico 2D (como o top_view.png da Parte 3): os pontos, as caixas
-       verdadeiras (preto), a bounding box (tracejado cinzento) e a otimização (uma cor por caixa)."""
+       As vistas de cima são gráficos 2D (como o top_view.png da Parte 3), com os pontos e as caixas
+       verdadeiras (preto): na da otimização, a otimização (uma cor por caixa) e a bounding box (tracejado
+       cinzento); na da bounding box, só a bounding box (uma cor por caixa)."""
     title = f"Avaliador - {data['cena']}"
     view = data_view(data)
     def clouds(est, gt):
@@ -422,18 +423,15 @@ def make_windows(data):
         if len(data[f"params_{key}"]) == 0:
             continue
         boxes = [box_item(p, BOX_COLORS[j % len(BOX_COLORS)]) for j, p in enumerate(data[f"params_{key}"])]
-        if key == "otimizacao":                    # gráfico 2D visto de cima, com o ground truth
-            bbox = data["params_bounding_box"]
-            image = top_view_image(data["objects"], data["object_colors"], data["params_otimizacao"],
-                                   bbox if len(bbox) else None, title=str(data["cena"]),
-                                   params_gt=data["gt_params"], frame="mundo")
-            windows.append({"name": f"_caixas_{key}_vista_de_cima",
-                            "title": f"{title}: {label}, vista de cima 2D (verdadeiras a preto)",
-                            "items": [image_item(image)], "view": None})
-        else:
-            windows.append({"name": f"_caixas_{key}_vista_de_cima",
-                            "title": f"{title}: {label}, vista de cima (verdadeiras a preto)",
-                            "items": [objects] + gt + boxes, "view": top_view(data["objects"])})
+        # Gráfico 2D visto de cima, com o ground truth (na otimização, também a bounding box a tracejado)
+        bbox = data["params_bounding_box"]
+        image = top_view_image(data["objects"], data["object_colors"], data[f"params_{key}"],
+                               bbox if key == "otimizacao" and len(bbox) else None, title=str(data["cena"]),
+                               params_gt=data["gt_params"], frame="mundo",
+                               label="otimização" if key == "otimizacao" else "bounding box")
+        windows.append({"name": f"_caixas_{key}_vista_de_cima",
+                        "title": f"{title}: {label}, vista de cima 2D (verdadeiras a preto)",
+                        "items": [image_item(image)], "view": None})
         windows.append({"name": f"_caixas_{key}_3d", "title": f"{title}: {label}, em 3D (verdadeiras a preto)",
                         "items": [objects] + gt + boxes, "view": close_view(view, data["objects"])})
     return windows

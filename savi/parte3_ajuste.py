@@ -1113,10 +1113,13 @@ def draw_rects(ax, params, style, label=None):
                 label=label if j == 0 else None)
 
 
-def top_view_figure(points, colors, params_opt, params_bbox=None, title="", params_gt=None, frame="mesa"):
+def top_view_figure(points, colors, params_opt, params_bbox=None, title="", params_gt=None, frame="mesa",
+                    label="otimização"):
     """Gráfico 2D visto de cima (matplotlib): os pontos dos objetos e as caixas dos dois métodos (bounding
     box a tracejado cinzento, otimização com uma cor por caixa), no referencial da mesa. O avaliador usa o
-    mesmo gráfico com as caixas verdadeiras (params_gt, a preto, por baixo) no referencial do mundo."""
+    mesmo gráfico com as caixas verdadeiras (params_gt, a preto, por baixo) no referencial do mundo.
+    label: nome, na legenda, das caixas desenhadas a cores (params_opt; o avaliador usa-o também para
+    desenhar só as da bounding box a cores)."""
     fig = Figure(figsize=(6, 6), dpi=120)        # sem pyplot: também funciona no processo das janelas
     FigureCanvasAgg(fig)
     ax = fig.add_subplot()
@@ -1128,7 +1131,7 @@ def top_view_figure(points, colors, params_opt, params_bbox=None, title="", para
         draw_rects(ax, params_gt, {"color": "k", "lw": 3.0}, "ground truth")
     if params_bbox is not None:
         draw_rects(ax, params_bbox, {"color": "gray", "ls": "--"}, "bounding box")
-    draw_rects(ax, params_opt, {}, "otimização")
+    draw_rects(ax, params_opt, {}, label)
     ax.set_aspect("equal")
     ax.set_xlabel(f"x {frame} (m)")
     ax.set_ylabel(f"y {frame} (m)")
@@ -1143,9 +1146,10 @@ def save_top_view(path, points, colors, params_opt, params_bbox=None, title=""):
     top_view_figure(points, colors, params_opt, params_bbox, title).savefig(path, dpi=120)
 
 
-def top_view_image(points, colors, params_opt, params_bbox=None, title="", params_gt=None, frame="mesa"):
+def top_view_image(points, colors, params_opt, params_bbox=None, title="", params_gt=None, frame="mesa",
+                   label="otimização"):
     """O gráfico 2D visto de cima como imagem RGB (uint8), para mostrar numa janela (image_item)."""
-    fig = top_view_figure(points, colors, params_opt, params_bbox, title, params_gt, frame)
+    fig = top_view_figure(points, colors, params_opt, params_bbox, title, params_gt, frame, label)
     fig.canvas.draw()
     return np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
 
@@ -1184,14 +1188,6 @@ def figure_data(r1, r2, r3):
             "params_opt": np.asarray(r3["params_opt"]).reshape(-1, NUM_PARAMS), "frames": frames,
             "frame_notes": np.array(notes),
             **{f"view_{k}": v for k, v in view.items()}}
-
-
-def top_view(points):
-    """Ponto de vista de cima (referencial da mesa): por cima do centro dos pontos dos objetos, a olhar para
-    baixo, com x para a direita e y para cima (como uma figura vista de cima)."""
-    center = (points.min(axis=0) + points.max(axis=0)) / 2       # centro da caixa que envolve os pontos
-    height = max(0.25, 1.3 * float(np.ptp(points[:, :2], axis=0).max()))
-    return {"center": center, "eye": center + np.array([0.0, 0.0, height]), "up": np.array([0.0, 1.0, 0.0])}
 
 
 def make_windows(data):

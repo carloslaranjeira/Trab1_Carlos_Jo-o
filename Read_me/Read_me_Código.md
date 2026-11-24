@@ -431,7 +431,7 @@ porque depende da divisão inicial dos pontos entre as caixas, que é apenas apr
      Para cada caixa verdadeira: posição (mm), altura z da base (mm), yaw (°), dL, dW, dH (mm) e IoU 3D, com as
      simetrias da caixa. A associação entre caixas é feita pelo IoU (algoritmo húngaro). Uma caixa verdadeira sem
      caixa estimada conta com IoU 0, e as caixas a mais são indicadas. Janelas: as caixas estimadas sobre as
-     verdadeiras (preto), de cima e em 3D.
+     verdadeiras (preto), de cima (gráfico 2D) e em 3D.
    - **Extra (fotometria):** s e b estimados de cada imagem e os verdadeiros, se a cena tiver o campo `photometry`.
 
 O `ground_truth.json` só é lido pelo avaliador: as partes, o extra e o `run_test.py` nunca o leem. O
