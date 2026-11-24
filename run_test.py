@@ -14,7 +14,7 @@ e no fim mostra a janela da cena; só depois passa à cena seguinte:
     extra_fotometria.py    -> test/<cena>/partes/fotometria.json (exposição de cada imagem)
     parte2_segmentacao.py  -> test/<cena>/partes/objetos.ply, mesa.json, segmentacao.npz
     parte3_ajuste.py       -> results_test/<cena>/result.json (e top_view.png)
-    avaliador.py           -> número de caixas e erros em relação ao ground truth (se a cena o tiver)
+    avaliador.py           -> número de caixas e, se a cena tiver ground truth, results_test/<cena>/avaliacao.md
 As 4 partes NÃO usam o número de caixas (a Parte 2 estima-o). O número real só é pedido no avaliador,
 no fim de cada cena, para o comparar com o número de caixas encontradas; o de uma cena que esteja em
 test/num_boxes.json não é perguntado.
@@ -223,24 +223,20 @@ def run_scene(scene, output, views, show, known, push=False):
                              r2["seg"].colors, r3["params_opt"], r3["params_bbox"], title=scene.name)
     except Exception as error:
         print(f"  (figura não gravada: {error})")
-    # Caixas verdadeiras (só se a cena tiver ground truth): só para desenhar e avaliar
-    gt = comum.load_ground_truth(scene)
-    gt_params = parte3.gt_params_in_table(gt, r2["table"].T_camera0_table) if gt else None
-    collect(views, lambda: parte3.figure_data(r1, r2, r3, gt_params), "parte3_ajuste")
+    collect(views, lambda: parte3.figure_data(r1, r2, r3), "parte3_ajuste")
     if push:
         git_push(output, f"Resultado da cena {scene.name}")
     show()                                      # janela da cena (as 4 partes já acabaram)
-    # Avaliador: SÓ AGORA é pedido o número real de caixas (as 4 partes não o usaram)
-    real = known[scene.name] if scene.name in known else avaliador.ask_num_boxes(scene.name)
-    avaliador.print_box_count(avaliador.found_boxes(r2), real)
-    if gt is None:
-        print("  avaliador: a cena não tem ground_truth.json, não há mais nada a comparar")
-    else:
-        try:
-            avaliador.print_evaluation({**r1, **r2, **r3, "ground_truth": gt})
-        except Exception:
-            traceback.print_exc()
-            print(f"  ERRO no avaliador da cena {scene.name}")
+    # Avaliador: SÓ AGORA é pedido o número real de caixas (as 4 partes não o usaram) e, se a cena tiver
+    # ground truth, o result.json é comparado com ele (relatório results_test/<cena>/avaliacao.md)
+    real = known.get(scene.name)
+    try:
+        data = avaliador.evaluate_scene(scene, result_path, real)
+        if data is not None:
+            views.append((data, "avaliador"))      # figuras do avaliador (mostradas na janela da cena)
+    except Exception:
+        traceback.print_exc()
+        print(f"  ERRO no avaliador da cena {scene.name}")
 
 
 def open_windows(folder, show, parent_pid):

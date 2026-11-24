@@ -2,7 +2,8 @@
 """SAVIBoxes - código COMUM a todas as partes (não pertence a nenhuma parte em particular).
 
     1. Geometria        matrizes 4x4, rotações e caixas
-    2. Leitura da cena  ler as imagens e as nuvens de pontos, ler o ground truth e escrever o result.json
+    2. Leitura da cena  ler as imagens e as nuvens de pontos e escrever o result.json
+(O ground_truth.json só é lido pelo avaliador.py: nenhuma parte o lê.)
 
 =====================================================================================================
 CONVENÇÕES (usadas em todas as partes)
@@ -22,7 +23,7 @@ CONVENÇÕES (usadas em todas as partes)
 """
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2                                   # OpenCV: ler as imagens
@@ -140,7 +141,7 @@ def box_signed_distance(points_box, half_dims):
 #         point_clouds/000.ply   nuvem de pontos com cor, no referencial da câmara que a adquiriu
 #         rgb/000.png            imagem a cores correspondente
 #         intrinsics.json        fx, fy, cx, cy, width, height
-#         ground_truth.json      (só existe nas cenas de desenvolvimento; NUNCA é usado para estimar)
+#         ground_truth.json      (só nas cenas de desenvolvimento; só o avaliador.py o lê)
 @dataclass
 class View:
     """Uma imagem RGB-D da cena."""
@@ -158,7 +159,6 @@ class Scene:
     K: np.ndarray                   # matriz de parâmetros intrínsecos 3x3 da câmara
     width: int                      # largura das imagens (pixels)
     height: int                     # altura das imagens (pixels)
-    ground_truth: dict = field(default=None)   # só para avaliar (None se não existir)
 
 
 def intrinsics_matrix(intrinsics):
@@ -189,7 +189,7 @@ def cloud_to_xyz_image(cloud, K, width, height):
 
 
 def load_scene(folder):
-    """Lê uma cena: todas as nuvens de pontos, as imagens a cores, os intrínsecos e o ground truth.
+    """Lê uma cena: todas as nuvens de pontos, as imagens a cores e os intrínsecos (nunca o ground truth).
 
     Entrada: caminho da pasta da cena.
     Saída:   um objeto Scene.
@@ -210,19 +210,7 @@ def load_scene(folder):
         data = np.fromfile(str(folder / "rgb" / f"{name}.png"), dtype=np.uint8)
         rgb = cv2.imdecode(data, cv2.IMREAD_COLOR)[..., ::-1].copy()
         views.append(View(name, rgb, cloud, cloud_to_xyz_image(cloud, K, width, height)))
-
-    # O ground truth só é lido se existir. O programa NUNCA o usa para estimar; só para avaliar.
-    ground_truth = None
-    gt_path = folder / "ground_truth.json"
-    if gt_path.exists():
-        ground_truth = json.loads(gt_path.read_text(encoding="utf-8"))
-    return Scene(folder, views, K, width, height, ground_truth)
-
-
-def load_ground_truth(scene_folder):
-    """O ground_truth.json da cena, ou None se não existir (só para avaliar, NUNCA para estimar)."""
-    path = Path(scene_folder) / "ground_truth.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+    return Scene(folder, views, K, width, height)
 
 
 def boxes_to_camera0(params, T_camera0_table):

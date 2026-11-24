@@ -37,7 +37,7 @@ ORGANIZAÇÃO DESTE FICHEIRO (os dois métodos do enunciado; a otimização pelo
        2.6 Visualização       evolução das caixas ao longo da otimização
     3. Extra               cor na otimização (Nível 4)
     4. Saída               gravar e ler o ajuste.npz e escrever o result.json
-    5. Figuras             caixas dos dois métodos sobre a nuvem e sobre as verdadeiras (ground truth)
+    5. Figuras             caixas dos dois métodos sobre a nuvem (as caixas verdadeiras: avaliador.py)
     6. Programa principal  run_fit() e main()
 (Convenções: caixa = [x, y, yaw, length, width, height, z] no referencial da mesa; ver comum.py.)
 """
@@ -56,8 +56,8 @@ from scipy.optimize import least_squares     # otimização (Partes 05 e 06)
 from scipy.spatial import cKDTree            # procura rápida do vizinho mais próximo
 
 from comum import (  # geometria e leitura da cena (comuns a todas as partes)
-    box_corners_2d, box_lines_3d, box_signed_distance, box_T_table, boxes_to_camera0, load_ground_truth,
-    load_scene, OUTPUT_FOLDER, transform_points, wrap_angle, write_result, yaw_of,
+    box_corners_2d, box_lines_3d, box_signed_distance, box_T_table, boxes_to_camera0, load_scene,
+    OUTPUT_FOLDER, transform_points, wrap_angle, write_result,
 )
 from parte1_registo import (  # funções da Parte 1 usadas aqui
     aggregate, load_registration,
@@ -1077,27 +1077,15 @@ def write_scene_result(path, r1, r2, r3, method="opt"):
 
 
 # #####################################################################################################
-# 5. FIGURAS: CAIXAS DOS DOIS MÉTODOS E CAIXAS VERDADEIRAS
+# 5. FIGURAS: CAIXAS DOS DOIS MÉTODOS
 # #####################################################################################################
-# O enunciado pede as caixas estimadas sobrepostas às verdadeiras. Os erros (posição, altura, yaw,
-# dimensões, IoU 3D) são calculados no avaliador.py; aqui só se desenha.
+# A Parte 3 nunca lê o ground truth: as caixas estimadas sobrepostas às verdadeiras (e os erros) são
+# desenhadas e calculados no avaliador.py.
 BOX_COLORS = [(0.9, 0.1, 0.1), (0.1, 0.4, 0.9), (0.1, 0.7, 0.2), (0.9, 0.6, 0.0), (0.6, 0.2, 0.8), (0.0, 0.7, 0.7)]
-GT_COLOR = (0.0, 0.0, 0.0)  # caixas verdadeiras (se houver ground truth): a preto
-
-
-def gt_params_in_table(ground_truth, T_camera0_table):
-    """Caixas verdadeiras no referencial da mesa estimada (só para desenhar nas figuras)."""
-    T_table_camera0 = np.linalg.inv(T_camera0_table)
-    params = []
-    for b in ground_truth["boxes"]:
-        T = T_table_camera0 @ np.array(b["T_camera0_box"])
-        z_base = T[2, 3] - b["height"] / 2               # altura da base acima da mesa
-        params.append([T[0, 3], T[1, 3], yaw_of(T[:3, :3]), b["length"], b["width"], b["height"], z_base])
-    return np.array(params)
 
 
 # ----------------------------------------------------------------------------------------------------
-# Figuras PNG vistas de cima (matplotlib), usadas pelo avaliador.py e pelo run_test.py
+# Figura PNG vista de cima (matplotlib), usada pelo run_test.py
 # ----------------------------------------------------------------------------------------------------
 def _draw_rects(ax, params, style, label=None):
     for j, p in enumerate(params):
@@ -1108,13 +1096,11 @@ def _draw_rects(ax, params, style, label=None):
                 label=label if j == 0 else None)
 
 
-def save_top_view(path, points, colors, params_opt, params_bbox=None, gt_params=None, title=""):
-    """Vista de cima: pontos + caixas (otimização, bounding box e, se houver, verdadeiras)."""
+def save_top_view(path, points, colors, params_opt, params_bbox=None, title=""):
+    """Vista de cima: pontos + caixas (otimização e bounding box)."""
     fig, ax = plt.subplots(figsize=(6, 6))
     sel = np.random.default_rng(0).choice(len(points), min(len(points), 15000), replace=False)
     ax.scatter(points[sel, 0], points[sel, 1], c=colors[sel], s=1)
-    if gt_params is not None:
-        _draw_rects(ax, gt_params, {"color": "k", "lw": 2.5}, "verdadeira")
     if params_bbox is not None:
         _draw_rects(ax, params_bbox, {"color": "gray", "ls": "--"}, "bounding box")
     _draw_rects(ax, params_opt, {}, "otimização")
@@ -1130,12 +1116,12 @@ def save_top_view(path, points, colors, params_opt, params_bbox=None, gt_params=
 
 # ----------------------------------------------------------------------------------------------------
 # Janelas 3D (visualizacao.py): a cena com as caixas de cada método, vista de cima e em 3D, e a
-# ----------------------------------------------------------------------------------------------------
 # evolução da otimização (animação, 2.6)
-def figure_data(r1, r2, r3, gt_params=None):
+# ----------------------------------------------------------------------------------------------------
+def figure_data(r1, r2, r3):
     """Dados das janelas da Parte 3 (r1, r2 = Partes 1 e 2, r3 = run_fit ou load_fit), no referencial da
     mesa: a nuvem agregada (se existir; senão só os pontos dos objetos), os pontos dos objetos, as caixas
-    dos dois métodos, as caixas ao longo da otimização e, se houver ground truth, as verdadeiras."""
+    dos dois métodos e as caixas ao longo da otimização."""
     table, seg = r2["table"], r2["seg"]
     T_table_camera0 = np.linalg.inv(table.T_camera0_table)
     if r2.get("cloud") is not None:
@@ -1153,7 +1139,6 @@ def figure_data(r1, r2, r3, gt_params=None):
             "params_bbox": np.asarray(r3["params_bbox"]).reshape(-1, NUM_PARAMS),
             "params_opt": np.asarray(r3["params_opt"]).reshape(-1, NUM_PARAMS), "frames": frames,
             "steps": steps, "total_steps": len(snapshots) - 1,
-            "gt_params": np.zeros((0, NUM_PARAMS)) if gt_params is None else np.asarray(gt_params),
             **{f"view_{k}": v for k, v in view.items()}}
 
 
@@ -1166,15 +1151,13 @@ def top_view(points):
 
 
 def make_windows(data):
-    """Vistas da Parte 3 (caixas verdadeiras a preto, se houver ground truth):
+    """Vistas da Parte 3:
     1. método base (bounding box) visto de cima, sobre os pontos dos objetos;
     2. método principal (otimização) visto de cima;
     3. a cena em 3D com as caixas da bounding box;
     4. a cena em 3D com as caixas da otimização;
     5. a evolução das caixas ao longo da otimização em 3D, sobre os pontos dos objetos (animação; a
        figura gravada mostra o último passo)."""
-    gt = [box_item(p, GT_COLOR, 2.0) for p in data["gt_params"]]
-    note = " (verdadeiras a preto)" if len(data["gt_params"]) else ""
     title = f"Parte 3 - {data['cena']}"
     view = data_view(data)
     objects = points_item(data["objects"], data["object_colors"], 3.0)
@@ -1185,15 +1168,15 @@ def make_windows(data):
     windows = []
     for name, key, method in methods:                     # vistas de cima
         windows.append({"name": f"_{name}_vista_de_cima",
-                        "title": f"{title}: {method}, vista de cima ({len(data[key])} caixas){note}",
-                        "items": [objects] + gt + boxes[key], "view": top_view(data["objects"])})
+                        "title": f"{title}: {method}, vista de cima ({len(data[key])} caixas)",
+                        "items": [objects] + boxes[key], "view": top_view(data["objects"])})
     for name, key, method in methods:                     # na cena, em 3D
-        windows.append({"name": f"_{name}_3d", "title": f"{title}: {method}, em 3D na cena ({len(data[key])} caixas){note}",
-                        "items": [points_item(data["points"], data["colors"])] + gt + boxes[key], "view": view})
+        windows.append({"name": f"_{name}_3d", "title": f"{title}: {method}, em 3D na cena ({len(data[key])} caixas)",
+                        "items": [points_item(data["points"], data["colors"])] + boxes[key], "view": view})
     frames = [[box_item(p, BOX_COLORS[j % len(BOX_COLORS)]) for j, p in enumerate(frame)] for frame in data["frames"]]
     windows.append({"name": "_evolucao",
-                    "title": f"{title}: evolução da otimização em 3D ({int(data['total_steps'])} passos, animação){note}",
-                    "items": [objects] + gt, "view": close_view(view, data["objects"]), "frames": frames})
+                    "title": f"{title}: evolução da otimização em 3D ({int(data['total_steps'])} passos, animação)",
+                    "items": [objects], "view": close_view(view, data["objects"]), "frames": frames})
     return windows
 
 
@@ -1256,13 +1239,10 @@ def main():
     write_scene_result(output, r1, r2, r3, args.method)
     print(f"\nResultado escrito em {output}")
 
-    # Caixas verdadeiras (se a cena tiver ground truth): só para desenhar
-    gt = load_ground_truth(r1["scene_folder"])
-    gt_params = gt_params_in_table(gt, table.T_camera0_table) if gt else None
     if args.visualize:
         # a nuvem agregada (só para desenhar a cena à volta das caixas)
         r2["cloud"], _ = aggregate(load_scene(r1["scene_folder"]), r1["T_cams"], r1["registered"])
-        show_windows(make_windows(figure_data(r1, r2, r3, gt_params)))
+        show_windows(make_windows(figure_data(r1, r2, r3)))
     if args.open3d:
         animate_optimization(r3["fit_points"], np.full_like(r3["fit_points"], 0.6), r3["problem"])
 

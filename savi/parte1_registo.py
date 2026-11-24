@@ -7,7 +7,7 @@ COMO CORRER
     (a partir da pasta principal do trabalho)
     python savi/parte1_registo.py --scene test/cena_1
     python savi/parte1_registo.py --scene test/cena_1 --visualize   # janelas 3D: nuvem agregada
-    python savi/parte1_registo.py --scene test/cena_1 --open3d      # janelas antigas do Open3D (+ ground truth)
+    python savi/parte1_registo.py --scene test/cena_1 --open3d      # janelas antigas do Open3D
 
 Não precisa do número de caixas. Grava <cena>/partes/registo.json com a pose de cada câmara em relação
 à câmara 000 (T_camera0_camera) e as câmaras que entraram na nuvem agregada.
@@ -327,9 +327,9 @@ def make_windows(data):
              "items": [points_item(data["points"], CAMERA_COLORS[data["camera"] % 10])], "view": data_view(data)}]
 
 
-def show_registration(scene, T_est, T_gt=None):
-    """Janelas antigas do Open3D (opção --open3d): nuvem agregada com as cores reais | uma cor por câmara |
-    (se houver ground truth) a nuvem estimada a vermelho sobre a verdadeira a verde."""
+def show_registration(scene, T_est):
+    """Janelas antigas do Open3D (opção --open3d): nuvem agregada com as cores reais | uma cor por câmara.
+    (A nuvem estimada sobre a verdadeira é desenhada pelo avaliador.py.)"""
     cloud, _ = aggregate(scene, T_est)
     cloud = cloud.voxel_down_sample(0.005)
     o3d.visualization.draw_geometries([cloud], window_name="Nuvem agregada (cores reais)")
@@ -341,15 +341,6 @@ def show_registration(scene, T_est, T_gt=None):
         c.paint_uniform_color(CAMERA_COLORS[k % 10])
         by_camera += c
     o3d.visualization.draw_geometries([by_camera], window_name="Nuvem agregada (cor = câmara)")
-
-    if T_gt is not None:
-        est, _ = aggregate(scene, T_est)
-        gt, _ = aggregate(scene, T_gt)
-        est = est.voxel_down_sample(0.005)
-        gt = gt.voxel_down_sample(0.005)
-        est.paint_uniform_color((0.9, 0.1, 0.1))
-        gt.paint_uniform_color((0.1, 0.7, 0.2))
-        o3d.visualization.draw_geometries([gt, est], window_name="Estimada (vermelho) vs verdadeira (verde)")
 
 
 # #####################################################################################################
@@ -788,12 +779,10 @@ def load_registration(folder):
             "registered": info["camaras_registadas"], "folder": Path(folder)}
 
 
-def run_registration(scene_folder, output=None, loop_closure=True, gt_registration=False, verbose=True):
+def run_registration(scene_folder, output=None, loop_closure=True, verbose=True):
     """Parte 1 numa cena: regista as imagens, junta as nuvens (4. agregação) e grava o registo.json.
 
     Entrada: pasta da cena e pasta de saída (por omissão <cena>/partes).
-    gt_registration=True usa as poses VERDADEIRAS das câmaras em vez do registo. Só serve para
-    avaliar a segmentação e o ajuste isoladamente (como pede o enunciado); nunca no resultado final.
     Saída: dicionário com a cena, as poses das câmaras, as câmaras registadas, a nuvem agregada (e a
     câmara de cada ponto) e o ganho e o desvio de cada imagem (para o extra_fotometria.py).
     """
@@ -803,12 +792,7 @@ def run_registration(scene_folder, output=None, loop_closure=True, gt_registrati
     if verbose:
         print(f"Cena {scene.folder.name}: {len(scene.views)} imagens")
 
-    if gt_registration:
-        T_cams = [np.array(c["T_camera0_camera"]) for c in scene.ground_truth["cameras"]]
-        T_chain = T_cams
-        registered = [True] * len(T_cams)
-    else:
-        T_cams, T_chain, registered = register_scene(scene, loop_closure=loop_closure, verbose=verbose)
+    T_cams, T_chain, registered = register_scene(scene, loop_closure=loop_closure, verbose=verbose)
     if verbose and not all(registered):
         left_out = [v.name for v, ok in zip(scene.views, registered) if not ok]
         print(f"  câmaras sem registo de confiança, deixadas de fora da nuvem: {', '.join(left_out)}")
@@ -829,23 +813,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scene", required=True, help="pasta da cena")
     parser.add_argument("--no_loop_closure", action="store_true", help="registo só por encadeamento")
-    parser.add_argument("--gt_registration", action="store_true",
-                        help="usa as poses verdadeiras das câmaras (só para avaliar o resto do sistema)")
     parser.add_argument("--visualize", action="store_true", help="janelas 3D: nuvem agregada (cor dos píxeis e cor por câmara)")
     parser.add_argument("--open3d", action="store_true",
-                        help="janelas antigas do Open3D (com ground truth: nuvem estimada sobre a verdadeira)")
+                        help="janelas antigas do Open3D (cores reais e uma cor por câmara)")
     args = parser.parse_args()
 
-    r = run_registration(args.scene, loop_closure=not args.no_loop_closure, gt_registration=args.gt_registration)
+    r = run_registration(args.scene, loop_closure=not args.no_loop_closure)
     print(f"\nRegisto gravado em {r['folder']}. A seguir:\n"
           f"    python savi/extra_fotometria.py --scene {args.scene}\n"
           f"    python savi/parte2_segmentacao.py --scene {args.scene}")
     if args.visualize:
         show_windows(make_windows(figure_data(r)))
     if args.open3d:
-        gt = r["scene"].ground_truth
-        T_gt = [np.array(c["T_camera0_camera"]) for c in gt["cameras"]] if gt else None
-        show_registration(r["scene"], r["T_cams"], T_gt=T_gt)
+        show_registration(r["scene"], r["T_cams"])
 
 
 if __name__ == "__main__":

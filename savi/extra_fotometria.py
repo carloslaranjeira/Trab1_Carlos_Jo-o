@@ -15,10 +15,10 @@ numas imagens e mais escura noutras. Este extra (Parte 06):
        uma câmara (pontos que coincidem na nuvem agregada), por mínimos quadrados robustos;
     2. corrige as imagens a cores (grava <cena>/partes/fotometria/NNN.png) e volta a colorir as nuvens
        (a nuvem agregada da Parte 1 já é construída com as cores corrigidas);
-    3. compara os valores estimados com os do campo 'photometry' do ground_truth.json (se existir).
+    (a comparação com o campo 'photometry' do ground_truth.json é feita no avaliador.py).
 A mesma correção é usada no registo (Parte 1), para comparar cores de imagens com exposições diferentes,
 e chega corrigida à segmentação por cor (Parte 2, Nível 4).
-Grava <cena>/partes/fotometria.json com s e b de cada imagem (estimados e, se houver, verdadeiros).
+Grava <cena>/partes/fotometria.json com o s e o b estimados de cada imagem.
 
 Ordem das partes (o run_test.py corre-as todas, cena a cena):
     parte1_registo.py      -> <cena>/partes/registo.json   (pose de cada câmara)
@@ -31,7 +31,7 @@ Ordem das partes (o run_test.py corre-as todas, cena a cena):
 ORGANIZAÇÃO DESTE FICHEIRO
 =====================================================================================================
     1. Modelo da exposição  estimar s e b (exposure_fit, match_exposure) e corrigir cores (exposure_corrected)
-    2. Correção das imagens s e b de cada imagem, valores verdadeiros, imagens corrigidas
+    2. Correção das imagens s e b de cada imagem e imagens corrigidas
     3. Visualização         janelas 3D: nuvem agregada sem correção e com correção
     4. Programa principal   run_photometry() e main()
 """
@@ -101,23 +101,8 @@ def match_exposure(cloud, reference, distance=0.01):
 # #####################################################################################################
 # 2. CORREÇÃO DE CADA IMAGEM EM RELAÇÃO À IMAGEM 000
 # #####################################################################################################
-PHOTOMETRY_FILE = "fotometria.json"     # s e b de cada imagem (estimados e, se houver, verdadeiros)
+PHOTOMETRY_FILE = "fotometria.json"     # s e b estimados de cada imagem
 CORRECTED_FOLDER = "fotometria"         # imagens a cores corrigidas
-
-
-def true_exposures(ground_truth):
-    """s e b VERDADEIROS de cada imagem em relação à imagem 000 (só para avaliar).
-
-    O ground_truth.json dá, para cada imagem k, cor_k = s_k * cor + b_k. Tirando a cor verdadeira:
-        cor_0 = s_0 / s_k * (cor_k - b_k) + b_0 = s_rel * cor_k + b_rel
-    com s_rel = s_0 / s_k e b_rel = b_0 - s_0 * b_k / s_k. É isto que se estima, porque a imagem 000 é a
-    referência. Saída: {imagem: (s_rel, b_rel)}, ou {} se não houver ground truth.
-    """
-    if not ground_truth or "photometry" not in ground_truth:
-        return {}
-    photometry = {p["image"]: (p["s"], p["b"]) for p in ground_truth["photometry"]}
-    s0, b0 = photometry[min(photometry)]
-    return {name: (s0 / s, b0 - s0 * b / s) for name, (s, b) in photometry.items()}
 
 
 def correct_images(scene, exposures, folder):
@@ -145,27 +130,19 @@ def figure_data(r1, rx):
     if corrected is None or len(corrected.points) != len(raw.points):
         corrected, _ = p1.aggregate(scene, r1["T_cams"], r1["registered"])
     rows = rx["photometry"]
-    nan = float("nan")
     view = scene_view(r1["T_cams"], r1["registered"])
     return {"parte": "extra_fotometria", "cena": Path(r1["scene_folder"]).name,
             "points": np.asarray(raw.points, np.float32), "colors_raw": colors_uint8(raw.colors),
             "colors_corrected": colors_uint8(corrected.colors),
             "images": np.array([row["imagem"] for row in rows]), "s": np.array([row["s"] for row in rows]),
             "b": np.array([row["b"] for row in rows]),
-            "s_true": np.array([nan if row["s_verdadeiro"] is None else row["s_verdadeiro"] for row in rows]),
-            "b_true": np.array([nan if row["b_verdadeiro"] is None else row["b_verdadeiro"] for row in rows]),
             **{f"view_{k}": v for k, v in view.items()}}
 
 
 def make_windows(data):
     """Janelas do extra: a nuvem agregada com as cores originais de cada imagem e com a exposição de todas
     as imagens corrigida para a da imagem 000 (cada uma na sua janela; s e b de cada imagem no título)."""
-    values = []
-    for name, s, b, st, bt in zip(data["images"], data["s"], data["b"], data["s_true"], data["b_true"]):
-        value = f"{name}: s={s:.3f} b={b:+.3f}"
-        if not np.isnan(st):
-            value += f" (verd. {st:.3f} {bt:+.3f})"
-        values.append(value)
+    values = [f"{name}: s={s:.3f} b={b:+.3f}" for name, s, b in zip(data["images"], data["s"], data["b"])]
     title = f"Extra - {data['cena']}: correção fotométrica, cor_000 = s * cor + b"
     view = data_view(data)
     return [{"name": "_sem_correcao", "title": f"{title} - SEM correção (cada imagem com a sua exposição)",
@@ -178,12 +155,11 @@ def make_windows(data):
 # 4. PROGRAMA PRINCIPAL
 # #####################################################################################################
 def run_photometry(r1, verbose=True):
-    """Extra numa cena: s e b de cada imagem, comparação com o ground truth, imagens corrigidas e
-    fotometria.json.
+    """Extra numa cena: s e b de cada imagem, imagens corrigidas e fotometria.json.
 
     Entrada: o resultado da Parte 1. Com run_registration, s e b já foram estimados ao juntar as nuvens
     (aggregate); com load_registration, as nuvens voltam a ser juntadas para os estimar.
-    Saída: dicionário com a lista de {imagem, s, b, s_verdadeiro, b_verdadeiro}.
+    Saída: dicionário com a lista de {imagem, s, b}.
     """
     import parte1_registo as p1
     scene = r1["scene"] if r1.get("scene") is not None else load_scene(r1["scene_folder"])
@@ -191,22 +167,16 @@ def run_photometry(r1, verbose=True):
     if exposures is None:
         exposures = []
         p1.aggregate(scene, r1["T_cams"], r1["registered"], exposures=exposures)
-    truth = true_exposures(scene.ground_truth)
     folder = Path(r1["folder"])
     correct_images(scene, exposures, folder / CORRECTED_FOLDER)
 
-    rows = [{"imagem": name, "s": float(s), "b": float(b),
-             "s_verdadeiro": truth[name][0] if name in truth else None,
-             "b_verdadeiro": truth[name][1] if name in truth else None} for name, s, b in exposures]
+    rows = [{"imagem": name, "s": float(s), "b": float(b)} for name, s, b in exposures]
     folder.mkdir(parents=True, exist_ok=True)
     (folder / PHOTOMETRY_FILE).write_text(json.dumps(rows, indent=2), encoding="utf-8")
     if verbose:
         print("Extra - fotometria (cor_000 = s * cor + b):")
         for row in rows:
-            line = f"  imagem {row['imagem']}: s = {row['s']:.3f}, b = {row['b']:+.3f}"
-            if row["s_verdadeiro"] is not None:
-                line += f"   (verdadeiros: s = {row['s_verdadeiro']:.3f}, b = {row['b_verdadeiro']:+.3f})"
-            print(line)
+            print(f"  imagem {row['imagem']}: s = {row['s']:.3f}, b = {row['b']:+.3f}")
         estimated = {row["imagem"] for row in rows}
         for v in scene.views:
             if v.name not in estimated:
