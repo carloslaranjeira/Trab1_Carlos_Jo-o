@@ -49,7 +49,7 @@ Opções de cada parte (todas têm `--scene`, a pasta da cena):
 | | `--open3d` | janelas antigas do Open3D (com ground truth: nuvem estimada sobre a verdadeira) |
 | `extra_fotometria.py` | `--visualize` | 2 vistas: nuvem agregada sem e com correção da exposição (s e b de cada imagem no título) |
 | `parte2_segmentacao.py` | `--no_color` | não usa a cor para separar as caixas |
-| | `--visualize` | 3 vistas: objetos isolados (resto da cena a cinzento); nuvem só das caixas (como antes, de cima, com os eixos da mesa); nuvem só das caixas em 3D, sem cenário |
+| | `--visualize` | 4 vistas: objetos isolados (resto da cena a cinzento); uma cor por cluster euclidiano; nuvem só das caixas (como antes, de cima, com os eixos da mesa); nuvem só das caixas em 3D, sem cenário |
 | | `--open3d` | janela antiga do Open3D com a nuvem dos objetos |
 | `parte3_ajuste.py` | `--output` | onde escrever o `result.json` (por omissão: dentro da pasta da cena) |
 | | `--method bbox` | usa a bounding box no `result.json`, em vez da otimização |
@@ -98,10 +98,13 @@ que faz, o que recebe, o que devolve e porque foi feita assim.
 | parte 1 | 5. Extras de robustez | `alignment_score`, `free_space_violation`, `choose_candidate`, `table_hypotheses`, `extra_edges`, `optimize_pose_graph` | Escolher entre hipóteses, hipóteses da mesa, fecho de ciclo e grafo de poses (não fazem parte das 4 subpartes) |
 | parte 1 | 6. Programa principal | `register_pair`, `register_scene`, `save_registration`, `run_registration`, `main` | Junta as subpartes por ordem; grava `registo.json` |
 | extra | 1–4 | `exposure_fit`, `exposure_corrected`, `match_exposure`, `true_exposures`, `correct_images`, `run_photometry` | s e b de cada imagem, imagens corrigidas, comparação com o ground truth |
-| parte 2 | 1. Mesa e objetos | `table_plane_guess`, `detect_table`, `extract_objects` | Mesa e referencial da mesa; pontos dos objetos |
-| parte 2 | 2. Separar as caixas | `euclidean_clusters`, `estimate_boxes`, `count_top_levels`, `count_colors`, `allocate_boxes`, `chroma_features`, `color_split`, `segment` | Clusters; n.º de caixas estimado por cluster; cor |
-| parte 2 | 3–5. Saída, visualização, principal | `save_objects`, `save_segmentation`, `make_windows`, `run_segmentation` | Grava `objetos.ply`, `mesa.json`, `segmentacao.npz`; 3 vistas 3D |
-| parte 3 | 1. Otimização | `initial_boxes`, `split_geometric`, `split_profile`, `place_on_supports`, `distances_to_boxes`, `FitProblem.residuals`, `fit_boxes` | Estimativa inicial e otimização com `least_squares` |
+| parte 2 | 1. Mesa e referencial | `table_plane_guess`, `horizontal_points`, `table_points_from_floor`, `detect_table` | Chão e mesa com RANSAC guiado pelas normais; referencial da mesa |
+| parte 2 | 2. Retirar mesa e fundo | `extract_objects` | Pontos acima da mesa e dentro dos limites do tampo |
+| parte 2 | 3. Clustering | `euclidean_clusters`, `figure_data`, `make_windows` | Clusters euclidianos (DBSCAN); figuras (objetos isolados, uma cor por cluster) |
+| parte 2 | 4. Cor | `chroma_features`, `color_split`, `split_by_color` | Separar caixas em contacto pela cor (Nível 4) |
+| parte 2 | 5. Extra | `top_surface_points`, `count_top_levels`, `count_colors`, `estimate_boxes` | Número de caixas desconhecido: caixas estimadas por cluster |
+| parte 2 | 6. Programa principal | `segment`, `save_objects`, `save_segmentation`, `run_segmentation`, `main` | Junta as subpartes; grava `objetos.ply`, `mesa.json`, `segmentacao.npz` |
+| parte 3 | 1. Otimização | `initial_boxes`, `allocate_boxes`, `split_geometric`, `split_profile`, `place_on_supports`, `distances_to_boxes`, `FitProblem.residuals`, `fit_boxes` | Estimativa inicial e otimização com `least_squares` |
 | parte 3 | 2. Método base | `bbox_box`, `bbox_method` | Bounding box orientada, para comparar |
 | parte 3 | 3–5. Saída, visualização, principal | `write_scene_result`, `save_fit`, `make_windows`, `save_top_view`, `run_fit` | `result.json` e `ajuste.npz`; 5 vistas 3D (bounding box e otimização de cima e na cena, evolução) |
 | avaliador | 1–3. Avaliação | `camera_errors`, `evaluate_segmentation`, `evaluate_boxes`, `iou_3d`, `print_evaluation` | Erros em relação ao ground truth |
@@ -194,30 +197,41 @@ regressão (0.97, erro das câmaras 1.8 mm).
 
 ## Parte 2 — Segmentação
 
-1. **Direção "para cima":** RANSAC (`segment_plane`) nos pontos do **centro das imagens** (as câmaras apontam para
-   a mesa); a normal do plano é orientada para o lado das câmaras.
-2. **Tampo, como na Parte 08 Ex. 4, com o RANSAC guiado pelas normais (Parte 07 Ex. 8):**
+O código da Parte 2 (`savi/parte2_segmentacao.py`) está organizado pelas 4 subpartes do enunciado, seguidas do
+extra "número de caixas desconhecido" (secção 5) e do programa principal. A referência principal é a solução da
+Parte 08, Ex. 4 (chão → mesa → referencial da mesa → objetos → clusters).
+
+1. **Plano da mesa com RANSAC e referencial da mesa** (Parte 08, Ex. 4), com o RANSAC guiado pelas normais (Parte 07, Ex. 8):
    - calcula-se a normal de cada ponto e ficam só os de superfícies horizontais (normal a menos de 10° da vertical,
-     θ = arccos|n·up|, Parte 07 Ex. 6). Assim o RANSAC não encontra "planos" que cortam paredes ou móveis na diagonal;
-   - **chão** = o maior plano desses pontos; a altura de cada ponto é a sua distância ao chão;
+     θ = arccos|n·up|, Parte 07, Ex. 6). Assim o RANSAC não encontra "planos" que cortam paredes ou móveis na diagonal;
+   - **chão** = o maior plano desses pontos (`segment_plane`); a altura de cada ponto é a sua distância ao chão;
    - **mesa** = RANSAC só nos pontos entre **0.5 e 1.0 m** acima do chão; *clustering* euclidiano do plano e fica o
      maior grupo (outras superfícies à mesma altura, como um aparador, ficam de fora). Só contam os grupos que
      aparecem no centro das imagens;
-   - **recurso:** se o chão não aparecer (poucas câmaras muito perto da mesa), usa-se o plano do centro das imagens:
-     dos planos paralelos fica o mais baixo que não esteja mais de 35 cm abaixo do píxel central, e a componente
-     ligada (DBSCAN) dos pontos a menos de 1.5 cm desse plano.
-3. O plano é reajustado por SVD e o retângulo de área mínima do tampo dá o
-   **referencial da mesa** (origem no centro, x ao longo do comprimento, z para cima) e os seus limites.
-4. Ficam os pontos entre 8 mm e 60 cm acima da mesa e dentro dos limites; voxel de 4 mm e remoção de outliers.
-5. **DBSCAN** (eps = 1.5 cm) separa os objetos. Se há menos clusters que caixas, as caixas extra vão para o
-   cluster com maior área por caixa.
-6. **Cor:** dentro de um cluster com várias caixas, k-means na **cromaticidade normalizada**
-   r = R/(R+G+B), g = G/(R+G+B). A cor só é usada se os grupos estiverem bem separados (distância entre centros
-   > 4× a dispersão).
+   - **referencial da mesa:** origem no centro do tampo, z perpendicular à mesa e para cima.
+   - *Não está nas aulas:* o sentido "para cima" vem de um RANSAC nos pontos do **centro das imagens** (as câmaras
+     apontam para a mesa), com a normal orientada para o lado das câmaras; na Parte 08 o sinal é escolhido à mão.
+     Se o chão não aparecer (poucas câmaras muito perto da mesa), usa-se esse plano do centro das imagens: dos
+     planos paralelos fica o mais baixo que não esteja mais de 35 cm abaixo do píxel central, e a componente ligada
+     (DBSCAN) dos pontos a menos de 1.5 cm desse plano. O plano é reajustado por SVD e o retângulo de área mínima
+     do tampo (`cv2.minAreaRect`) dá o eixo x ao longo do comprimento e os limites do tampo (na Parte 08 o eixo x
+     aponta para um ponto qualquer do tampo).
+2. **Retirar a mesa e o fundo** (Parte 08, Ex. 4): ficam os pontos entre 8 mm e 60 cm acima da mesa e dentro dos
+   limites do tampo (a Parte 08 usa 40 cm; aqui há pilhas de caixas); voxel de 4 mm e remoção de outliers.
+3. **Clustering euclidiano** (`cluster_dbscan`, eps = 1.5 cm; Parte 07, Ex. 4 e Parte 08, Ex. 4) separa os objetos;
+   os pontos soltos e os clusters pequenos ficam de fora. Uma das vistas mostra cada cluster com uma cor (Ex. 4.5).
+4. **Cor** (Nível 4): dentro de um cluster com várias caixas, k-means (`cv2.kmeans`, tutorial do OpenCV) na
+   **cromaticidade normalizada** r = R/(R+G+B), g = G/(R+G+B): a mesma ideia do HSV da Parte 02 (separar a cor do
+   brilho). O `inRange` da Parte 02 precisava de limites de cor conhecidos, e as cores das caixas não se conhecem.
+   A cor só é usada se os grupos estiverem bem separados (distância entre centros > 4× a dispersão).
    Uma sombra multiplica R, G e B pelo mesmo fator, que se cancela na divisão, por isso todas as faces de uma caixa têm
    a mesma cromaticidade. A primeira versão usava (a\*, b\*) do espaço Lab, que não é invariante à escala: nas faces
    escuras (a\*, b\*) aproximam-se de zero. Numa cena de teste, um azul e um roxo deixaram de se distinguir
    (IoU 0.00–0.58); com (r, g) passaram a 0.991–0.998.
+
+**Extra — número de caixas desconhecido:** em cada cluster, o número de caixas é o maior entre o número de topos a
+alturas diferentes e o número de cores. Caixas da mesma cor e da mesma altura encostadas contam como uma.
+A divisão de cada cluster em caixas é feita na estimativa inicial da Parte 3.
 
 A avaliação usa as caixas verdadeiras com margem de 5 mm. A precisão fica acima de 0.98. O recall (~0.66) é mais
 baixo porque a referência inclui os pontos dos primeiros 8 mm junto à mesa e a margem de 5 mm, que a segmentação

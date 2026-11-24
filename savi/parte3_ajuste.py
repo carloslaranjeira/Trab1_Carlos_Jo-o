@@ -55,8 +55,7 @@ from visualizacao import (  # janelas 3D (comuns a todas as partes)
     box_item, camera_view, close_view, colors_uint8, data_view, points_item, show_windows,
 )
 from parte2_segmentacao import (  # funções da Parte 2 usadas aqui
-    allocate_boxes, chroma_features, components_with, large_components, largest_component, load_objects,
-    load_segmentation, top_surface_points,
+    chroma_features, count_top_levels, load_objects, load_segmentation, top_surface_points,
 )
 
 
@@ -87,6 +86,79 @@ NORMAL_PENALTY = 0.02     # m: custo extra de explicar um ponto com uma face de 
 # ----------------------------------------------------------------------------------------------------
 # 1.1 Estimativa inicial (Parte 06, Ex. 6: a otimização precisa de começar perto da solução)
 # ----------------------------------------------------------------------------------------------------
+# Funções de apoio para dividir um cluster em caixas (estavam na Parte 2, mas só a Parte 3 as usa)
+def largest_component(points, eps=0.012):
+    """Índices da maior componente ligada (DBSCAN) de um conjunto de pontos (retira pontos soltos)."""
+    if len(points) < 20:
+        return np.arange(len(points))
+    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points)).cluster_dbscan(eps, 5))
+    if labels.max() < 0:
+        return np.arange(len(points))
+    return np.nonzero(labels == np.bincount(labels[labels >= 0]).argmax())[0]
+
+
+def footprint_area(points_xy):
+    """Área ocupada por um conjunto de pontos visto de cima: área do retângulo de área mínima."""
+    (_, _), (a, b), _ = cv2.minAreaRect(points_xy.astype(np.float32))
+    return a * b
+
+
+def large_components(points, eps=0.012, fraction=0.1, min_size=50):
+    """Índices das componentes ligadas (DBSCAN) com pelo menos 10% dos pontos da maior (e 50 pontos)."""
+    if len(points) < 20:
+        return np.arange(len(points))
+    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points)).cluster_dbscan(eps, 5))
+    if labels.max() < 0:
+        return np.arange(len(points))
+    sizes = np.bincount(labels[labels >= 0])
+    keep = np.nonzero(sizes >= max(fraction * sizes.max(), min_size))[0]
+    return np.nonzero(np.isin(labels, keep))[0]
+
+
+def components_with(points, n_seed, eps=0.012, min_seed=10, min_size=50):
+    """Índices das componentes ligadas (DBSCAN) que pertencem à caixa.
+
+    Os primeiros n_seed pontos são os de confiança (o topo de uma caixa). Fica uma componente que tem
+    pelo menos min_seed desses pontos, ou que é grande (min_size pontos): um pedaço de parede pode
+    não tocar no topo visível (a caixa de cima tapa o topo quase todo). Saem os grupos pequenos de
+    pontos soltos.
+    """
+    if len(points) < 20:
+        return np.arange(len(points))
+    labels = np.array(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points)).cluster_dbscan(eps, 5))
+    seed = labels[:n_seed]
+    keep = [k for k in range(labels.max() + 1)
+            if np.sum(seed == k) >= min_seed or np.sum(labels == k) >= min_size]
+    if not keep:
+        return largest_component(points, eps)
+    return np.nonzero(np.isin(labels, keep))[0]
+
+
+def allocate_boxes(points, groups, num_boxes):
+    """Reparte num_boxes caixas pelos grupos de pontos (usado pela Parte 3 dentro de um cluster:
+    quantas das caixas estimadas desse cluster ficam em cada grupo de cor).
+
+    - Tantos grupos como caixas: uma caixa por grupo;
+    - Menos grupos do que caixas: há caixas da mesma cor. As caixas extra vão primeiro para os grupos
+      com mais TOPOS do que caixas (uma pilha tem pouca área vista de cima, mas tem vários topos). As
+      que sobram vão, uma a uma, para o grupo com maior área por caixa;
+    - Mais grupos do que caixas: ficam os maiores.
+    Saída: dicionário grupo -> número de caixas.
+    """
+    labels = list(range(groups.max() + 1))[:num_boxes]
+    counts = {k: 1 for k in labels}
+    areas = {k: footprint_area(points[groups == k, :2]) for k in labels}
+    tops = {k: count_top_levels(points[groups == k]) for k in labels} if num_boxes > len(labels) else {}
+    for _ in range(num_boxes - len(labels)):
+        missing = [c for c in labels if tops[c] > counts[c]]
+        if missing:
+            k = max(missing, key=lambda c: areas[c])
+        else:
+            k = max(labels, key=lambda c: areas[c] / counts[c])
+        counts[k] += 1
+    return counts
+
+
 def rect_params(points_xy):
     """Retângulo de área mínima de pontos 2D (cv2.minAreaRect) -> [x, y, yaw, length, width]."""
     (cx, cy), (a, b), angle = cv2.minAreaRect(points_xy.astype(np.float32))
