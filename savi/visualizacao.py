@@ -35,8 +35,8 @@ CAMERA_NAMES = ["azul", "laranja", "verde", "vermelho", "roxo", "castanho", "ros
 WINDOW_SIZE = (1100, 750)     # pixels de cada janela
 POINT_SIZE = 2.0              # tamanho de cada ponto desenhado (pixels)
 WHITE = (1.0, 1.0, 1.0)       # cor do fundo
-FRAME_SECONDS = 0.15          # duração de cada passo das animações
-REPEAT_SECONDS = 2.0          # pausa no fim de uma animação, antes de recomeçar
+FRAME_SECONDS = 0.8           # duração de cada passo das animações
+REPEAT_SECONDS = 3.0          # pausa no fim de uma animação, antes de recomeçar
 
 
 def points_item(points, colors, size=POINT_SIZE):
@@ -215,7 +215,9 @@ class SceneWindows:
     avançam) enquanto se chama tick(); run() espera que todas sejam fechadas.
     Uma vista (dicionário) tem: "name" (identifica a vista), "title", "items" (o que desenhar), "view"
     ({"center", "eye", "up"}; sem view, a vista inicial do draw_geometries) e, para as animações,
-    "frames" (o que desenhar em cada passo, por cima dos items). Uma vista pode também ser só uma imagem
+    "frames" (o que desenhar em cada passo, por cima dos items), "notes" (opcional: um comentário por
+    passo, mostrado no título da janela) e "durations" (opcional: segundos de cada passo; por omissão
+    FRAME_SECONDS, e REPEAT_SECONDS no último). Uma vista pode também ser só uma imagem
     2D (image_item), por exemplo um gráfico do matplotlib.
     """
 
@@ -275,10 +277,14 @@ class SceneWindows:
 
     @staticmethod
     def _update_title(window):
-        """Título da janela: a vista que está a ser mostrada, de quantas."""
+        """Título da janela: a vista que está a ser mostrada, de quantas, e (nas animações com comentários)
+        o comentário do passo que está a ser mostrado, logo no início, para se ler bem."""
         k = window["current"]
-        _set_window_title(window, f"{window['group']}  [{k + 1}/{len(window['views'])}]  "
-                                  f"{window['views'][k]['title']}   (setas <- -> mudam de vista)")
+        spec = window["views"][k]
+        notes, frame = spec.get("notes"), window.get("frame")
+        note = f"{notes[frame]}   |   " if notes is not None and frame is not None else ""
+        _set_window_title(window, f"{window['group']}  [{k + 1}/{len(window['views'])}]  {note}"
+                                  f"{spec['title']}   (setas <- -> mudam de vista)")
 
     def _step(self, window, direction):
         """Vista anterior / seguinte (setas do teclado)."""
@@ -291,7 +297,8 @@ class SceneWindows:
         now = time.time()
         for group, window in list(self.groups.items()):
             vis = window["vis"]
-            frames = window["views"][window["current"]].get("frames")
+            spec = window["views"][window["current"]]
+            frames = spec.get("frames")
             if frames is not None and now >= window["next"]:
                 last = len(frames) - 1
                 window["frame"] = 0 if window["frame"] >= last else window["frame"] + 1
@@ -300,7 +307,14 @@ class SceneWindows:
                 window["shown"] = [_geometry(item) for item in frames[window["frame"]]]
                 for geometry in window["shown"]:
                     vis.add_geometry(geometry, reset_bounding_box=False)
-                window["next"] = now + (REPEAT_SECONDS if window["frame"] == last else FRAME_SECONDS)
+                durations = spec.get("durations")
+                if window["frame"] == last:
+                    seconds = REPEAT_SECONDS
+                else:
+                    seconds = durations[window["frame"]] if durations is not None else FRAME_SECONDS
+                window["next"] = now + seconds
+                if spec.get("notes") is not None:
+                    self._update_title(window)               # comentário do novo passo
             if not vis.poll_events():                       # a janela foi fechada
                 vis.destroy_window()
                 del self.groups[group]

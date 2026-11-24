@@ -50,7 +50,7 @@ Opções de cada parte (todas têm `--scene`, a pasta da cena):
 | `parte3_ajuste.py` | `--output` | onde escrever o `result.json` (por omissão: dentro da pasta da cena) |
 | | `--method bbox` | usa a bounding box no `result.json`, em vez da otimização |
 | | `--no_color` | não usa a cor na otimização |
-| | `--visualize` | 4 vistas: gráfico 2D visto de cima com as caixas dos dois métodos (como o `top_view.png`); bounding box em 3D na cena; otimização em 3D na cena; evolução da otimização em 3D (animação) |
+| | `--visualize` | 4 vistas: gráfico 2D visto de cima com as caixas dos dois métodos (como o `top_view.png`); bounding box em 3D na cena; otimização em 3D na cena; evolução em 3D (animação lenta: bounding box → estimativa inicial → passos da otimização → resultado final, com o comentário de cada etapa e o custo no título da janela) |
 | | `--open3d` | janela do Open3D com a evolução da otimização (como nas aulas) |
 | `avaliador.py` | `--scene` | cena já corrida: pergunta o n.º real de caixas e, se houver `ground_truth.json`, escreve `avaliacao.md` |
 | | `--result` | o `result.json` a avaliar (por omissão: `<cena>/result.json`); o relatório fica ao lado dele |

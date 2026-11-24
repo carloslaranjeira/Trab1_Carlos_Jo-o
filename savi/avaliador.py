@@ -48,16 +48,18 @@ from scipy.optimize import linear_sum_assignment   # emparelhar caixas / conjunt
 from scipy.spatial.transform import Rotation       # ângulo de uma rotação (Parte 08)
 
 from comum import (  # geometria e leitura da cena (comuns a todas as partes)
-    boxes_to_camera0, load_scene, OUTPUT_FOLDER, transform_points,
+    box_corners_2d, boxes_to_camera0, load_scene, OUTPUT_FOLDER, transform_points,
     wrap_angle, yaw_of,
 )
 from extra_fotometria import PHOTOMETRY_FILE
 from parte1_registo import aggregate, load_registration, save_registration
 from parte2_segmentacao import load_objects, run_segmentation
 from parte3_ajuste import (  # IoU 3D (overlap_area, height_overlap) e figuras da Parte 3
-    BOX_COLORS, height_overlap, load_fit, overlap_area, run_fit, top_view,
+    BOX_COLORS, height_overlap, load_fit, overlap_area, run_fit, top_view, top_view_image,
 )
-from visualizacao import box_item, camera_view, close_view, colors_uint8, data_view, points_item, SceneWindows
+from visualizacao import (  # janelas 3D (comuns a todas as partes)
+    box_item, camera_view, close_view, colors_uint8, data_view, image_item, points_item, SceneWindows,
+)
 
 
 GROUND_TRUTH_FILE = "ground_truth.json"
@@ -372,7 +374,9 @@ def figure_data(name, est_cloud, gt_cloud, T_world_camera0, boxes, gt_params):
     real), as caixas de cada método e as verdadeiras."""
     est = transform_points(T_world_camera0, np.asarray(est_cloud.points))
     gt = transform_points(T_world_camera0, np.asarray(gt_cloud.points))
-    lo, hi = gt_params[:, :2].min(axis=0) - 0.1, gt_params[:, :2].max(axis=0) + 0.1
+    # Retângulo (visto de cima) que envolve os cantos de todas as caixas verdadeiras, com 3 cm de margem
+    corners = np.vstack([box_corners_2d(*p[:5]) for p in gt_params])
+    lo, hi = corners.min(axis=0) - 0.03, corners.max(axis=0) + 0.03
 
     def region(points, margin, z_min):
         """Pontos à volta das caixas verdadeiras (vistas de cima, com uma margem) e acima de z_min."""
@@ -398,7 +402,9 @@ def make_windows(data):
     """Vistas do avaliador:
     1. Parte 1: a nuvem com as poses estimadas (vermelho) sobre a nuvem com as poses verdadeiras (verde);
     2. o mesmo, de perto, à volta das caixas;
-    3-6. Parte 3: as caixas de cada método (cores) sobre as verdadeiras (preto), vistas de cima e em 3D."""
+    3-6. Parte 3: as caixas de cada método (cores) sobre as verdadeiras (preto), vistas de cima e em 3D.
+       A vista de cima da otimização é um gráfico 2D (como o top_view.png da Parte 3): os pontos, as caixas
+       verdadeiras (preto), a bounding box (tracejado cinzento) e a otimização (uma cor por caixa)."""
     title = f"Avaliador - {data['cena']}"
     view = data_view(data)
     def clouds(est, gt):
@@ -416,9 +422,18 @@ def make_windows(data):
         if len(data[f"params_{key}"]) == 0:
             continue
         boxes = [box_item(p, BOX_COLORS[j % len(BOX_COLORS)]) for j, p in enumerate(data[f"params_{key}"])]
-        windows.append({"name": f"_caixas_{key}_vista_de_cima",
-                        "title": f"{title}: {label}, vista de cima (verdadeiras a preto)",
-                        "items": [objects] + gt + boxes, "view": top_view(data["objects"])})
+        if key == "otimizacao":                    # gráfico 2D visto de cima, com o ground truth
+            bbox = data["params_bounding_box"]
+            image = top_view_image(data["objects"], data["object_colors"], data["params_otimizacao"],
+                                   bbox if len(bbox) else None, title=str(data["cena"]),
+                                   params_gt=data["gt_params"], frame="mundo")
+            windows.append({"name": f"_caixas_{key}_vista_de_cima",
+                            "title": f"{title}: {label}, vista de cima 2D (verdadeiras a preto)",
+                            "items": [image_item(image)], "view": None})
+        else:
+            windows.append({"name": f"_caixas_{key}_vista_de_cima",
+                            "title": f"{title}: {label}, vista de cima (verdadeiras a preto)",
+                            "items": [objects] + gt + boxes, "view": top_view(data["objects"])})
         windows.append({"name": f"_caixas_{key}_3d", "title": f"{title}: {label}, em 3D (verdadeiras a preto)",
                         "items": [objects] + gt + boxes, "view": close_view(view, data["objects"])})
     return windows
