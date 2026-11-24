@@ -1,4 +1,4 @@
-# Teste — Dia da apresentação (simulação n.º 18: 5 cenas aleatórias)
+# Teste — Dia da apresentação (simulação n.º 19: 5 cenas aleatórias)
 
 As cenas estão na pasta `cenas_teste/`. Foram geradas pelo simulador e **têm** `ground_truth.json` (para o avaliador comparar os resultados); não têm `config.json`.
 
@@ -7,10 +7,10 @@ As cenas têm dificuldades diferentes e entre **1 e 4 imagens**. As câmaras est
 | cena | caixas | imagens |
 |---|---|---|
 | cena_1 | 3 | 2 |
-| cena_2 | 2 | 3 |
-| cena_3 | 3 | 4 |
-| cena_4 | 4 | 1 |
-| cena_5 | 2 | 4 |
+| cena_2 | 2 | 2 |
+| cena_3 | 3 | 1 |
+| cena_4 | 4 | 4 |
+| cena_5 | 3 | 3 |
 
 ## O que tem de fazer
 
