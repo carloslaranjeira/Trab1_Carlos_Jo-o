@@ -1,4 +1,4 @@
-# Teste — Dia da apresentação (simulação n.º 22: 5 cenas aleatórias, 2 com Exposure changes)
+# Teste — Dia da apresentação (simulação n.º 23: 5 cenas aleatórias, 2 com Exposure changes)
 
 As cenas estão na pasta `cenas_teste/`. Foram geradas pelo simulador e **têm** `ground_truth.json` (para o avaliador comparar os resultados); não têm `config.json`.
 
@@ -7,11 +7,11 @@ As cenas têm dificuldades diferentes e entre **1 e 4 imagens**. As câmaras est
 
 | cena | caixas | imagens | Exposure changes |
 |---|---|---|---|
-| cena_1 | 2 | 4 | sim |
-| cena_2 | 3 | 3 | sim |
-| cena_3 | 3 | 1 | não |
-| cena_4 | 2 | 2 | não |
-| cena_5 | 1 | 3 | não |
+| cena_1 | 2 | 2 | não |
+| cena_2 | 3 | 1 | não |
+| cena_3 | 3 | 2 | sim |
+| cena_4 | 3 | 4 | não |
+| cena_5 | 1 | 3 | sim |
 
 ## O que tem de fazer
 
