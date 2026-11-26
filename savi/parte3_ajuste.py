@@ -17,7 +17,7 @@ Grava também <cena>/partes/ajuste.npz (para o avaliador.py).
 
 Ordem das partes (o run_test.py corre-as todas, cena a cena):
     parte1_registo.py      -> <cena>/partes/registo.json   (pose de cada câmara)
-    extra_fotometria.py    -> <cena>/partes/fotometria.json (ganho e desvio de cada imagem)
+    extra_fotometria.py    -> <cena>/partes/fotometria.json e fotometria/ (s e b, imagens corrigidas)
     parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (estima o n.º de caixas)
     parte3_ajuste.py       -> result.json e <cena>/partes/ajuste.npz
     avaliador.py           -> pede o n.º real de caixas e compara com o ground truth (se a cena o tiver)
@@ -60,6 +60,7 @@ from comum import (  # geometria e leitura da cena (comuns a todas as partes)
     box_corners_2d, box_lines_3d, box_signed_distance, box_T_table, boxes_to_camera0, load_scene,
     OUTPUT_FOLDER, transform_points, wrap_angle, write_result,
 )
+from extra_fotometria import load_corrected_scene   # EXTRA: cores corrigidas (só para as janelas)
 from parte1_registo import (  # funções da Parte 1 usadas aqui
     aggregate, load_registration,
 )
@@ -1288,7 +1289,8 @@ def main():
 
     if args.visualize:
         # a nuvem agregada (só para desenhar a cena à volta das caixas)
-        r2["cloud"], _ = aggregate(load_scene(r1["scene_folder"]), r1["T_cams"], r1["registered"])
+        scene = load_corrected_scene(load_scene(r1["scene_folder"]), folder)      # cores do extra, se correu
+        r2["cloud"], _ = aggregate(scene, r1["T_cams"], r1["registered"])
         show_windows(make_windows(figure_data(r1, r2, r3)))
     if args.open3d:
         animate_optimization(r3["fit_points"], np.full_like(r3["fit_points"], 0.6), r3["problem"])

@@ -14,7 +14,7 @@ Não precisa do número de caixas. Grava <cena>/partes/registo.json com a pose d
 
 Ordem das partes (o run_test.py corre-as todas, cena a cena):
     parte1_registo.py      -> <cena>/partes/registo.json   (pose de cada câmara)
-    extra_fotometria.py    -> <cena>/partes/fotometria.json (ganho e desvio de cada imagem)
+    extra_fotometria.py    -> <cena>/partes/fotometria.json e fotometria/ (s e b, imagens corrigidas)
     parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (estima o n.º de caixas)
     parte3_ajuste.py       -> result.json e <cena>/partes/ajuste.npz
     avaliador.py           -> pede o n.º real de caixas e compara com o ground truth (se a cena o tiver)
@@ -51,9 +51,8 @@ import open3d as o3d                         # nuvens de pontos: RANSAC, ICP, gr
 from scipy.spatial import cKDTree            # procura rápida do vizinho mais próximo
 
 from comum import intrinsics_matrix, OUTPUT_FOLDER, load_scene, rotation_angle_deg, rz4, transform_points
-# EXTRA fotometria: comparar cores de imagens com exposições diferentes (alignment_score) e juntar as
-# nuvens com a mesma exposição (aggregate)
-from extra_fotometria import exposure_corrected, match_exposure
+# EXTRA fotometria: comparar cores de imagens com exposições diferentes (alignment_score)
+from extra_fotometria import exposure_corrected
 from visualizacao import (  # janelas 3D (comuns a todas as partes)
     CAMERA_COLORS, CAMERA_NAMES, camera_item, colors_uint8, data_view, points_item, scene_view, show_windows,
 )
@@ -274,15 +273,13 @@ def chain_poses(edges):
 # #####################################################################################################
 # 4. AGREGAÇÃO
 # #####################################################################################################
-def aggregate(scene, T_camera0_cameras, registered=None, photometric=True, exposures=None):
+def aggregate(scene, T_camera0_cameras, registered=None):
     """Junta as nuvens com a RESOLUÇÃO ORIGINAL no referencial da câmara 0.
 
     Cada nuvem é copiada, transformada com T_camera0_camera (leva os pontos para o referencial da
     câmara 0) e somada à nuvem agregada.
     registered: lista de True/False por câmara; as câmaras com False (registo falhado) ficam de fora.
-    EXTRA fotometria: com photometric=True, a exposição de cada imagem é corrigida para a das anteriores
-    (match_exposure, em extra_fotometria.py); photometric=False só serve para a janela do extra.
-    exposures: lista onde se acrescenta (imagem, s, b) de cada câmara (para o extra_fotometria.py).
+    As cores são as das nuvens da cena: depois do extra_fotometria.py, as das imagens corrigidas.
     Saída: (nuvem agregada, índice da câmara que adquiriu cada ponto).
     """
     aggregated = o3d.geometry.PointCloud()
@@ -292,12 +289,6 @@ def aggregate(scene, T_camera0_cameras, registered=None, photometric=True, expos
             continue
         cloud = copy.deepcopy(view.cloud)       # cópia, para não alterar a nuvem original
         cloud.transform(T)                      # leva os pontos para o referencial da câmara 0
-        s, b = 1.0, 0.0                         # câmara 0 (a referência) ou sem correção
-        if photometric and len(aggregated.points) > 0:
-            s, b = match_exposure(cloud, aggregated)
-            cloud.colors = o3d.utility.Vector3dVector(np.clip(s * np.asarray(cloud.colors) + b, 0.0, 1.0))
-        if exposures is not None:
-            exposures.append((view.name, s, b))
         aggregated += cloud
         camera_index.append(np.full(len(cloud.points), k))
     return aggregated, np.concatenate(camera_index)
@@ -810,7 +801,7 @@ def run_registration(scene_folder, output=None, loop_closure=True, verbose=True)
 
     Entrada: pasta da cena e pasta de saída (por omissão <cena>/partes).
     Saída: dicionário com a cena, as poses das câmaras, as câmaras registadas, a nuvem agregada (e a
-    câmara de cada ponto) e o ganho e o desvio de cada imagem (para o extra_fotometria.py).
+    câmara de cada ponto).
     """
     t0 = time.time()
     scene = load_scene(scene_folder)
@@ -823,15 +814,14 @@ def run_registration(scene_folder, output=None, loop_closure=True, verbose=True)
         left_out = [v.name for v, ok in zip(scene.views, registered) if not ok]
         print(f"  câmaras sem registo de confiança, deixadas de fora da nuvem: {', '.join(left_out)}")
 
-    exposures = []                       # (imagem, s, b) de cada câmara, preenchido pelo aggregate
-    cloud, camera_index = aggregate(scene, T_cams, registered, exposures=exposures)
+    cloud, camera_index = aggregate(scene, T_cams, registered)
     save_registration(output, scene, T_cams, registered)
     if verbose:
         print(f"  4. nuvem agregada com {len(cloud.points)} pontos; registo gravado em "
               f"{output / REGISTRATION_FILE} ({time.time() - t0:.1f} s)")
     return {"scene": scene, "scene_folder": scene.folder, "images": [v.name for v in scene.views],
             "T_cams": T_cams, "registered": registered, "cloud": cloud,
-            "camera_index": camera_index, "exposures": exposures, "folder": output}
+            "camera_index": camera_index, "folder": output}
 
 
 def main():

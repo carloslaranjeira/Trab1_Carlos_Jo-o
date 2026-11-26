@@ -22,7 +22,7 @@ O run_test.py chama-o no fim de cada cena (evaluate_scene).
 
 Ordem das partes (o run_test.py corre-as todas, cena a cena):
     parte1_registo.py      -> <cena>/partes/registo.json   (pose de cada câmara)
-    extra_fotometria.py    -> <cena>/partes/fotometria.json (ganho e desvio de cada imagem)
+    extra_fotometria.py    -> <cena>/partes/fotometria.json e fotometria/ (s e b, imagens corrigidas)
     parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (estima o n.º de caixas)
     parte3_ajuste.py       -> result.json e <cena>/partes/ajuste.npz
     avaliador.py           -> pede o n.º real de caixas e compara com o ground truth (se a cena o tiver)
@@ -36,7 +36,8 @@ ORGANIZAÇÃO DESTE FICHEIRO
     3. Parte 2 - segmentação  nuvens juntas com as poses verdadeiras; n.º de caixas, precisão e recall
     4. Parte 3 - caixas    erros de posição, altura, yaw e dimensões e IoU 3D dos dois métodos, com as
                            simetrias; caixas estimadas sobre as verdadeiras
-    5. Extra - fotometria  s e b estimados de cada imagem contra os verdadeiros
+    5. Extra - fotometria  s e b estimados de cada imagem contra os verdadeiros, erro de cor nos pontos
+                           comuns e efeito na segmentação por cor (sem correção / estimada / verdadeira)
     6. Relatório           avaliacao.md e figuras (janelas 3D)
     7. Programa principal  evaluate_scene(), scene_figure_data() (janelas sem recalcular) e main()
 """
@@ -53,7 +54,9 @@ from comum import (  # geometria e leitura da cena (comuns a todas as partes)
     box_corners_2d, boxes_to_camera0, load_scene, OUTPUT_FOLDER, transform_points,
     wrap_angle, yaw_of,
 )
-from extra_fotometria import PHOTOMETRY_FILE
+from extra_fotometria import (  # EXTRA: correção fotométrica
+    color_error, common_points, corrected_scene, load_corrected_scene, PHOTOMETRY_FILE,
+)
 from parte1_registo import aggregate, load_registration, save_registration
 from parte2_segmentacao import load_objects, run_segmentation
 from parte3_ajuste import (  # IoU 3D (overlap_area, height_overlap) e figuras da Parte 3
@@ -66,6 +69,7 @@ from visualizacao import (  # janelas 3D (comuns a todas as partes)
 
 GROUND_TRUTH_FILE = "ground_truth.json"
 GT_FOLDER = "partes_gt"        # 3. Parte 2 e conjuntos de pontos com as poses verdadeiras (ao lado do result.json)
+PHOTOMETRY_GT_FOLDER = "partes_gt_fotometria"   # 5. Parte 2 sem correção / estimada / verdadeira
 REPORT_FILE = "avaliacao.md"   # 6. relatório (ao lado do result.json)
 INSIDE_MARGIN = 0.005          # 3. m: margem à volta das caixas verdadeiras (ruído), como no enunciado
 FIGURE_VOXEL = 0.005           # 6. m: voxel das nuvens das figuras
@@ -173,12 +177,11 @@ def segmentation_with_true_poses(scene, ground_truth, folder):
     """
     T_true = true_camera_poses(scene, ground_truth)
     registered = [True] * len(T_true)
-    exposures = []
-    cloud, camera_index = aggregate(scene, T_true, registered, exposures=exposures)
+    cloud, camera_index = aggregate(scene, T_true, registered)
     save_registration(folder, scene, T_true, registered)
     r1 = {"scene": scene, "scene_folder": scene.folder, "images": [v.name for v in scene.views],
           "T_cams": T_true, "registered": registered, "cloud": cloud,
-          "camera_index": camera_index, "exposures": exposures, "folder": Path(folder)}
+          "camera_index": camera_index, "folder": Path(folder)}
     r2 = run_segmentation(r1, verbose=False)
     r3 = run_fit(r1, r2, verbose=False)
     return r1, r2, r3
@@ -336,7 +339,10 @@ def bbox_boxes(parts_folder):
 # 5. EXTRA - FOTOMETRIA
 # #####################################################################################################
 # O extra estima o ganho s e o desvio b de cada imagem em relação à imagem 000; aqui comparam-se com os do
-# campo 'photometry' do ground_truth.json (se a cena foi gerada com "Exposure changes").
+# campo 'photometry' do ground_truth.json (se a cena foi gerada com "Exposure changes") e mede-se o efeito
+# da correção na segmentação por cor do Nível 4 (Parte 2, secção 4): a Parte 2 corre três vezes sobre a
+# nuvem junta com as poses verdadeiras (como na secção 3), com as cores sem correção, com a correção
+# estimada e com a correção verdadeira (o melhor que a correção pode fazer).
 def true_exposures(ground_truth):
     """s e b VERDADEIROS de cada imagem em relação à imagem 000.
 
@@ -351,15 +357,78 @@ def true_exposures(ground_truth):
     return {name: (s0 / s, b0 - s0 * b / s) for name, (s, b) in photometry.items()}
 
 
+def has_exposure_changes(ground_truth):
+    """True se a cena foi gerada com "Exposure changes" (alguma imagem com s != 1 ou b != 0)."""
+    return any(abs(s - 1) > 1e-9 or abs(b) > 1e-9 for s, b in true_exposures(ground_truth).values())
+
+
 def photometry_errors(parts_folder, ground_truth):
     """s e b estimados (partes/fotometria.json) e verdadeiros de cada imagem. Lista vazia se faltar algum."""
     path = Path(parts_folder) / PHOTOMETRY_FILE
     truth = true_exposures(ground_truth)
     if not truth or not path.exists():
         return []
-    rows = json.loads(path.read_text(encoding="utf-8"))
+    rows = json.loads(path.read_text(encoding="utf-8"))["imagens"]
     return [{"imagem": r["imagem"], "s": r["s"], "b": r["b"], "s_gt": truth[r["imagem"]][0],
              "b_gt": truth[r["imagem"]][1]} for r in rows if r["imagem"] in truth]
+
+
+def color_labels(seg):
+    """Conjuntos de pontos dados SÓ pela segmentação da Parte 2 (clusters e cor, sem a geometria da Parte 3):
+    cada cluster é um conjunto e, nos clusters que a cor separou, cada grupo de cor é um conjunto."""
+    labels = np.full(len(seg.points), -1)
+    n = 0
+    for k in sorted(seg.boxes_per_cluster):
+        mine = np.flatnonzero(seg.clusters == k)
+        groups = seg.color_groups.get(k)
+        if groups is None:
+            labels[mine] = n
+            n += 1
+            continue
+        for g in np.unique(groups):
+            labels[mine[groups == g]] = n
+            n += 1
+    return labels
+
+
+def photometry_segmentation(scene, ground_truth, rows, folder):
+    """Efeito da correção fotométrica na segmentação por cor (Nível 4).
+
+    Entrada: a cena com as cores ORIGINAIS, o ground truth, o s e o b estimados (linhas do fotometria.json)
+    e a pasta onde a Parte 2 grava (partes_gt_fotometria/, ao lado do result.json).
+    Para cada versão das cores (sem correção, estimada, verdadeira): erro de cor nos pontos comuns, número
+    de caixas que a Parte 2 estima, clusters que a cor separou e precisão / recall dos conjuntos da Parte 2.
+    """
+    T_true = true_camera_poses(scene, ground_truth)
+    registered = [True] * len(T_true)
+    names = [v.name for v in scene.views]
+    truth = [{"imagem": n, "s": s, "b": b} for n, (s, b) in true_exposures(ground_truth).items()]
+    pairs = common_points(scene, T_true, registered)             # pontos comuns, com as cores originais
+
+    def arrays(version):
+        exposure = {r["imagem"]: (r["s"], r["b"]) for r in version}
+        return (np.array([exposure.get(n, (1.0, 0.0))[0] for n in names]),
+                np.array([exposure.get(n, (1.0, 0.0))[1] for n in names]))
+
+    results = []
+    for k, (label, version) in enumerate((("sem correção", []), ("s e b estimados", rows),
+                                          ("s e b verdadeiros", truth))):
+        colored = corrected_scene(scene, version)
+        cloud, _ = aggregate(colored, T_true, registered)
+        r1 = {"scene": colored, "scene_folder": scene.folder, "T_cams": T_true, "registered": registered,
+              "cloud": cloud, "folder": Path(folder) / f"versao_{k}"}
+        r2 = run_segmentation(r1, verbose=False)
+        seg = r2["seg"]
+        n_sets, num_gt, seg_rows = evaluate_segmentation(seg.points, color_labels(seg), r2["table"].T_camera0_table,
+                                                         np.asarray(cloud.points), ground_truth)
+        results.append({"versao": label, "erro_cor": color_error(pairs, *arrays(version)),
+                        "caixas": int(r2["num_boxes"]), "caixas_gt": num_gt, "conjuntos": n_sets,
+                        "clusters": len(seg.boxes_per_cluster),
+                        "separados_por_cor": sum(g is not None for g in seg.color_groups.values()),
+                        "precision": float(np.mean([r["precision"] for r in seg_rows])) if seg_rows else 0.0,
+                        "recall": float(np.mean([r["recall"] for r in seg_rows])) if seg_rows else 0.0,
+                        "sem_conjunto": num_gt - len(seg_rows)})
+    return results
 
 
 # #####################################################################################################
@@ -439,7 +508,7 @@ def make_windows(data):
     return windows
 
 
-def write_report(path, name, count, cams, seg, boxes, photometry):
+def write_report(path, name, count, cams, seg, boxes, photometry, photo_seg):
     """Escreve o relatório avaliacao.md: os tópicos de "Comparação com o ground truth" de cada parte."""
     found, real, num_gt = count
     text = [f"# Avaliação da cena {name}", "",
@@ -497,10 +566,29 @@ def write_report(path, name, count, cams, seg, boxes, photometry):
         text.append("")
 
     if photometry:
-        text += ["", "## Extra - Fotometria", "", "cor_000 = s · cor + b de cada imagem:", "",
-                 "| imagem | s estimado | s verdadeiro | b estimado | b verdadeiro |", "|---|---|---|---|---|"]
-        text += [f"| {p['imagem']} | {p['s']:.3f} | {p['s_gt']:.3f} | {p['b']:+.3f} | {p['b_gt']:+.3f} |"
-                 for p in photometry]
+        text += ["", "## Extra - Fotometria", "",
+                 "cor_000 = s · cor + b de cada imagem, em relação à imagem 000 (o verdadeiro vem do campo "
+                 "`photometry` do ground truth: s = s_000 / s_k, b = b_000 − s_000 · b_k / s_k):", "",
+                 "| imagem | s estimado | s verdadeiro | erro de s | b estimado | b verdadeiro | erro de b |",
+                 "|---|---|---|---|---|---|---|"]
+        text += [f"| {p['imagem']} | {p['s']:.3f} | {p['s_gt']:.3f} | {abs(p['s'] - p['s_gt']):.3f} | "
+                 f"{p['b']:+.3f} | {p['b_gt']:+.3f} | {abs(p['b'] - p['b_gt']):.3f} |" for p in photometry]
+        others = photometry[1:]
+        if others:
+            text.append(f"| média (sem a 000) | | | {np.mean([abs(p['s'] - p['s_gt']) for p in others]):.3f} | | | "
+                        f"{np.mean([abs(p['b'] - p['b_gt']) for p in others]):.3f} |")
+    if photo_seg:
+        text += ["", "### Efeito na segmentação por cor (Nível 4)", "",
+                 "A Parte 2 correu três vezes sobre a nuvem junta com as poses verdadeiras (em "
+                 f"`{PHOTOMETRY_GT_FOLDER}/`), com as cores sem correção, com a correção estimada e com a "
+                 "correção verdadeira. Erro de cor = diferença média de cor (0 a 1) entre os pontos vistos por duas "
+                 "câmaras. Os conjuntos de pontos são só os da Parte 2 (clusters e grupos de cor, sem a "
+                 "geometria da Parte 3).", "",
+                 "| cores | erro de cor | caixas estimadas | clusters separados por cor | conjuntos | precisão | recall | caixas sem conjunto |",
+                 "|---|---|---|---|---|---|---|---|"]
+        text += [f"| {r['versao']} | {r['erro_cor']:.4f} | {r['caixas']} de {r['caixas_gt']} | "
+                 f"{r['separados_por_cor']} de {r['clusters']} | {r['conjuntos']} | {r['precision']:.3f} | "
+                 f"{r['recall']:.3f} | {r['sem_conjunto']} |" for r in photo_seg]
     Path(path).write_text("\n".join(text) + "\n", encoding="utf-8")
 
 
@@ -530,6 +618,8 @@ def evaluate_scene(scene_folder, result_path=None, num_boxes=None, verbose=True)
         print("A cena não tem ground_truth.json: não há mais nada a comparar.")
         return None
     scene = load_scene(scene_folder)
+    # As Partes 2 e 3 do sistema usam as cores corrigidas pelo extra (se correu): a avaliação também
+    scene_corrected = load_corrected_scene(scene, parts)
 
     # 2. Parte 1
     cams = camera_errors(result, ground_truth)
@@ -538,7 +628,7 @@ def evaluate_scene(scene_folder, result_path=None, num_boxes=None, verbose=True)
     if verbose:
         print("  a correr as Partes 2 e 3 com as poses verdadeiras (só para avaliar a segmentação)...")
     try:
-        _, r2, r3 = segmentation_with_true_poses(scene, ground_truth, out / GT_FOLDER)
+        _, r2, r3 = segmentation_with_true_poses(scene_corrected, ground_truth, out / GT_FOLDER)
         n_sets, num_gt, seg_rows = evaluate_segmentation(r2["seg"].points, r3["box_labels"],
                                                          r2["table"].T_camera0_table,
                                                          np.asarray(r2["cloud"].points), ground_truth)
@@ -550,13 +640,21 @@ def evaluate_scene(scene_folder, result_path=None, num_boxes=None, verbose=True)
     est = {"otimizacao": result["boxes"], "bounding_box": bbox_boxes(parts)}
     boxes = {k: evaluate_boxes(v, ground_truth) if v is not None else None for k, v in est.items()}
 
-    # 5. Extra
+    # 5. Extra (o efeito na segmentação só nas cenas geradas com "Exposure changes")
     photometry = photometry_errors(parts, ground_truth)
+    photo_seg = []
+    if photometry and has_exposure_changes(ground_truth):
+        if verbose:
+            print("  a correr a Parte 2 sem correção, com a correção estimada e com a verdadeira (extra)...")
+        try:
+            photo_seg = photometry_segmentation(scene, ground_truth, photometry, out / PHOTOMETRY_GT_FOLDER)
+        except Exception as error:
+            print(f"  (efeito da fotometria na segmentação não avaliado: {type(error).__name__}: {error})")
 
     # 6. Relatório e figuras
     data = scene_figure_data(scene_folder, result_path, ground_truth, scene)
     write_report(out / REPORT_FILE, scene_folder.name, (found, real, len(ground_truth["boxes"])), cams, seg,
-                 boxes, photometry)
+                 boxes, photometry, photo_seg)
     if verbose:
         t = [c["transl_mm"] for c in cams]
         print(f"  Parte 1: erro máximo das câmaras {max(t):.2f} mm, {max(c['rot_deg'] for c in cams):.3f}°")
@@ -566,6 +664,12 @@ def evaluate_scene(scene_folder, result_path=None, num_boxes=None, verbose=True)
         for key, label in METHODS:
             if boxes[key] is not None:
                 print(f"  Parte 3, {label}: IoU 3D médio {np.mean([r['iou'] for r in boxes[key][0]]):.3f}")
+        if photometry[1:]:
+            print(f"  Extra: erro médio de s {np.mean([abs(p['s'] - p['s_gt']) for p in photometry[1:]]):.3f}, "
+                  f"de b {np.mean([abs(p['b'] - p['b_gt']) for p in photometry[1:]]):.3f}")
+        for r in photo_seg:
+            print(f"    segmentação por cor, {r['versao']}: erro de cor {r['erro_cor']:.4f}, {r['caixas']} caixas, "
+                  f"precisão {r['precision']:.3f}, recall {r['recall']:.3f}")
         print(f"  relatório escrito em {out / REPORT_FILE}")
     return data
 

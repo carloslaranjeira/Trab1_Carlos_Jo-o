@@ -16,7 +16,7 @@ mesa.json (pose e dimensões da mesa) e segmentacao.npz (cluster e grupo de cor 
 
 Ordem das partes (o run_test.py corre-as todas, cena a cena):
     parte1_registo.py      -> <cena>/partes/registo.json   (pose de cada câmara)
-    extra_fotometria.py    -> <cena>/partes/fotometria.json (ganho e desvio de cada imagem)
+    extra_fotometria.py    -> <cena>/partes/fotometria.json e fotometria/ (s e b, imagens corrigidas)
     parte2_segmentacao.py  -> <cena>/partes/objetos.ply, mesa.json, segmentacao.npz (estima o n.º de caixas)
     parte3_ajuste.py       -> result.json e <cena>/partes/ajuste.npz
     avaliador.py           -> pede o n.º real de caixas e compara com o ground truth (se a cena o tiver)
@@ -51,6 +51,7 @@ from scipy.spatial import cKDTree            # procura rápida do vizinho mais p
 from comum import (  # geometria e leitura da cena (comuns a todas as partes)
     box_corners_2d, load_scene, make_T, OUTPUT_FOLDER, transform_points,
 )
+from extra_fotometria import load_corrected_scene   # EXTRA: cores das imagens com a exposição corrigida
 from parte1_registo import (  # funções da Parte 1 usadas aqui
     aggregate, load_registration,
 )
@@ -787,7 +788,9 @@ def run_segmentation(r1, cloud=None, use_color=True, verbose=True):
     Saída: dicionário com a mesa, os pontos dos objetos, a segmentação e a nuvem agregada.
     """
     t0 = time.time()
-    scene = r1["scene"] if r1.get("scene") is not None else load_scene(r1["scene_folder"])
+    # A cena com as cores corrigidas pelo extra_fotometria.py (se já correu nesta cena)
+    scene = r1["scene"] if r1.get("scene") is not None else load_corrected_scene(load_scene(r1["scene_folder"]),
+                                                                                 r1["folder"])
     registered = r1["registered"]
     if cloud is None:
         cloud = r1.get("cloud")

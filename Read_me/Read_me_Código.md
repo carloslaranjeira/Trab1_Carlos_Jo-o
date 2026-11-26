@@ -43,7 +43,7 @@ Opções de cada parte (todas têm `--scene`, a pasta da cena):
 | `parte1_registo.py` | `--no_loop_closure` | registo só por encadeamento, sem fecho de ciclo |
 | | `--visualize` | 2 vistas: nuvem agregada com a cor dos píxeis; com uma cor por câmara |
 | | `--open3d` | janelas antigas do Open3D (cores reais e uma cor por câmara) |
-| `extra_fotometria.py` | `--visualize` | 2 vistas: nuvem agregada sem e com correção da exposição (s e b de cada imagem no título) |
+| `extra_fotometria.py` | `--visualize` | 3 vistas: mosaico das imagens (em cima as originais, em baixo as corrigidas, com o s e o b de cada uma); nuvem agregada sem e com correção (erro de cor nos pontos comuns no título) |
 | `parte2_segmentacao.py` | `--no_color` | não usa a cor para separar as caixas |
 | | `--visualize` | 4 vistas: objetos isolados (resto da cena a cinzento); uma cor por cluster euclidiano; nuvem só das caixas (como antes, de cima, com os eixos da mesa); nuvem só das caixas em 3D, sem cenário |
 | | `--open3d` | janela antiga do Open3D com a nuvem dos objetos |
@@ -69,8 +69,10 @@ o seu resultado numa pasta `partes/` ao lado do `result.json` (quando cada parte
 
 1. **`parte1_registo.py` — Parte 1.** Regista as imagens e junta as nuvens. Grava `registo.json` (pose de cada
    câmara em relação à câmara 000 e as câmaras que entraram na nuvem). Não precisa do número de caixas.
-2. **`extra_fotometria.py` — extra.** Estima o ganho s e o desvio b de cada imagem em relação à 000, corrige as
-   imagens a cores (`fotometria/NNN.png`). Grava `fotometria.json` (a comparação com o ground truth está no avaliador).
+2. **`extra_fotometria.py` — extra.** Estima o ganho s e o desvio b de cada imagem em relação à 000 (pontos vistos
+   por mais do que uma câmara, `least_squares` com a 000 fixa), corrige as imagens a cores (`fotometria/NNN.png`) e
+   volta a colorir as nuvens com elas: as Partes 2 e 3 usam estas cores. Grava `fotometria.json` (s e b de cada
+   imagem e erro de cor nos pontos comuns; a comparação com o ground truth está no avaliador).
 3. **`parte2_segmentacao.py` — Parte 2.** Deteta a mesa (RANSAC), retira a mesa e o fundo e separa as caixas
    (clusters e cor); **estima o número de caixas** (em cada cluster, o maior entre o n.º de topos a alturas
    diferentes, o n.º de cores, o n.º de caixas em fila pelos degraus do topo e o n.º de orientações das paredes;
@@ -84,7 +86,7 @@ o seu resultado numa pasta `partes/` ao lado do `result.json` (quando cada parte
    nunca o leem.
 
 O `run_test.py` (na pasta principal) corre os 4 ficheiros e o avaliador em todas as cenas de `test/` e escreve
-`results_test/<cena>/`. As cenas correm **uma de cada vez**: em cada cena correm seguidas a Parte 1, o extra, a Parte 2 e a Parte 3 (sem perguntas), abre a janela 3D (Open3D) dessa cena, com as vistas de todas as partes, por esta ordem: Parte 1, Parte 2, Parte 3 e, no fim, as do extra de fotometria (setas ← e → para mudar de vista), e por fim o avaliador pede o número real de caixas (se a cena não estiver em `test/num_boxes.json`) e compara; só depois passa à cena seguinte. As janelas **não param o programa** (são desenhadas por um segundo processo): pode ver-se a cena 3 sem fechar as
+`results_test/<cena>/`. As cenas correm **uma de cada vez**: em cada cena correm seguidas a Parte 1, o extra, a Parte 2 e a Parte 3 (sem perguntas), abre a janela 3D (Open3D) dessa cena, com as vistas de todas as partes, por esta ordem: Parte 1, extra de fotometria, Parte 2 e Parte 3, a mesma ordem em que correm (setas ← e → para mudar de vista), e por fim o avaliador pede o número real de caixas (se a cena não estiver em `test/num_boxes.json`) e compara; só depois passa à cena seguinte. As janelas **não param o programa** (são desenhadas por um segundo processo): pode ver-se a cena 3 sem fechar as
 janelas das cenas 1 e 2 (os pedidos ao segundo processo ficam na pasta temporária do sistema, `SAVIBoxes_janelas`).
 A pasta `test/` só é lida: os resultados intermédios de cada parte ficam em `results_test/<cena>/partes/`, que não
 vai para o git (`.gitignore`). Com `--sem_janelas` não abre janelas. Com `--ver cena_1 [cena_2 ...]` não corre
@@ -104,7 +106,10 @@ que faz, o que recebe, o que devolve e porque foi feita assim.
 | parte 1 | 4. Agregação | `aggregate`, `figure_data`, `make_windows` | Nuvem agregada na resolução original e as suas figuras |
 | parte 1 | 5. Extras de robustez | `alignment_score`, `free_space_violation`, `choose_candidate`, `table_hypotheses`, `extra_edges`, `optimize_pose_graph` | Escolher entre hipóteses, hipóteses da mesa, fecho de ciclo e grafo de poses (não fazem parte das 4 subpartes) |
 | parte 1 | 6. Programa principal | `register_pair`, `register_scene`, `save_registration`, `run_registration`, `main` | Junta as subpartes por ordem; grava `registo.json` |
-| extra | 1–4 | `exposure_fit`, `exposure_corrected`, `match_exposure`, `correct_images`, `run_photometry` | s e b de cada imagem e imagens corrigidas |
+| extra | 1. Pontos comuns | `common_points`, `color_pairs`, `unsaturated` | Pares de pontos vistos por duas câmaras (correspondências do ICP, Parte 08) |
+| extra | 2. Estimar s e b | `objective_function`, `estimate_exposures`, `exposure_corrected`, `color_error` | `least_squares` com a 000 fixa (Parte 06, Ex. 2 e 5) |
+| extra | 3–4. Imagens e nuvens | `correct_image`, `save_images`, `recolor_cloud`, `corrected_scene`, `load_corrected_scene` | Imagens corrigidas e nuvens coloridas de novo |
+| extra | 5–6. Figuras, principal | `mosaic`, `figure_data`, `make_windows`, `run_photometry` | 3 vistas; `fotometria.json` |
 | parte 2 | 1. Mesa e referencial | `table_plane_guess`, `horizontal_points`, `table_points_from_floor`, `detect_table` | Chão e mesa com RANSAC guiado pelas normais; referencial da mesa |
 | parte 2 | 2. Retirar mesa e fundo | `extract_objects` | Pontos acima da mesa e dentro dos limites do tampo |
 | parte 2 | 3. Clustering | `euclidean_clusters`, `figure_data`, `make_windows` | Clusters euclidianos (DBSCAN); figuras (objetos isolados, uma cor por cluster) |
@@ -198,12 +203,11 @@ No nível 4: erros entre 0.4 e 2.4 mm e abaixo de 0.05°.
   hipótese sozinha (sem nenhuma diferente) tem de ter score ≥ 1.5 × 0.05 = 0.075: no teste 10 a única hipótese
   que sobrou num par estava rodada 180° e tinha score 0.054.
 - **Mudanças de exposição:** com exposição automática, a cor de cada imagem é `s · cor + b` (no teste 10, uma
-  imagem tinha s = 0.66, b = −0.06). `exposure_fit` estima s e b por mínimos quadrados com os pontos que
-  coincidem em geometria (2 passagens, sem os 30% de maior resíduo); está no `extra_fotometria.py`. Usa-se em dois sítios:
-  (1) no `alignment_score`, antes de comparar cores: sem isto todas as hipóteses tinham score ~0.003 e a mesa
-  rodada 180° ganhou (erro de 2.35 m numa câmara); (2) no `aggregate`, cada imagem fica com a exposição das
-  anteriores: a cromaticidade cancela s mas não b, e o laranja e o castanho de uma torre deixavam de se
-  separar. Cena 2 do teste 10 (torre de 3, exposição diferente): IoU 0.45 → 0.97.
+  imagem tinha s = 0.66, b = −0.06). No `alignment_score`, antes de comparar as cores de um par, a exposição da
+  fonte é corrigida para a do alvo com `exposure_corrected` (do `extra_fotometria.py`: Parte 06, Ex. 2.2, com o
+  alvo fixo): sem isto todas as hipóteses tinham score ~0.003 e a mesa rodada 180° ganhou (erro de 2.35 m numa
+  câmara). A nuvem agregada da Parte 1 fica com as cores originais; a correção de todas as imagens em relação
+  à 000 é feita a seguir, no extra (ver "Extra — Correção fotométrica").
 - **Sem fecho de ciclo em arco:** se a primeira e a última câmara olharem com mais de 100° de diferença não
   têm nada em comum, e o par 3→0 só dava soluções erradas.
 - **Faces nunca vistas:** no ajuste, o termo de cobertura só conta faces viradas para alguma câmara.
@@ -414,6 +418,89 @@ porque depende da divisão inicial dos pontos entre as caixas, que é apenas apr
   *flying pixel* ou um ponto ruidoso numa face alarga a caixa. O ajuste usa todos os pontos com uma perda robusta.
   Cortar 0.5 % dos pontos em cada extremo de cada eixo reduz este efeito, mas não o elimina.
 
+## Extra — Correção fotométrica
+
+Com a opção **Exposure changes** do simulador (`--exposure_changes` em `--batch`), cada imagem k tem o seu ganho e o
+seu desvio, `cor_k = s_k · cor + b_k`. O `extra_fotometria.py` corre entre a Parte 1 e a Parte 2 e usa o modelo da
+Parte 06 (`I' = s · I + b`):
+
+1. **Pontos vistos por mais do que uma câmara.** Para cada par de câmaras registadas, as duas nuvens vão para o
+   referencial da câmara 0 (poses da Parte 1), são reduzidas com um voxel de 1 cm (Parte 07) e os pares de pontos
+   a menos de 1 cm são as correspondências do ICP com a identidade (`evaluate_registration(...).correspondence_set`,
+   Parte 08). Ficam de fora as cores cortadas a 0 ou a 1 (aí o modelo não vale, como a erosão da máscara na
+   Parte 06, Ex. 3) e usam-se até 3000 pares por par de câmaras (menos dados, como o `scaling_factor` do Ex. 2).
+2. **s e b de cada imagem em relação à 000.** Uma só otimização com `least_squares`, como na Parte 06: uma
+   `objective_function` que devolve um erro por par de pontos e por canal,
+   `(s_i · cor_i + b_i) − (s_j · cor_j + b_j)` (Ex. 2.3: um erro por pixel, não a média), com a imagem 000 fixa
+   em s = 1, b = 0 (Ex. 2.2; se também mudasse, a solução degenerava em imagens pretas, Ex. 2.1). Entram todos os
+   pares de câmaras, não só os pares com a 000: uma imagem sem nada em comum com a 000 fica ligada a ela através
+   das outras. Um grupo de imagens sem ligação à 000 não é corrigido. `bounds` limita os valores possíveis
+   (Ex. 4.3) e uma `loss` robusta reduz o peso dos pares errados (Ex. 5): pontos a menos de 1 cm que não são o
+   mesmo ponto (arestas, sombras, cores misturadas pelo desalinhamento cor/profundidade).
+3. **Imagens corrigidas:** `I' = s · I + b`, limitado a [0, 1] (Ex. 1), gravadas em `partes/fotometria/NNN.png`.
+4. **Nuvens coloridas de novo:** cada ponto é projetado com K no seu pixel da imagem corrigida
+   (`u = fx·x/z + cx`, `v = fy·y/z + cy`, a mesma projeção do `cloud_to_xyz_image`). Esta projeção não vem de uma
+   Parte: é o inverso da passagem da imagem de profundidade para a nuvem. A nuvem agregada é juntada outra vez com
+   estas cores, e as Partes 2 e 3 usam-na. Quando correm sozinhas, lêem o `fotometria.json` (`load_corrected_scene`).
+
+O registo (Parte 1) também compara cores de imagens diferentes (`alignment_score`). Aí usa-se a mesma estimação
+com 2 parâmetros e a nuvem alvo fixa (`exposure_corrected`, Ex. 2.2 tal e qual), porque ainda não há poses para
+estimar todas as imagens de uma vez.
+
+**Escolha da loss.** Com as poses verdadeiras, na cena `level_4` com Exposure changes (erro médio de s e de b nas
+imagens 001–007):
+
+| loss | erro de s | erro de b |
+|---|---|---|
+| nenhuma (mínimos quadrados) | 0.138 | 0.078 |
+| `soft_l1` (Ex. 5), `f_scale` 0.02 | 0.030 | 0.018 |
+| `cauchy`, `f_scale` 0.01 | **0.007** | **0.005** |
+
+Com o `soft_l1`, o s de todas as imagens ficava ~3% abaixo do verdadeiro: os pares errados puxam o declive para
+baixo e o b para cima. A `cauchy` é o mesmo argumento `loss` do `least_squares`, mas reduz mais o peso dos erros
+grandes, por isso foi a escolhida. `f_scale` = 0.01 é da ordem do ruído de cor.
+
+**Comparação com o ground truth** (`avaliacao.md`, secção "Extra - Fotometria"). O campo `photometry` dá
+`cor_k = s_k · cor + b_k`; em relação à 000, `s = s_000 / s_k` e `b = b_000 − s_000 · b_k / s_k`. Com as poses do
+registo, o erro médio é ~0.008 em s e ~0.005 em b. A versão anterior, que corrigia cada nuvem contra a nuvem
+agregada até ali (em cadeia, com `np.linalg.lstsq` e corte de 30% dos pares), dava 0.019 e 0.010 na `level_4`, e o
+erro crescia ao longo da cadeia: s = 0.886 na imagem 007, para 0.848 verdadeiro (agora 0.844). O erro de cor nos
+pontos comuns desce de ~0.10 para ~0.024, praticamente o mesmo que se obtém com o s e o b verdadeiros (o que
+sobra é ruído, desfoque e pares que não são o mesmo ponto).
+
+**Efeito na segmentação por cor do Nível 4.** O avaliador corre a Parte 2 três vezes sobre a nuvem junta com as
+poses verdadeiras: sem correção, com a correção estimada e com a verdadeira (conjuntos só da Parte 2: clusters e
+grupos de cor).
+
+| cena (Exposure changes) | cores | conjuntos (3 caixas) | precisão | recall |
+|---|---|---|---|---|
+| `level_4` (vermelho, azul, verde) | sem correção | 3 | 0.990 | 0.665 |
+| | estimada / verdadeira | 3 | 0.991 | 0.665 |
+| `level_4_cores_proximas` (laranja, castanho, verde) | sem correção | **2** (laranja e castanho juntos) | **0.790** | 0.673 |
+| | estimada / verdadeira | 3 | 0.980 | 0.661 |
+
+Com cores muito diferentes, a correção não muda nada: a cromaticidade (`chroma_features`, `r/(r+g+b)` e
+`g/(r+g+b)`) cancela o ganho s, e o desvio b não chega para trocar vermelho por azul. Com cores próximas, o b muda a
+cromaticidade de cada imagem de forma diferente, as nuvens das duas caixas misturam-se e o k-means deixa de as
+separar. Com a correção estimada, o resultado é igual ao da correção verdadeira e ao da mesma cena gerada sem
+Exposure changes.
+
+**Sistema completo** (`run_test.py`, IoU 3D médio da otimização):
+
+| cena | versão anterior (em cadeia) | extra novo |
+|---|---|---|
+| `level_4_exposure` | 0.984 | 0.978 |
+| `stack_2_exposure` | 0.975 | 0.981 |
+| `level_4_cores_proximas` (sem Exposure changes) | 0.952 | 0.954 |
+| `level_4_cores_proximas_exposure` | 0.935 | 0.963 |
+
+As cenas geram-se com
+`python simulator/savi_box_simulator.py --batch simulator/configs/level_4.json simulator/configs/stack_2.json simulator/configs/level_4_cores_proximas.json --exposure_changes`.
+
+**Janelas.** No `run_test.py`, as 3 vistas do extra aparecem logo a seguir às da Parte 1, a ordem em que o extra
+corre: o mosaico das imagens (em cima as originais, em baixo as corrigidas, com o s e o b de cada uma, como o
+mosaico da Parte 06, Ex. 2), e a nuvem agregada sem e com correção.
+
 ## Avaliador
 
 `savi/avaliador.py` faz duas coisas, por esta ordem:
@@ -436,7 +523,11 @@ porque depende da divisão inicial dos pontos entre as caixas, que é apenas apr
      simetrias da caixa. A associação entre caixas é feita pelo IoU (algoritmo húngaro). Uma caixa verdadeira sem
      caixa estimada conta com IoU 0, e as caixas a mais são indicadas. Janelas: as caixas estimadas sobre as
      verdadeiras (preto), de cima (gráfico 2D) e em 3D.
-   - **Extra (fotometria):** s e b estimados de cada imagem e os verdadeiros, se a cena tiver o campo `photometry`.
+   - **Extra (fotometria):** s e b estimados de cada imagem e os verdadeiros (com os erros), se a cena tiver o
+     campo `photometry`. Nas cenas geradas com Exposure changes, a Parte 2 corre também três vezes com as poses
+     verdadeiras (em `partes_gt_fotometria/`): cores sem correção, com a correção estimada e com a verdadeira, com o
+     erro de cor nos pontos comuns, as caixas estimadas, os clusters separados por cor e a precisão e o recall dos
+     conjuntos da Parte 2. A avaliação da Parte 2 (`partes_gt/`) usa as cores corrigidas, como o sistema.
 
 O `ground_truth.json` só é lido pelo avaliador: as partes, o extra e o `run_test.py` nunca o leem. O
 `run_test.py` chama o avaliador no fim de cada cena, e as figuras do avaliador aparecem na janela da cena.
