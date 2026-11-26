@@ -1,16 +1,17 @@
-# Teste — Dia da apresentação (simulação n.º 20: 5 cenas aleatórias)
+# Teste — Dia da apresentação (simulação n.º 21: 5 cenas aleatórias, 2 com Exposure changes)
 
 As cenas estão na pasta `cenas_teste/`. Foram geradas pelo simulador e **têm** `ground_truth.json` (para o avaliador comparar os resultados); não têm `config.json`.
 
 As cenas têm dificuldades diferentes e entre **1 e 4 imagens**. As câmaras estão num arco (45° a 75° entre vizinhas).
+**Duas cenas foram geradas com Exposure changes**: cada imagem tem o seu ganho s e o seu desvio b (o campo `photometry` do `ground_truth.json` tem os valores verdadeiros).
 
-| cena | caixas | imagens |
-|---|---|---|
-| cena_1 | 4 | 3 |
-| cena_2 | 2 | 3 |
-| cena_3 | 3 | 2 |
-| cena_4 | 2 | 4 |
-| cena_5 | 1 | 1 |
+| cena | caixas | imagens | Exposure changes |
+|---|---|---|---|
+| cena_1 | 1 | 1 | não |
+| cena_2 | 2 | 4 | não |
+| cena_3 | 3 | 2 | sim |
+| cena_4 | 3 | 4 | sim |
+| cena_5 | 2 | 3 | não |
 
 ## O que tem de fazer
 
